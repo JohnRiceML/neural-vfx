@@ -40,14 +40,33 @@ class Solver:
     def reset(self, obstacles: list[Obstacle] = ()) -> FieldState      # ambient, empty
     def step(self, state: FieldState, forces: Forces, dt: float) -> FieldState
     # step may update state in place and return it. Deterministic for identical inputs.
+    # --- hooks for tests (public, stable) ---
+    def divergence(self, state: FieldState) -> torch.Tensor  # (H,W) |div u|*dx/(max|u|+1e-8), fluid cells only (0 in solids)
+    def advect(self, field: torch.Tensor, velocity: torch.Tensor, dt: float) -> torch.Tensor
+    #   field (H,W) or (C,H,W) float32 cuda, velocity (2,H,W) m/s; returns the advected field (same scheme step() uses)
+    def project(self, state: FieldState) -> FieldState      # pressure projection only, in place ok
 SOLVER_VERSION: str
+# SolverConfig field names are fixed (tests set them to 0 to isolate terms):
+#   buoyancy_alpha (density sinks), buoyancy_beta (heat lifts), vorticity_eps, density_dissipation,
+#   temperature_cooling, burn_rate, ignition_temp, burn_heat, smoke_from_fuel,
+#   pressure_tol, pressure_max_iters
+# All in world units, so 128^2 and 512^2 runs of the same Scenario look alike at large scales.
 
 # vfx/datagen/__init__.py
 def sample_scenario(seed: int, split: str) -> Scenario          # split in {"train","test","ood"}
-def run(scenario: Scenario) -> dict                              # writes one scenario dir, returns metadata
-def load_dataset(version: str) -> "PairedDataset"               # see datagen README for format
+def run(scenario: Scenario, out_dir=None, frames=None) -> dict   # writes one scenario dir, returns metadata
+def load_dataset(version: str, split="train") -> "PairedDataset"  # test/ood items also carry `lr_sim`
+
+# vfx/model/__init__.py
+class DetailNet(torch.nn.Module):
+    def forward(self, lr: Tensor, prev_hr_warped: Tensor) -> Tensor
+    # lr (B,5,h,w) physical units; prev_hr_warped (B,2,4h,4w) density,temperature(K);
+    # returns (B,2,4h,4w) density,temperature(K). Normalization happens INSIDE the model.
+def load_model(path) -> DetailNet
 
 # vfx/runtime/__init__.py
+def warp_prev(prev_hr, lr_velocity, dx_hr, dt) -> Tensor   # (2,H,W) prev HR advected by upsampled LR velocity
+#   used by BOTH train/ and runtime/ so training and inference see identical warping
 class Upscaler:                    # neural; owns temporal state (previous HR output)
     def __init__(self, checkpoint_path: str | None = None, device="cuda"): ...
     def reset(self) -> None
@@ -66,6 +85,25 @@ def spectrum_error(pred, ref) -> float      # log radial power-spectrum error of
 def flicker(seq, velocities, dx, dt) -> float
 def l1(pred, ref) -> float
 ```
+
+## Dataset format (v0) — `DATA_ROOT/datasets/<version>/`
+```
+card.json        version, counts per split, param ranges, solver_version, created
+splits.json      {"train": [seeds], "test": [seeds], "ood": [seeds]}   # split by scenario seed
+<split>/scn_<seed:06d>/
+  meta.json      scenario (dataclasses.asdict), solver_version, lr_res, hr_res, dt, start_step, tags
+  lr.npy         (T, 5, 128, 128) float16   HR state 4x average-pooled (training input)
+  hr.npy         (T, 2, 512, 512) float16   HR density, temperature (target)
+  solid_lr.npy   (128, 128) uint8           solid_hr.npy (512, 512) uint8
+  lr_sim.npy     (T, 5, 128, 128) float16   independent 128^2 sim of the same scenario (test/ood only)
+```
+Frames are consecutive solver steps (frame t-1 -> t is one SIM_DT). `load_dataset(version)` returns a
+torch Dataset whose items are dicts of float32 tensors: `lr` (5,128,128), `hr_prev` (2,512,512),
+`hr` (2,512,512), `solid_lr`, `solid_hr`, plus `seed`, `t`. Whole dataset must stay under ~6 GB.
+
+## Git
+Five engineers share this one checkout. Do NOT run git commands (no add/commit/stash/checkout);
+the lead reviews and commits.
 
 ## Rules
 - No CPU copies (`.cpu()`, `.item()`, `.numpy()`, `print(tensor)`) in the frame loop. The ONLY

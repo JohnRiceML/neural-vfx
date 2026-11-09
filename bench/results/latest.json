@@ -1,0 +1,73 @@
+{
+ "stages": {
+  "trivial_torch": {
+   "mean_ms": 0.016087680088821797,
+   "p50_ms": 0.01152000017464161,
+   "p95_ms": 0.038975998759269714,
+   "max_ms": 0.177824005484581,
+   "iters": 200
+  },
+  "trivial_warp": {
+   "mean_ms": 0.019334240106400103,
+   "p50_ms": 0.015456000342965126,
+   "p95_ms": 0.03993599861860275,
+   "max_ms": 0.3144960105419159,
+   "iters": 200
+  },
+  "solver_step_128": {
+   "mean_ms": 1.1261084815859794,
+   "p50_ms": 1.1056959629058838,
+   "p95_ms": 1.3857280015945435,
+   "max_ms": 1.6875200271606445,
+   "iters": 200,
+   "solver_version": "sim2d-warp-0.1.0"
+  },
+  "upscaler_infer": {
+   "mean_ms": 0.8456788837909699,
+   "p50_ms": 0.8032640218734741,
+   "p95_ms": 1.1504640579223633,
+   "max_ms": 1.329856038093567,
+   "iters": 200,
+   "checkpoint": "C:\\Users\\ricej\\AppData\\Local\\neural-vfx\\checkpoints\\demo\\latest.pt"
+  },
+  "render_draw_1024": {
+   "mean_ms": 0.17891519986093044,
+   "p50_ms": 0.17235200107097626,
+   "p95_ms": 0.17507199943065643,
+   "max_ms": 0.5605120062828064,
+   "iters": 200,
+   "fields": "neural"
+  },
+  "frame_total": {
+   "mean_ms": 2.117623360157013,
+   "p50_ms": 2.04367995262146,
+   "p95_ms": 2.399199962615967,
+   "max_ms": 2.4944961071014404,
+   "iters": 200,
+   "includes": "step+neural+draw"
+  }
+ },
+ "skipped": {},
+ "scene_source": "solver",
+ "upscaler_internal_timings": {
+  "warp": 0.04771199822425842,
+  "net": 0.6676480174064636,
+  "mask": 0.04508800059556961,
+  "total": 0.7604479789733887,
+  "processed_fraction": 1.0
+ },
+ "sum_of_stages_ms": 2.15070256523788,
+ "vram": {
+  "torch_peak_allocated_mb": 61.6630859375,
+  "torch_peak_reserved_mb": 98.0,
+  "device_used_peak_minus_start_mb": 208.0,
+  "device_used_peak_mb": 1498.4375
+ },
+ "meta": {
+  "gpu": "NVIDIA GeForce RTX 5080",
+  "torch": "2.11.0+cu128",
+  "python": "3.12.0",
+  "iters": 200,
+  "created": "2026-11-09 11:09:49"
+ }
+}
