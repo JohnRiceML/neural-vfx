@@ -1,0 +1,11 @@
+{
+  "name": "v3_seq_scratch",
+  "dataset": "v3",
+  "init": null,
+  "model": {"lr_channels": 64, "n_blocks": 8, "hr_feats": 8, "hr_hidden": 16, "vel_scale": 0.3237},
+  "hypothesis": "v3 run 2 (control): same recipe as v3 run 1 (lr_sim input, K=8 unrolls, temporal 0.5, flicker hinge alpha 0.7, 35% pooled input) but from scratch (lr 3e-4, same arch, vel_scale fixed to the current model's 0.3237 so normalization matches), to test whether the v1/v2 weights carry any old-solver habit. Run 1 (fine-tune) already beats the before checkpoint on every audited metric and looks clean. Expect from scratch in 15 min to be close but slightly behind run 1 on spectrum/L1 (v2 adopted weights had ~45 min of cumulative training); adopt it only if it is equal or better and visually cleaner.",
+  "train": {"minutes": 15.0, "batch": 8, "crop_hr": 256, "steps_k": 8, "lr": 3e-4, "p_pooled": 0.35},
+  "loss": {"l1": 1.0, "grad": 0.5, "hf": 1.0, "spec": 0.002, "spec_max_frac": 0.5, "temporal": 0.5,
+           "flicker": 4.0, "flicker_alpha": 0.7},
+  "exposure": {"p_cold": 0.5, "noise_sigma": 0.1}
+}

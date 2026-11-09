@@ -37,6 +37,10 @@ Overrides: `--minutes`, `--dataset`.
 - Current default = `configs/v2_seq_mix.json` (run 3), fine-tuned from run 2 (`v2_seq_k8.json`), which
   was fine-tuned from the v1 run-3 checkpoint. Backups in `checkpoints/demo/` (`v1_run3_backup.pt`,
   `v2_seq_run1/2/3.pt`).
+- **v3 (solver 0.2.0)**: current default = `configs/v3_seq_ft.json` (v2 run 3 fine-tuned 15 min on v3, same
+  recipe), also `checkpoints/demo/v3_seq_run1.pt`; previous default in `v2_seq_run3_backup.pt`. A from-scratch
+  15-min control (`v3_seq_scratch.json`) was clearly worse (spectrum -58%, pooled-L1 gate fails). Score v3 with
+  `evaluate --scorecard --version v3`.
 - `evaluate.py` now calls `vfx.eval.metrics.evaluate_upscaler` (the gate's single flicker definition;
   the old local flicker warped the HR reference with the lr_sim velocity). Runs never auto-promote;
   copy to `paths.default_checkpoint()` by hand after comparing scorecards.

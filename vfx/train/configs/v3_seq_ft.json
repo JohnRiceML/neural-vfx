@@ -1,0 +1,10 @@
+{
+  "name": "v3_seq_ft",
+  "dataset": "v3",
+  "init": "C:/Users/ricej/AppData/Local/neural-vfx/checkpoints/demo/v2_seq_run3_backup.pt",
+  "hypothesis": "v3 run 1: fine-tune the v2 run-3 default on v3 (solver 0.2.0: smooth temperature, cleaner smoke edges) with the adopted v2 recipe (lr_sim input, K=8 self-feedback unrolls, temporal 0.5, flicker hinge alpha 0.7, 35% pooled input, lr 1.5e-4). Before (v2 run 3 on v3) already passes every goal (flicker test/ood lr_sim 0.676/0.681, live 0.535/1.059, spec -76%/-69%, L1 d -27%/-15%, pooled -38%) but its temperature L1 is worse than bicubic (test/lr_sim 0.38 vs 0.34 K, ood 0.74 vs 0.63, pooled 0.27 vs 0.22): it still adds the old solver's sharp/jagged temperature detail that v3's diffused HR no longer has. Expect temperature L1 at or below bicubic and no loss on the density/flicker goals.",
+  "train": {"minutes": 15.0, "batch": 8, "crop_hr": 256, "steps_k": 8, "lr": 1.5e-4, "p_pooled": 0.35},
+  "loss": {"l1": 1.0, "grad": 0.5, "hf": 1.0, "spec": 0.002, "spec_max_frac": 0.5, "temporal": 0.5,
+           "flicker": 4.0, "flicker_alpha": 0.7},
+  "exposure": {"p_cold": 0.5, "noise_sigma": 0.1}
+}
