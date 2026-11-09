@@ -48,12 +48,19 @@ def radial_power(x):
     return out[:, 1:nb].reshape(B, C, nb - 1)
 
 
-def spectral_loss(p, t, eps: float = 1e-8):
-    """Mean |log P_pred - log P_ref| over radial frequency bins (computed in fp32)."""
+def spectral_loss(p, t, eps: float = 1e-8, min_std: float = 1e-2, max_frac: float = 1.0):
+    """Mean |log P_pred - log P_ref| over radial frequency bins (fp32), per sample/channel; samples
+    whose target is nearly flat (std < min_std, normalized units) are excluded: their log spectrum is noise.
+    max_frac < 1 restricts the term to the lowest max_frac of radial bins: matching power at the
+    pixel scale rewards isolated speckles, so the top band is left to the L1/gradient/HF terms."""
     with torch.autocast("cuda", enabled=False):
-        Pp, Pt = radial_power(p.float()), radial_power(t.float())
+        p, t = p.float(), t.float()
+        Pp, Pt = radial_power(p), radial_power(t)
         scale = Pt.mean(dim=-1, keepdim=True) * 1e-4 + eps     # floor relative to the signal energy
-        return (torch.log(Pp + scale) - torch.log(Pt + scale)).abs().mean()
+        nb = max(1, int(round(Pt.shape[-1] * max_frac)))
+        e = (torch.log(Pp[..., :nb] + scale) - torch.log(Pt[..., :nb] + scale)).abs().mean(-1)   # (B,C)
+        w = (t.std(dim=(-2, -1)) > min_std).float()
+        return (e * w).sum() / w.sum().clamp_min(1.0)
 
 
 def temporal_l1(pred, prev_pred_warped, target, prev_target_warped):

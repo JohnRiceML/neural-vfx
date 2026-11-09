@@ -1,10 +1,42 @@
 {
   "name": "demo",
   "dataset": "v1",
-  "hypothesis": "M3 non-adversarial baseline: LR-trunk residual DetailNet (64ch x 8 blocks) with warped prev frame beats bicubic on L1 and spectrum error on held-out scenes.",
-  "model": {"lr_channels": 64, "n_blocks": 8, "hr_feats": 8, "hr_hidden": 16, "vel_scale": "auto"},
-  "train": {"minutes": 15.0, "batch": 16, "crop_hr": 256, "lr": 1e-3, "preload": true},
-  "loss": {"l1": 1.0, "grad": 0.5, "hf": 1.0, "spec": 0.05, "temporal": 0.5},
-  "exposure": {"p_cold": 0.1, "p_rollout": 0.4, "noise_sigma": 0.1},
-  "eval": {"split": "test", "max_scenarios": 8}
+  "hypothesis": "Run 3: run-2 recipe (LR degradation p=0.5) + spectral term restricted to the lower half of radial bins. Neural output has ~4.5x the reference's isolated speckle pixels; matching pixel-scale power likely rewards speckle. Expect fewer speckles with similar spectrum/L1 gains.",
+  "model": {
+    "lr_channels": 64,
+    "n_blocks": 8,
+    "hr_feats": 8,
+    "hr_hidden": 16,
+    "vel_scale": "auto"
+  },
+  "train": {
+    "minutes": 15.0,
+    "batch": 16,
+    "crop_hr": 256,
+    "lr": 0.001,
+    "preload": true
+  },
+  "loss": {
+    "l1": 1.0,
+    "grad": 0.5,
+    "hf": 1.0,
+    "spec": 0.002,
+    "temporal": 0.5,
+    "spec_max_frac": 0.5
+  },
+  "exposure": {
+    "p_cold": 0.1,
+    "p_rollout": 0.4,
+    "noise_sigma": 0.1
+  },
+  "eval": {
+    "split": "test",
+    "max_scenarios": 8
+  },
+  "lr_degrade": {
+    "p": 0.5,
+    "blur_max": 1.5,
+    "noise": 0.05,
+    "vel_noise": 0.02
+  }
 }

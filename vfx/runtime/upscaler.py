@@ -2,7 +2,9 @@
 
 Per frame:
   1. pre-stage (one CUDA graph, fixed shapes): fp16 LR -> bicubic base, warp of the previous output
-     along the upsampled LR velocity, and the brick-activity mask of this frame.
+     along the upsampled LR velocity of the PREVIOUS frame (the solver advects t-1 -> t with the
+     start-of-step velocity; same convention in training and vfx.eval.metrics.flicker), and the
+     brick-activity mask of this frame.
   2. network on the active crop (one CUDA graph per quantized crop shape), or the full frame.
   3. compose: bicubic everywhere, network result pasted on the active bounding box.
   4. async copy of this frame's brick mask into a ring of pinned host buffers.
@@ -76,6 +78,7 @@ class Upscaler:
         self._lr[:, CH["temperature"]] = AMBIENT_TEMP
         self._prev = torch.zeros(1, 2, HR_RES, HR_RES, device=self.device, dtype=torch.half)
         self._prev[:, 1] = AMBIENT_TEMP
+        self._velp = torch.zeros(1, 2, h, h, device=self.device, dtype=torch.half)   # LR velocity of frame t-1
         nb = LR_RES // brick
         self._ring = [{"host": torch.zeros((nb, nb), dtype=torch.uint8, pin_memory=True),
                        "event": torch.cuda.Event(), "frame": -10 ** 9} for _ in range(max_lag + 2)]
@@ -94,7 +97,7 @@ class Upscaler:
     def _pre_fn(self, dt):
         lr = self._lr
         base = upscale_lr_tensor(lr[:, _DT], "bicubic")
-        prevw = warp_prev(self._prev, lr[:, _VEL], self.dx_hr, dt)
+        prevw = warp_prev(self._prev, self._velp, self.dx_hr, dt)
         b = self.brick
         d = F.max_pool2d(lr[:, CH["density"]:CH["density"] + 1], b)
         t = F.max_pool2d(lr[:, CH["temperature"]:CH["temperature"] + 1], b)
@@ -182,6 +185,7 @@ class Upscaler:
         base, prevw, act = self._pre(float(lr_state.meta.dt))
         if self._cold:
             prevw = base
+        self._velp.copy_(self._lr[:, _VEL])                  # velocity used to warp into the next frame
         ev["warp"].record()
 
         region = self._region()

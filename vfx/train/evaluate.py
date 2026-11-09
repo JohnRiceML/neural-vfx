@@ -38,6 +38,7 @@ def evaluate(ckpt, version: str, split: str = "test", max_scenarios: int | None 
         solid = torch.from_numpy(np.load(s["dir"] / "solid_lr.npy")).float().cuda()
         ups.reset()
         prev = {"net": None, "bic": None, "ref": None}
+        prev_vel = None
         T = hr.shape[0] if max_frames is None else min(hr.shape[0], max_frames)
         for t in range(T):
             data = torch.from_numpy(np.asarray(lr[t], np.float32)).cuda()
@@ -53,10 +54,11 @@ def evaluate(ckpt, version: str, split: str = "test", max_scenarios: int | None 
             acc["net_spec"].append(spec(net[0], ref[0])); acc["bic_spec"].append(spec(bic[0], ref[0]))
             acc["frac"].append(ups.timings["processed_fraction"])
             for name, x in (("net", net[0]), ("bic", bic[0]), ("ref", ref[0])):
-                f = _flicker(x[None], prev[name], vel)
+                f = _flicker(x[None], prev[name], prev_vel)
                 if f is not None:
                     acc[f"{name}_flicker"].append(f)
                 prev[name] = x[None]
+            prev_vel = vel
     r = {k: float(np.mean(v)) for k, v in acc.items() if v}
     r["spec_improvement"] = 1.0 - r["net_spec"] / max(r["bic_spec"], 1e-12)
     r["l1_improvement"] = 1.0 - r["net_l1_d"] / max(r["bic_l1_d"], 1e-12)

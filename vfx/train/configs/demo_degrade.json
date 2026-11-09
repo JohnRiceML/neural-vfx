@@ -1,0 +1,42 @@
+{
+  "name": "demo_degrade",
+  "dataset": "v1",
+  "hypothesis": "Run 1 is slightly worse than bicubic on lr_sim (L1 -1%, flicker ratio 2.72 vs 2.20). Degrading the LR input in training (p=0.5: Gaussian blur sigma<=1.5 LR cells, 5% relative noise, vel noise) makes the model less literal about LR structure and improves lr_sim L1/flicker without losing much on pooled lr.",
+  "model": {
+    "lr_channels": 64,
+    "n_blocks": 8,
+    "hr_feats": 8,
+    "hr_hidden": 16,
+    "vel_scale": "auto"
+  },
+  "train": {
+    "minutes": 15.0,
+    "batch": 16,
+    "crop_hr": 256,
+    "lr": 0.001,
+    "preload": true
+  },
+  "loss": {
+    "l1": 1.0,
+    "grad": 0.5,
+    "hf": 1.0,
+    "spec": 0.002,
+    "temporal": 0.5
+  },
+  "exposure": {
+    "p_cold": 0.1,
+    "p_rollout": 0.4,
+    "noise_sigma": 0.1
+  },
+  "eval": {
+    "split": "test",
+    "max_scenarios": 8
+  },
+  "promote": false,
+  "lr_degrade": {
+    "p": 0.5,
+    "blur_max": 1.5,
+    "noise": 0.05,
+    "vel_noise": 0.02
+  }
+}

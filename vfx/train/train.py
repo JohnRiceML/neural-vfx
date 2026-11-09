@@ -22,9 +22,10 @@ from dataclasses import asdict
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 
 from vfx.core import paths
-from vfx.core.fields import CH, DOMAIN_SIZE, HR_RES
+from vfx.core.fields import AMBIENT_TEMP, CH, DOMAIN_SIZE, HR_RES
 from vfx.model import DetailNet, DetailNetConfig, param_count, save_model
 from vfx.runtime.warp import upscale_lr_tensor, warp_prev
 from vfx.train import losses as L
@@ -45,6 +46,7 @@ DEFAULTS = {
               "preload": True, "log_every": 50, "val_every": 500, "ckpt_every_minutes": 5.0, "dt": 1.0 / 30.0},
     "loss": {"l1": 1.0, "grad": 0.5, "hf": 1.0, "spec": 0.05, "temporal": 0.5},
     "exposure": {"p_cold": 0.1, "p_rollout": 0.4, "noise_sigma": 0.1},
+    "lr_degrade": {"p": 0.0, "blur_max": 1.0, "noise": 0.05, "vel_noise": 0.02},
     "eval": {"split": "test", "max_scenarios": 8, "max_frames": None},
 }
 
@@ -86,11 +88,12 @@ class Logger:
 
 
 def build_prev(model, lr, hr, ex, dt, generator=None):
-    """Per-sample previous-frame input (physical units) and rollout mask. lr (B,2,5,h,w), hr (B,3,2,H,W)."""
+    """Per-sample previous-frame input (physical units) and rollout mask. lr (B,3,5,h,w), hr (B,3,2,H,W)
+    for frames t-2, t-1, t. Frame k-1 -> k is warped with the LR velocity of frame k-1."""
     B = lr.shape[0]
     dev = lr.device
-    lr_prev, lr_cur = lr[:, 0], lr[:, 1]
-    vel = lr_cur[:, _VEL]
+    lr_pp, lr_prev, lr_cur = lr[:, 0], lr[:, 1], lr[:, 2]
+    vel = lr_prev[:, _VEL]
     # teacher + relative noise
     sig = torch.rand(B, 1, 1, 1, device=dev) * ex["noise_sigma"]
     pn = model.norm_hr(hr[:, 1])
@@ -98,7 +101,7 @@ def build_prev(model, lr, hr, ex, dt, generator=None):
     teacher = warp_prev(model.denorm_hr(pn), vel, DX_HR, dt)
     # rollout from model's own previous output
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
-        p1 = model(lr_prev, warp_prev(hr[:, 0], lr_prev[:, _VEL], DX_HR, dt)).float()
+        p1 = model(lr_prev, warp_prev(hr[:, 0], lr_pp[:, _VEL], DX_HR, dt)).float()
     roll = warp_prev(p1, vel, DX_HR, dt)
     cold = upscale_lr_tensor(lr_cur[:, _DT], "bicubic")
     r = torch.rand(B, 1, 1, 1, device=dev)
@@ -108,18 +111,51 @@ def build_prev(model, lr, hr, ex, dt, generator=None):
     return prev, roll, is_roll
 
 
+def degrade_lr(lr, dg: dict):
+    """Optional LR-input degradation (robustness to an independent LR sim instead of pooled HR).
+    Per sample with prob p: Gaussian blur (sigma ~ U(0, blur_max) LR cells) and relative noise on
+    density / heat / fuel, plus absolute velocity noise; the same degradation for all frames of a sample."""
+    p = dg.get("p", 0.0)
+    if p <= 0:
+        return lr
+    B, T, C, h, w = lr.shape
+    x = lr.reshape(B, T * C, h, w)
+    sig = torch.rand(B, device=lr.device) * dg.get("blur_max", 1.0)
+    r = torch.arange(-3, 4, device=lr.device, dtype=torch.float32)
+    k1 = torch.exp(-r[None] ** 2 / (2 * sig[:, None].clamp_min(1e-3) ** 2))
+    k1 = k1 / k1.sum(-1, keepdim=True)                                   # (B,7)
+    xp = F.pad(x, (3, 3, 3, 3), mode="replicate")
+    xb = F.conv2d(xp.reshape(1, B * T * C, h + 6, w + 6),
+                  k1.repeat_interleave(T * C, 0).view(-1, 1, 1, 7), groups=B * T * C)
+    xb = F.conv2d(xb, k1.repeat_interleave(T * C, 0).view(-1, 1, 7, 1), groups=B * T * C).view(B, T, C, h, w)
+    n = dg.get("noise", 0.0)
+    if n > 0:
+        z = torch.randn_like(xb) * n
+        amb = torch.zeros(1, 1, C, 1, 1, device=lr.device)
+        amb[:, :, CH["temperature"]] = AMBIENT_TEMP
+        rel = (xb - amb).abs()
+        rel[:, :, _VEL] = dg.get("vel_noise", 0.02)
+        xb = xb + z * rel
+        xb[:, :, CH["density"]] = xb[:, :, CH["density"]].clamp_min(0)
+        xb[:, :, CH["fuel"]] = xb[:, :, CH["fuel"]].clamp_min(0)
+        xb[:, :, CH["temperature"]] = xb[:, :, CH["temperature"]].clamp_min(AMBIENT_TEMP)
+    m = (torch.rand(B, device=lr.device) < p).view(B, 1, 1, 1, 1)
+    return torch.where(m, xb, lr)
+
+
 def compute_loss(model, lr, hr, cfg):
     ex, wl, dt = cfg["exposure"], cfg["loss"], cfg["train"]["dt"]
+    lr = degrade_lr(lr, cfg.get("lr_degrade", {}))
     prev, roll, is_roll = build_prev(model, lr, hr, ex, dt)
     with torch.autocast("cuda", dtype=torch.float16, enabled=cfg["train"]["amp"]):
-        pred = model.forward_normalized(lr[:, 1], prev)
+        pred = model.forward_normalized(lr[:, 2], prev)
     pred = pred.float()
     tgt = model.norm_hr(hr[:, 2])
     terms = {"l1": (pred - tgt).abs().mean(), "grad": L.grad_l1(pred, tgt), "hf": L.hf_l1(pred, tgt),
-             "spec": L.spectral_loss(pred, tgt)}
+             "spec": L.spectral_loss(pred, tgt, max_frac=wl.get("spec_max_frac", 1.0))}
     if wl["temporal"] > 0 and bool(is_roll.any()):
         m = is_roll.view(-1)
-        ref_prev = model.norm_hr(warp_prev(hr[:, 1], lr[:, 1, _VEL], DX_HR, dt))
+        ref_prev = model.norm_hr(warp_prev(hr[:, 1], lr[:, 1, _VEL], DX_HR, dt))  # vel of t-1
         terms["temporal"] = L.temporal_l1(pred[m], model.norm_hr(roll[m]), tgt[m], ref_prev[m])
     total = sum(wl[k] * v for k, v in terms.items())
     return total, terms
@@ -134,8 +170,8 @@ def quick_val(model, sampler, cfg, n_batches=4):
         lr, hr = sampler.fixed_batch()
         prev = warp_prev(hr[:, 1], lr[:, 1, _VEL], DX_HR, cfg["train"]["dt"])
         with torch.autocast("cuda", dtype=torch.float16):
-            pred = model(lr[:, 1], prev).float()
-        bic = upscale_lr_tensor(lr[:, 1, _DT], "bicubic")
+            pred = model(lr[:, 2], prev).float()
+        bic = upscale_lr_tensor(lr[:, 2, _DT], "bicubic")
         pn, bn, tn = model.norm_hr(pred), model.norm_hr(bic), model.norm_hr(hr[:, 2])
         acc["val_l1"] += (pn - tn).abs().mean().item() / n_batches
         acc["val_bic_l1"] += (bn - tn).abs().mean().item() / n_batches
@@ -205,7 +241,7 @@ def train(cfg: dict, overfit_steps: int = 0) -> dict:
             g["lr"] = lr_now
         lr_b, hr_b = fixed if overfit_steps else sampler.next()
         if overfit_steps:   # pure fitting check: teacher-forced, no noise
-            cfg_o = _merge(cfg, {"exposure": {"p_cold": 0.0, "p_rollout": 0.0, "noise_sigma": 0.0}})
+            cfg_o = _merge(cfg, {"exposure": {"p_cold": 0.0, "p_rollout": 0.0, "noise_sigma": 0.0}, "lr_degrade": {"p": 0.0}})
             total, terms = compute_loss(model, lr_b, hr_b, cfg_o)
         else:
             total, terms = compute_loss(model, lr_b, hr_b, cfg)
