@@ -113,3 +113,52 @@ the lead reviews and commits.
 - The test agent never tests code it wrote; owners may add quick self-checks under their own dir
   (`vfx/<mod>/selfcheck.py`) but the gate tests live in `tests/`.
 - Report numbers you measured; do not claim numbers you did not run.
+
+## 3D phase (feasibility + sandbox) — added 2026-11-09
+Goal: measure whether the spec's 3D budget (64^3 sim <= 2.0 ms, detail <= 2.5 ms, 1440p render <= 1.5 ms,
+total <= 6 ms, <= 4 GB VRAM on the RTX 5080) is reachable, by two routes — (A) volumetric 4x neural
+upscale 64^3 -> 256^3 with empty-space skipping, (B) screen-space 2D neural detail on the rendered
+image — and give the user a 3D sandbox to compare modes. No 3D training in this phase.
+Types: `vfx.core.fields3d`. The 2D code (`vfx/sim`, `vfx/render`, `vfx/app`, ...) stays untouched and working.
+
+| Path | Owner |
+|---|---|
+| `vfx/core/fields3d.py` | lead |
+| `vfx/sim3d/` | 3D solver engineer |
+| `vfx/render3d/`, `vfx/app3d/` | 3D render/sandbox engineer |
+| `vfx/model3d/`, `vfx/runtime3d/` | 3D ML/runtime engineer |
+| `tests3d/`, `bench3d/` | 3D test/eval engineer |
+
+```python
+# vfx/sim3d/__init__.py — same shape as vfx.sim, 3D types
+class SolverConfig3D: ...        # same field names as the 2D SolverConfig (+ heat_diffusion, confinement_floor)
+class Solver3D:
+    def __init__(self, res: int, config: SolverConfig3D | None = None, device="cuda"): ...
+    def reset(self, obstacles: list[Obstacle3D] = ()) -> FieldState3D
+    def step(self, state: FieldState3D, forces: Forces3D, dt: float) -> FieldState3D
+    def divergence(self, state) -> torch.Tensor      # (D,H,W) normalized as in 2D
+    def advect(self, field, velocity, dt) -> torch.Tensor
+    def project(self, state) -> FieldState3D
+SOLVER3D_VERSION: str
+
+# vfx/render3d/__init__.py
+class VolumeRenderer:
+    def __init__(self, out_size: tuple[int, int], device="cuda", march_scale: float = 1.0): ...
+    #   march_scale < 1 ray-marches at reduced resolution and upsamples to out_size
+    def draw(self, volume: Volume, camera: Camera, solid: torch.Tensor | None = None) -> torch.Tensor
+    #   (out_h, out_w, 3) uint8 cuda, row 0 = top of screen
+    timings: dict[str, float]
+
+# vfx/runtime3d/__init__.py
+def classical_upscale_3d(state: FieldState3D, factor=4, mode="trilinear") -> Volume
+class VolumeUpscaler:            # route A; untrained weights are fine in this phase
+    def __init__(self, checkpoint_path=None, device="cuda", **arch): ...
+    def infer(self, state: FieldState3D) -> Volume          # HR volume, empty bricks skipped
+    timings: dict[str, float]
+class ScreenDetail:              # route B; untrained weights are fine in this phase
+    def __init__(self, checkpoint_path=None, device="cuda", **arch): ...
+    def infer(self, frame: torch.Tensor, aux: dict | None = None) -> torch.Tensor   # (h,w,3) uint8 cuda in/out
+    timings: dict[str, float]
+```
+Timing rule for this phase: another training job may be using the GPU. Check `nvidia-smi` before
+recording numbers and say in your report whether the GPU was shared; the lead re-runs `bench3d` on an idle GPU.
