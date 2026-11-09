@@ -1,0 +1,10 @@
+{
+  "name": "v2_seq_ft",
+  "dataset": "v2",
+  "init": "C:/Users/ricej/AppData/Local/neural-vfx/checkpoints/demo/v1_run3_backup.pt",
+  "hypothesis": "Seq run 1: fine-tune the v1 run-3 checkpoint on v2 with lr_sim input, 6-step self-feedback unrolls (full gradient, 50% cold start), warp = runtime warp_prev with the lr_sim velocity; temporal change-matching 0.5 + flicker hinge relu(F_pred - 0.8 F_bicubic) (w 4). Expect live flicker below bicubic (fire ratio <= 0.61, smoke <= 1.2) while keeping spectrum >= 70% below bicubic and L1 better than bicubic on v2 lr_sim.",
+  "train": {"minutes": 15.0, "batch": 8, "crop_hr": 256, "steps_k": 6, "lr": 3e-4},
+  "loss": {"l1": 1.0, "grad": 0.5, "hf": 1.0, "spec": 0.002, "spec_max_frac": 0.5, "temporal": 0.5,
+           "flicker": 4.0, "flicker_alpha": 0.8},
+  "exposure": {"p_cold": 0.5, "noise_sigma": 0.1}
+}

@@ -17,16 +17,18 @@ Design: [SPEC.md](SPEC.md). Conventions and module contracts: [CLAUDE.md](CLAUDE
 | 1–4 | presets: campfire, smoke stack + obstacle, twin torches + wind, box obstacle (out-of-distribution) |
 | O / R / Space / H / Esc | obstacle, reset, pause, HUD, quit |
 
-## Measured (RTX 5080, 2026-11-09)
-- Windowed, neural side-by-side: 60.4 fps, 1% low 55.5 fps (spec ≥ 60 / ≥ 50)
-- GPU per stage: sim 0.78 ms, neural upscale 0.75 ms, render 0.18 ms, frame 1.7 ms (budget 6 ms)
-- Detail vs bicubic: spectrum error 70–77% lower (spec v1 gate ≥ 50%)
-- Known gaps: on the live independent 128² sim the neural output flickers more than bicubic (2.8× reference vs 2.2×; spec gate 1.2×), and per-pixel L1 is ~2% worse than bicubic, because the 128² sim drifts from its 512² twin. See vfx/train/EXPERIMENTS.md.
+## Measured (RTX 5080, 2026-11-09, checkpoint v2_seq_run3)
+- Windowed, neural side-by-side: 60.5 fps, 1% low 55.7 fps (spec >= 60 / >= 50)
+- GPU per stage: sim 0.76 ms, neural upscale 0.71 ms, render 0.17 ms, frame ~1.9 ms (budget 6 ms)
+- Detail vs bicubic on the live-style 128² sim input: spectrum error 75% lower on test scenes, 67% on unfamiliar scenes (spec gate >= 50%)
+- Flicker vs high-res reference (spec gate <= 1.2x): 0.58 test, 0.59 unfamiliar, 0.45 live fire, 1.02 live smoke + obstacle (bicubic: 0.83, 0.80, 0.61, 1.41)
+- Trained on dataset v2: the 512² sim is steered to follow the independent 128² sim the app runs. History in vfx/train/EXPERIMENTS.md.
+- Known gaps: a few small detached wisps at plume edges; jagged flame column in the 512² solver output.
 
 ## Pipeline
 ```
-.venv/Scripts/python -m vfx.datagen.build --version v1                        # ~2 min, 5.7 GB in %LOCALAPPDATA%/neural-vfx
-.venv/Scripts/python -m vfx.train.train --config vfx/train/configs/demo.json  # 15 min
+.venv/Scripts/python -m vfx.datagen.build --version v2                        # ~2 min, 5.9 GB in %LOCALAPPDATA%/neural-vfx
+.venv/Scripts/python -m vfx.train.train_seq --config vfx/train/configs/v2_seq_mix.json  # 15 min per run
 .venv/Scripts/python -m pytest tests -q
 .venv/Scripts/python -m bench.run
 ```

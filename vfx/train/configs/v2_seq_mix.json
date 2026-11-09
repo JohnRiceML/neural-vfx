@@ -1,0 +1,10 @@
+{
+  "name": "v2_seq_mix",
+  "dataset": "v2",
+  "init": "C:/Users/ricej/AppData/Local/neural-vfx/checkpoints/demo/v2_seq_run2.pt",
+  "hypothesis": "Seq run 3: run 2 passes every goal metric but fails the Layer 4 hard gate test_beats_bicubic_l1 (pooled-lr input, v2 test: L1 0.00140 vs bicubic 0.00118): trained only on lr_sim it over-sharpens the cleaner pooled input. Fine-tune run 2 (lr 1.5e-4, same K=8 / alpha 0.7 recipe) with the pooled `lr` as input for 35% of samples. Expect pooled-lr L1 below bicubic while lr_sim/live numbers stay within ~5% of run 2.",
+  "train": {"minutes": 15.0, "batch": 8, "crop_hr": 256, "steps_k": 8, "lr": 1.5e-4, "p_pooled": 0.35},
+  "loss": {"l1": 1.0, "grad": 0.5, "hf": 1.0, "spec": 0.002, "spec_max_frac": 0.5, "temporal": 0.5,
+           "flicker": 4.0, "flicker_alpha": 0.7},
+  "exposure": {"p_cold": 0.5, "noise_sigma": 0.1}
+}

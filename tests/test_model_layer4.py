@@ -102,21 +102,32 @@ def report():
     up = rt.Upscaler(str(CKPT), device=DEV)
     root = dataset_dir(VERSION)
     splits = json.loads((root / "splits.json").read_text())
-    rep = {"checkpoint": str(CKPT), "dataset": VERSION, "created": time.strftime("%Y-%m-%d %H:%M:%S"), "results": {}}
+    rep = {"checkpoint": str(CKPT), "dataset": VERSION, "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+           "flicker_definition": "audited-2026-11-09: pred warped with its driving (source) velocity, "
+                                 "ref = HR warped with pooled-HR velocity; legacy key *_legacy_hrvel",
+           "results": {}}
     for split in ("test", "ood"):
         if not splits.get(split):
             continue
         for source in ("lr", "lr_sim"):
+            key = f"{split}/{source}"
             try:
                 n = M.evaluate_upscaler(up, VERSION, split, source)
                 b = M.evaluate_upscaler(M.bicubic_upscale, VERSION, split, source)
             except FileNotFoundError as e:
-                rep["results"][f"{split}/{source}"] = {"error": str(e)}
+                rep["results"][key] = {"error": str(e)}
                 continue
-            rep["results"][f"{split}/{source}"] = {"neural": n.as_dict(), "bicubic": b.as_dict()}
-            print(f"[{split}/{source}] spectrum neural {n.spectrum_error:.4f} vs bicubic {b.spectrum_error:.4f} | "
+            if n.n_scenarios == 0:     # dataset still being written (e.g. v2 under construction)
+                rep["results"][key] = {"skip": f"no finished scenarios ({n.n_skipped_incomplete} incomplete)"}
+                continue
+            rep["results"][key] = {"neural": n.as_dict(), "bicubic": b.as_dict()}
+            fpf = n.n_frames / n.n_scenarios
+            print(f"[{key}] {n.n_scenarios} scn x {fpf:.0f} frames ({n.n_skipped_incomplete} incomplete skipped) | "
+                  f"spectrum neural {n.spectrum_error:.4f} vs bicubic {b.spectrum_error:.4f} | "
                   f"L1 dens {n.l1_density:.5f} vs {b.l1_density:.5f} | L1 T {n.l1_temperature:.3f} vs "
-                  f"{b.l1_temperature:.3f} | flicker ratio neural {n.flicker_ratio:.3f}, bicubic {b.flicker_ratio:.3f}")
+                  f"{b.l1_temperature:.3f} K | flicker ratio neural {n.flicker_ratio:.3f}, bicubic {b.flicker_ratio:.3f} "
+                  f"(legacy HR-velocity: {n.flicker_ratio_legacy_hrvel:.3f} / {b.flicker_ratio_legacy_hrvel:.3f}; "
+                  f"detail-normalized: {n.flicker_ratio_detail_norm:.3f} / {b.flicker_ratio_detail_norm:.3f})")
     out = RUNS / "eval"
     out.mkdir(parents=True, exist_ok=True)
     (out / "layer4_latest.json").write_text(json.dumps(rep, indent=1, default=str))
@@ -127,6 +138,8 @@ def _get(report, key):
     r = report.get(key)
     if r is None:
         pytest.skip(f"{key} not evaluated (split empty)")
+    if "skip" in r:
+        pytest.skip(f"{key}: {r['skip']}")
     if "error" in r:
         pytest.fail(f"{key}: {r['error']}")
     return r["neural"], r["bicubic"]
@@ -160,8 +173,12 @@ def test_v1_spectrum_50pct_below_bicubic(report, source):
 @pytest.mark.xfail(strict=False, reason="v1 gate (M4); v0 is the M3 baseline - informational")
 @pytest.mark.parametrize("source", ["lr", "lr_sim"])
 def test_v1_flicker_within_1p2_of_reference(report, source):
+    """Audited definition (metrics.evaluate_upscaler): pred warped with the velocity of the LR input it was
+    fed, reference = HR warped with its own pooled velocity. The pre-audit number (pred warped with the HR
+    run's velocity even when fed the independent LR sim) is printed as 'legacy' for history only."""
     n, b = _get(report, f"test/{source}")
     print(f"test/{source}: flicker ratio pred/ref neural {n['flicker_ratio']:.3f} (bicubic {b['flicker_ratio']:.3f}); "
+          f"legacy HR-velocity {n['flicker_ratio_legacy_hrvel']:.3f} (bicubic {b['flicker_ratio_legacy_hrvel']:.3f}); "
           "v1 needs <= 1.2")
     assert n["flicker_ratio"] <= 1.2
 
@@ -226,3 +243,41 @@ def test_long_rollout_live_solver():
                 assert drift < 0.25, f"HR mean density drifted {drift * 100:.1f}% from LR at frame {i + 1}"
     for s in stats:
         print("frame %5d  dmax %.3f  T [%.0f, %.0f]  mean density LR %.4f HR %.4f" % s)
+
+
+# ----------------------------------------------------------------------------- live-app flicker (no dataset)
+@pytest.fixture(scope="module")
+def live():
+    """vfx.eval.live_flicker: 128^2 Solver on fixed scenes (fire; smoke + circle), 300 steps, fed to the
+    Upscaler and classical_upscale; flicker with the 128^2 run's own velocity; reference = a 512^2 Solver
+    run of the same scene (a different flow realization: indicative, not pixel-matched)."""
+    _need_ckpt()
+    import_or_skip("vfx.sim", ("Solver",))
+    import_or_skip("vfx.runtime", ("Upscaler", "classical_upscale"))
+    from vfx.eval.live_flicker import live_flicker
+    res = live_flicker(steps=300, warmup=30, checkpoint=str(CKPT))
+    out = RUNS / "eval"
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "live_flicker_latest.json").write_text(json.dumps(
+        {"checkpoint": str(CKPT), "steps": 300, "warmup": 30, "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+         "results": res}, indent=1))
+    for k, r in res.items():
+        print(f"live/{k}: flicker neural {r['neural']:.6f} bicubic {r['bicubic']:.6f} ref(512^2) {r['ref']:.6f} | "
+              f"ratio neural {r['ratio_neural']:.3f} bicubic {r['ratio_bicubic']:.3f} neural/bicubic "
+              f"{r['neural_over_bicubic']:.3f}")
+    return res
+
+
+@pytest.mark.parametrize("scene", ["fire", "smoke_obstacle"])
+def test_live_flicker_measured(live, scene):
+    r = live[scene]
+    assert all(math.isfinite(r[k]) and r[k] > 0 for k in ("neural", "bicubic", "ref")), r
+
+
+@pytest.mark.xfail(strict=False, reason="v1 gate (M4) on the live app situation; reference is a 512^2 run of the "
+                                        "same scene (different realization) - informational")
+@pytest.mark.parametrize("scene", ["fire", "smoke_obstacle"])
+def test_v1_live_flicker_within_1p2_of_reference(live, scene):
+    r = live[scene]
+    print(f"live/{scene}: flicker ratio neural {r['ratio_neural']:.3f} (bicubic {r['ratio_bicubic']:.3f}); v1 needs <= 1.2")
+    assert r["ratio_neural"] <= 1.2

@@ -4,9 +4,10 @@ Public API (see CLAUDE.md and vfx/datagen/README.md):
     sample_scenario(seed, split) -> Scenario
     run(scenario) -> dict                       # writes one scenario dir, returns meta
     load_dataset(version, split="train") -> PairedDataset
+    load_sequences(version, split="train", length=8) -> SequenceDataset   # v2 rollouts
 """
-from .dataset import PairedDataset, load_dataset
+from .dataset import PairedDataset, SequenceDataset, load_dataset, load_sequences
 from .runner import run
 from .scenarios import DEFAULT_FRAMES, SPLITS, sample_scenario
 
-__all__ = ["sample_scenario", "run", "load_dataset", "PairedDataset", "SPLITS", "DEFAULT_FRAMES"]
+__all__ = ["sample_scenario", "run", "load_dataset", "load_sequences", "PairedDataset", "SequenceDataset", "SPLITS", "DEFAULT_FRAMES"]

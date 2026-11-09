@@ -1,0 +1,10 @@
+{
+  "name": "v2_seq_ft_k8",
+  "dataset": "v2",
+  "init": "C:/Users/ricej/AppData/Local/neural-vfx/checkpoints/demo/v1_run3_backup.pt",
+  "hypothesis": "Seq run 2: run-1 recipe with longer unrolls (K=8) and a tighter flicker hinge (alpha 0.7) from the same v1 init. Run 1 passes every gate but live smoke+obstacle is only 6% under 1.2 (1.131); expect more margin there (target <= 1.08) at a small cost in spectrum (keep >= 60% below bicubic) and no visible over-smoothing.",
+  "train": {"minutes": 15.0, "batch": 8, "crop_hr": 256, "steps_k": 8, "lr": 3e-4},
+  "loss": {"l1": 1.0, "grad": 0.5, "hf": 1.0, "spec": 0.002, "spec_max_frac": 0.5, "temporal": 0.5,
+           "flicker": 4.0, "flicker_alpha": 0.7},
+  "exposure": {"p_cold": 0.5, "noise_sigma": 0.1}
+}

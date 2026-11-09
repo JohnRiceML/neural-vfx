@@ -159,3 +159,72 @@ def test_bicubic_upscale_shapes_and_constant():
     assert out.density.shape == (128, 128) and out.temperature.shape == (128, 128)
     assert torch.allclose(out.density, torch.full_like(out.density, 0.7), atol=1e-5)
     assert torch.allclose(out.temperature, torch.full_like(out.temperature, 400.0), rtol=1e-6)
+
+
+def test_flicker_responds_to_known_noise_amplitude():
+    """Known-flicker injection: per-frame iid Gaussian noise of std s, warped by an integer-cell shift
+    (exact warp): x_t - warp(x_{t-1}) = n_t - n'_{t-1} ~ N(0, 2 s^2), so flicker = 2 s / sqrt(pi)."""
+    n, T = 128, 8
+    dx, dt = 1.0 / n, 0.05
+    vel = torch.zeros(T, 2, n, n, device=DEV)
+    vel[:, 1] = 2 * dx / dt
+    # a static clean field: with an integer-cell shift every warped sample is exactly one noise value
+    # of the previous frame (also at the clamped border), so the expectation is exact everywhere.
+    seq = torch.zeros(T, n, n, device=DEV)
+    base = M.flicker(seq, vel, dx, dt)
+    g = torch.Generator(device=DEV).manual_seed(0)
+    for s in (0.002, 0.01, 0.05):
+        noisy = seq + s * torch.randn(seq.shape, device=DEV, generator=g)
+        f = M.flicker(noisy, vel, dx, dt)
+        assert abs(f - 2 * s / math.sqrt(math.pi)) < 0.1 * (2 * s / math.sqrt(math.pi)) + base, (s, f, base)
+
+
+def _write_scn(root, split, seed, hr, lr, lr_sim, dt):
+    d = root / split / f"scn_{seed:06d}"
+    d.mkdir(parents=True)
+    np.save(d / "hr.npy", hr.astype(np.float16))
+    np.save(d / "lr.npy", lr.astype(np.float16))
+    np.save(d / "lr_sim.npy", lr_sim.astype(np.float16))
+    np.save(d / "solid_lr.npy", np.zeros(lr.shape[-2:], np.uint8))
+    np.save(d / "solid_hr.npy", np.zeros(hr.shape[-2:], np.uint8))
+    (d / "meta.json").write_text('{"dt": %r, "start_step": 1, "tags": [], "scenario": {"seed": %d}}' % (dt, seed))
+    return d
+
+
+def test_evaluate_upscaler_warps_pred_with_its_driving_velocity(tmp_path, monkeypatch):
+    """Audit regression test. HR/lr: a blob moving +x with lr velocity +x. lr_sim (an independent run):
+    a blob moving +y with lr_sim velocity +y. Bicubic of lr_sim is perfectly transported by ITS OWN flow,
+    so the audited flicker is ~ the reference; warping it with the HR run's velocity (legacy) is large.
+    Also: unfinished scenario dirs (no meta.json) are skipped and counted."""
+    from vfx.core.fields import UPSCALE
+    h, T, dt = 32, 6, 0.05
+    H = h * UPSCALE
+    dx_lr = 1.0 / h
+    c = (torch.arange(H, dtype=torch.float32) + 0.5) / H
+    yy, xx = torch.meshgrid(c, c, indexing="ij")
+    shift = 1 * dx_lr                       # one LR cell per frame
+    hr = np.zeros((T, 2, H, H), np.float32)
+    lr = np.zeros((T, NUM_CHANNELS, h, h), np.float32)
+    ls = np.zeros((T, NUM_CHANNELS, h, h), np.float32)
+    for t in range(T):
+        b = torch.exp(-((xx - 0.3 - t * shift) ** 2 + (yy - 0.5) ** 2) / (2 * 0.08 ** 2))
+        hr[t, 0] = b.numpy()
+        hr[t, 1] = 300.0
+        lr[t, CH["density"]] = F.avg_pool2d(b[None, None], UPSCALE)[0, 0].numpy()
+        lr[t, CH["temperature"]] = 300.0
+        lr[t, CH["vel_x"]] = shift / dt
+        bs = torch.exp(-((xx - 0.5) ** 2 + (yy - 0.3 - t * shift) ** 2) / (2 * 0.08 ** 2))
+        ls[t, CH["density"]] = F.avg_pool2d(bs[None, None], UPSCALE)[0, 0].numpy()
+        ls[t, CH["temperature"]] = 300.0
+        ls[t, CH["vel_y"]] = shift / dt
+    d = _write_scn(tmp_path, "test", 1, hr, lr, ls, dt)
+    (tmp_path / "test" / "scn_000002").mkdir()       # in progress: no meta.json
+    monkeypatch.setattr(M, "scenario_dirs", lambda v, s: [d, tmp_path / "test" / "scn_000002"])
+    r = M.evaluate_upscaler(M.bicubic_upscale, "fake", "test", "lr_sim", device=DEV)
+    assert r.n_scenarios == 1 and r.n_skipped_incomplete == 1 and r.n_frames == T
+    assert r.flicker_ref < 0.01 * hr[:, 0].mean() + 2e-3
+    assert r.flicker < 0.25 * r.flicker_legacy_hrvel, (r.flicker, r.flicker_legacy_hrvel)
+    assert r.flicker_ratio < r.flicker_ratio_legacy_hrvel
+    # source="lr": audited and legacy definitions coincide
+    q = M.evaluate_upscaler(M.bicubic_upscale, "fake", "test", "lr", device=DEV)
+    assert math.isclose(q.flicker, q.flicker_legacy_hrvel, rel_tol=1e-9)

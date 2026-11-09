@@ -2,7 +2,9 @@
 
 Item = one frame pair (t >= 1) of one scenario:
   lr (5,128,128), hr_prev (2,512,512), hr (2,512,512), solid_lr (128,128), solid_hr (512,512)
-  as float32 tensors, plus seed:int and t:int. Test/ood items also carry lr_sim (5,128,128).
+  as float32 tensors, plus seed:int and t:int. Items carry lr_sim (5,128,128) whenever the scenario
+  has one: test/ood in v1, every split in v2 (guided HR; see guide.py).
+SequenceDataset = windows of L consecutive frames (multi-step self-feedback rollouts).
 Arrays are opened with np.load(mmap_mode='r') lazily per process, so the dataset is cheap to
 pickle into DataLoader workers (Windows spawn).
 """
@@ -87,3 +89,34 @@ class PairedDataset(Dataset):
 def load_dataset(version: str, split: str = "train", include_lr_sim: bool = True) -> PairedDataset:
     """Dataset for DATA_ROOT/datasets/<version>/<split>. See vfx/datagen/README.md."""
     return PairedDataset(paths.dataset_dir(version), split, include_lr_sim)
+
+
+class SequenceDataset(PairedDataset):
+    """Item = L consecutive frames t0..t0+L-1 of one scenario (all start offsets):
+    lr (L,5,128,128), hr (L,2,512,512), lr_sim (L,5,128,128) if present, solid_lr, solid_hr,
+    seed, t0. Frame k -> k+1 is one SIM_DT."""
+
+    def __init__(self, root, split="train", length: int = 8, include_lr_sim: bool = True):
+        super().__init__(root, split, include_lr_sim)
+        if length < 2:
+            raise ValueError("length must be >= 2")
+        self.length = int(length)
+        self.index = [(k, t0) for k, s in enumerate(self.scenarios)
+                      for t0 in range(0, s["frames"] - self.length + 1)]
+
+    def __getitem__(self, i: int) -> dict:
+        k, t0 = self.index[i]
+        a = self._arrays(k)
+        sl = slice(t0, t0 + self.length)
+        item = {"lr": self._f32(a["lr"][sl]), "hr": self._f32(a["hr"][sl]),
+                "solid_lr": a["solid_lr"], "solid_hr": a["solid_hr"],
+                "seed": self.scenarios[k]["seed"], "t0": t0}
+        if "lr_sim" in a:
+            item["lr_sim"] = self._f32(a["lr_sim"][sl])
+        return item
+
+
+def load_sequences(version: str, split: str = "train", length: int = 8,
+                   include_lr_sim: bool = True) -> SequenceDataset:
+    """Windows of `length` consecutive frames (v2: up to 16). See vfx/datagen/README.md."""
+    return SequenceDataset(paths.dataset_dir(version), split, length, include_lr_sim)

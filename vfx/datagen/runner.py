@@ -122,25 +122,54 @@ def _save(path: Path, arr: np.ndarray) -> None:
     os.replace(tmp, path)
 
 
+def tracking(lr: torch.Tensor, lr_sim: torch.Tensor) -> dict:
+    """Per-frame relative L2 of pooled HR vs lr_sim after a further 4x pool (32²): density,
+    temperature - ambient, velocity. Returns {"density": [..T], "temperature": [..], "velocity": [..]}."""
+    a = F.avg_pool2d(lr.float(), UPSCALE)
+    b = F.avg_pool2d(lr_sim.float(), UPSCALE)
+    off = torch.zeros(NUM_CHANNELS, 1, 1, device=a.device)
+    off[CH["temperature"]] = AMBIENT_TEMP
+    a, b = a - off, b - off
+
+    def rel(idx):
+        num = (a[:, idx] - b[:, idx]).flatten(1).norm(dim=1)
+        return num / (b[:, idx].flatten(1).norm(dim=1) + 1e-8)
+    v = torch.stack([rel([CH["density"]]), rel([CH["temperature"]]), rel([CH["vel_x"], CH["vel_y"]])])
+    v = v.cpu().tolist()
+    return {"density": [round(x, 4) for x in v[0]], "temperature": [round(x, 4) for x in v[1]],
+            "velocity": [round(x, 4) for x in v[2]]}
+
+
 def run(scenario: Scenario, out_dir: str | Path | None = None, frames: int | None = None,
-        with_lr_sim: bool | None = None) -> dict:
+        with_lr_sim: bool | None = None, guide=None) -> dict:
     """Simulate and write one scenario directory; return its metadata dict.
 
     out_dir: the scenario directory (default: DATA_ROOT/datasets/scratch/<split>/scn_<seed>).
     frames: saved frames T (default DEFAULT_FRAMES); warm-up = scenario.num_steps - T.
-    with_lr_sim: also run an independent LR_RES sim (default: True for test/ood).
+    with_lr_sim: also run an independent LR_RES sim (default: True for test/ood; forced True
+        when guided).
+    guide: a vfx.datagen.guide.GuideConfig -> the HR run is guided toward the independent LR
+        run (dataset v2); lr_sim.npy is written for every split. None = v1 behaviour.
     """
     split = scenario_split(scenario)
     frames = DEFAULT_FRAMES if frames is None else int(frames)
     if with_lr_sim is None:
         with_lr_sim = split in ("test", "ood")
+    if guide is not None:
+        with_lr_sim = True
     d = Path(out_dir) if out_dir is not None else scenario_dir(paths.dataset_dir(DEFAULT_VERSION), split, scenario.seed)
     d.mkdir(parents=True, exist_ok=True)
     (d / "meta.json").unlink(missing_ok=True)       # incomplete until rewritten
 
     t0 = time.perf_counter()
-    hr, lr, solid_hr, version = simulate(scenario, HR_RES, frames, keep="hr")
+    lr_sim = None
+    if guide is not None:
+        from .guide import simulate_guided
+        hr, lr, lr_sim, solid_hr, version = simulate_guided(scenario, frames, guide)
+    else:
+        hr, lr, solid_hr, version = simulate(scenario, HR_RES, frames, keep="hr")
     stats = {"hr": _stats(hr), "lr": _stats(lr)}
+    track = tracking(lr, lr_sim) if lr_sim is not None else None
     _save(d / "hr.npy", hr.cpu().numpy())
     _save(d / "lr.npy", lr.cpu().numpy())
     _save(d / "solid_hr.npy", (solid_hr > 0.5).to(torch.uint8).cpu().numpy())
@@ -148,7 +177,11 @@ def run(scenario: Scenario, out_dir: str | Path | None = None, frames: int | Non
     del hr, lr
     t_hr = time.perf_counter() - t0
     t_lr = 0.0
-    if with_lr_sim:
+    if lr_sim is not None:
+        stats["lr_sim"] = _stats(lr_sim)
+        _save(d / "lr_sim.npy", lr_sim.cpu().numpy())
+        del lr_sim
+    elif with_lr_sim:
         t1 = time.perf_counter()
         lr_sim, _, _, _ = simulate(scenario, LR_RES, frames, keep="full")
         stats["lr_sim"] = _stats(lr_sim)
@@ -179,6 +212,9 @@ def run(scenario: Scenario, out_dir: str | Path | None = None, frames: int | Non
         "stats": stats, "flags": flags,
         "sim_seconds": {"hr": round(t_hr, 3), "lr": round(t_lr, 3)},
     }
+    if guide is not None:
+        meta["guidance"] = guide.asdict()
+        meta["tracking"] = track   # rel L2 at 32² of lr (pooled guided HR) vs lr_sim, per frame
     tmp = d / "meta.tmp.json"
     tmp.write_text(json.dumps(meta, indent=1))
     os.replace(tmp, d / "meta.json")

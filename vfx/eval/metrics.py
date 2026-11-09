@@ -35,10 +35,13 @@ __all__ = [
     "l1",
     "semi_lagrangian_warp",
     "flicker",
+    "flicker_step",
+    "grad_energy",
     "bicubic_upscale",
     "scenario_dirs",
     "load_scenario",
     "lr_frame_state",
+    "is_complete_scenario",
     "evaluate_upscaler",
     "EvalResult",
 ]
@@ -139,16 +142,38 @@ def semi_lagrangian_warp(x: torch.Tensor, velocity: torch.Tensor, dx: float, dt:
     return out[0] if squeeze else out
 
 
+def flicker_step(prev: torch.Tensor, cur: torch.Tensor, prev_velocity: torch.Tensor, dx: float, dt: float) -> float:
+    """One term of `flicker`: mean | cur - warp(prev, prev_velocity) | (for streaming use)."""
+    return float((_as_tensor(cur) - semi_lagrangian_warp(prev, prev_velocity, dx, dt)).abs().mean().item())
+
+
+def grad_energy(seq) -> float:
+    """Mean absolute forward difference (x and y averaged) of a (.., H, W) field, per cell.
+    Detail measure used only for the diagnostic `flicker_ratio_detail_norm`."""
+    s = _as_tensor(seq)
+    gx = (s[..., :, 1:] - s[..., :, :-1]).abs().mean()
+    gy = (s[..., 1:, :] - s[..., :-1, :]).abs().mean()
+    return float(((gx + gy) / 2).item())
+
+
 def flicker(seq, velocities, dx: float, dt: float) -> float:
     """Warped-frame flicker: mean_t mean_pixels | x_t - warp(x_{t-1}, v_{t-1}) |, t = 1..T-1.
 
     seq: (T, H, W) a scalar sequence (usually HR density). velocities: (T, 2, h, w) m/s, the
     flow at each frame (LR velocity is fine; it is resampled). Frame t-1 -> t is advected by
-    the velocity of frame t-1 (the solver advects with the start-of-step velocity).
-    dx: cell size of `seq` in meters, dt: seconds between frames.
+    the velocity of frame t-1 (vfx.sim advects first, with the start-of-step velocity, which
+    is the velocity stored with frame t-1). dx: cell size of `seq` in meters, dt: seconds
+    between frames.
+
+    `velocities` MUST be the flow that actually transports `seq`, i.e. the velocity of the
+    sequence that drove it (for an upscaler output: the velocity of the LR input it was fed).
+    Warping a sequence with another run's velocity measures the divergence between the two
+    runs, not temporal instability (see evaluate_upscaler and tests/README.md).
 
     Sources and diffusion make this non-zero even for the reference, so judge a prediction
-    by the RATIO flicker(pred) / flicker(reference) on the same velocities (v1 gate: <= 1.2).
+    by the RATIO flicker(pred, v_pred_driver) / flicker(reference, v_reference) (v1 gate: <= 1.2).
+    Response to real flicker: per-frame iid noise of std 0.2% of the frame max roughly doubles
+    the value on dataset v1 HR density (tests/README.md).
     """
     seq = _as_tensor(seq)
     velocities = _as_tensor(velocities).to(seq.device)
@@ -161,8 +186,7 @@ def flicker(seq, velocities, dx: float, dt: float) -> float:
         raise ValueError("need at least 2 frames")
     total = 0.0
     for t in range(1, T):
-        w = semi_lagrangian_warp(seq[t - 1], velocities[t - 1], dx, dt)
-        total += float((seq[t] - w).abs().mean().item())
+        total += flicker_step(seq[t - 1], seq[t], velocities[t - 1], dx, dt)
     return total / (T - 1)
 
 
@@ -210,20 +234,48 @@ def lr_frame_state(frame: np.ndarray, solid: np.ndarray, dt: float = SIM_DT, ste
 
 @dataclass
 class EvalResult:
+    """Scores of one upscaler on one (split, source). Flicker keys (see evaluate_upscaler):
+
+    flicker / flicker_ref / flicker_ratio   AUDITED (gated): pred warped with the velocity of the
+                                            sequence that drove it (`source`); reference = HR warped
+                                            with its own (pooled-HR) velocity.
+    flicker_legacy_hrvel / flicker_ratio_legacy_hrvel
+                                            PRE-AUDIT definition (vfx/train/EXPERIMENTS.md entries up
+                                            to 2026-11-09 12:08): pred always warped with the pooled-HR
+                                            velocity. Identical to the audited value for source="lr";
+                                            for "lr_sim" on v1 (independent run) it mostly measures how
+                                            far the LR sim's flow diverged from the HR run. Not gated.
+    flicker_ref_srcvel                      diagnostic: HR warped with the `source` velocity (meaningful
+                                            only when source follows HR, e.g. v2 lr_sim).
+    flicker_ratio_detail_norm               diagnostic: (flicker / grad_energy) of pred over the same
+                                            for HR. Saturates under real noise (noise also adds gradient
+                                            energy), so it is NOT a gate.
+    """
     split: str
     source: str
     n_scenarios: int = 0
     n_frames: int = 0
+    n_skipped_incomplete: int = 0
     spectrum_error: float = float("nan")      # decades, frame-weighted mean over scenarios
     l1_density: float = float("nan")
     l1_temperature: float = float("nan")      # kelvin
     flicker: float = float("nan")
     flicker_ref: float = float("nan")
-    flicker_ratio: float = float("nan")       # flicker / flicker_ref (mean of per-scenario ratios)
+    flicker_ratio: float = float("nan")       # mean of per-scenario flicker / flicker_ref
+    flicker_legacy_hrvel: float = float("nan")
+    flicker_ratio_legacy_hrvel: float = float("nan")
+    flicker_ref_srcvel: float = float("nan")
+    flicker_ratio_detail_norm: float = float("nan")
     per_scenario: list = field(default_factory=list)
 
     def as_dict(self) -> dict:
         return dict(self.__dict__)
+
+
+def is_complete_scenario(d: Path, need: tuple[str, ...] = ("lr", "hr", "solid_lr")) -> bool:
+    """meta.json is written last by datagen, so it marks a finished scenario directory."""
+    d = Path(d)
+    return (d / "meta.json").exists() and all((d / f"{n}.npy").exists() for n in need)
 
 
 def evaluate_upscaler(upscaler, version: str, split: str = "test", source: str = "lr",
@@ -234,18 +286,32 @@ def evaluate_upscaler(upscaler, version: str, split: str = "test", source: str =
     upscaler: object with .infer(FieldState) -> HRFields (and optional .reset(), called once per
               scenario so temporal state does not leak), or a plain callable FieldState -> HRFields.
     source:   "lr"     = 4x average-pooled HR (the training input distribution), or
-              "lr_sim" = the independent 128^2 sim (the real runtime situation; test/ood only).
-    Flicker of both prediction and reference is measured with the "lr" velocities (the
-    pooled true flow), so the ratio is apples to apples.
+              "lr_sim" = the 128^2 sim (the real runtime situation). In v1 it is an independent
+              run of the same scenario; in v2 the HR run is guided to follow it (matched pair).
+    All stored frames are used (8 in v1, 16 in v2) unless max_frames is given. Scenario dirs
+    that are not finished (no meta.json yet) are skipped and counted in n_skipped_incomplete.
+
+    Flicker (audited 2026-11-09): each sequence is warped with the velocity of the flow that
+    actually transports it:
+        flicker       = flicker(pred density, velocity of `source`)   # the flow the upscaler followed
+        flicker_ref   = flicker(HR density,   velocity of "lr")       # pooled HR = HR's own flow
+        flicker_ratio = mean over scenarios of flicker / flicker_ref  (v1 gate <= 1.2)
+    Both velocities are 128^2, so pred and reference are warped with equally coarse velocity.
+    For source="lr" this is identical to the pre-audit definition. See EvalResult for the
+    legacy and diagnostic keys.
     """
     infer: Callable = getattr(upscaler, "infer", upscaler)
     reset = getattr(upscaler, "reset", None)
     res = EvalResult(split=split, source=source)
     dirs = scenario_dirs(version, split)
+    finished = [d for d in dirs if is_complete_scenario(d)]
+    res.n_skipped_incomplete = len(dirs) - len(finished)
+    dirs = finished
     if max_scenarios is not None:
         dirs = dirs[:max_scenarios]
-    w_spec = w_l1d = w_l1t = w_fl = w_flr = 0.0
-    ratios = []
+    vsl = slice(CH["vel_x"], CH["vel_y"] + 1)
+    acc = {k: 0.0 for k in ("spec", "l1d", "l1t", "fl", "flr", "fll", "flrs")}
+    ratios, ratios_legacy, ratios_norm = [], [], []
     for d in dirs:
         scn = load_scenario(d)
         src = scn[source]
@@ -266,30 +332,41 @@ def evaluate_upscaler(upscaler, version: str, split: str = "test", source: str =
         pd = torch.stack(pd)
         pt = torch.stack(pt)
         hr = torch.from_numpy(np.asarray(scn["hr"][:T], dtype=np.float32)).to(device)
-        vel = torch.from_numpy(np.asarray(scn["lr"][:T, CH["vel_x"]:CH["vel_y"] + 1], dtype=np.float32)).to(device)
+        vel_hr = torch.from_numpy(np.asarray(scn["lr"][:T, vsl], dtype=np.float32)).to(device)
+        vel_src = torch.from_numpy(np.asarray(src[:T, vsl], dtype=np.float32)).to(device)
         dx_hr = 1.0 / hr.shape[-1]
         s = spectrum_error(pd, hr[:, 0])
         ld = l1(pd, hr[:, 0])
         lt = l1(pt, hr[:, 1])
-        fl = flicker(pd, vel, dx_hr, dt) if T > 1 else float("nan")
-        flr = flicker(hr[:, 0], vel, dx_hr, dt) if T > 1 else float("nan")
+        nan = float("nan")
+        fl = flicker(pd, vel_src, dx_hr, dt) if T > 1 else nan          # audited
+        flr = flicker(hr[:, 0], vel_hr, dx_hr, dt) if T > 1 else nan     # reference, own flow
+        fll = flicker(pd, vel_hr, dx_hr, dt) if T > 1 else nan           # legacy
+        flrs = flicker(hr[:, 0], vel_src, dx_hr, dt) if T > 1 else nan   # diagnostic
         ratio = fl / max(flr, 1e-12)
+        ratio_legacy = fll / max(flr, 1e-12)
+        g_p, g_r = max(grad_energy(pd), 1e-12), max(grad_energy(hr[:, 0]), 1e-12)
+        ratio_norm = (fl / g_p) / max(flr / g_r, 1e-12)
         res.per_scenario.append(dict(seed=meta.get("scenario", {}).get("seed"), dir=d.name, frames=T,
                                      spectrum_error=s, l1_density=ld, l1_temperature=lt,
                                      flicker=fl, flicker_ref=flr, flicker_ratio=ratio,
+                                     flicker_legacy_hrvel=fll, flicker_ratio_legacy_hrvel=ratio_legacy,
+                                     flicker_ref_srcvel=flrs, flicker_ratio_detail_norm=ratio_norm,
                                      tags=meta.get("tags", [])))
         res.n_scenarios += 1
         res.n_frames += T
-        w_spec += s * T
-        w_l1d += ld * T
-        w_l1t += lt * T
-        w_fl += fl * T
-        w_flr += flr * T
+        for k, v in (("spec", s), ("l1d", ld), ("l1t", lt), ("fl", fl), ("flr", flr), ("fll", fll), ("flrs", flrs)):
+            acc[k] += v * T
         ratios.append(ratio)
-        del pd, pt, hr, vel
+        ratios_legacy.append(ratio_legacy)
+        ratios_norm.append(ratio_norm)
+        del pd, pt, hr, vel_hr, vel_src
     if res.n_frames:
         n = res.n_frames
-        res.spectrum_error, res.l1_density, res.l1_temperature = w_spec / n, w_l1d / n, w_l1t / n
-        res.flicker, res.flicker_ref = w_fl / n, w_flr / n
+        res.spectrum_error, res.l1_density, res.l1_temperature = acc["spec"] / n, acc["l1d"] / n, acc["l1t"] / n
+        res.flicker, res.flicker_ref = acc["fl"] / n, acc["flr"] / n
+        res.flicker_legacy_hrvel, res.flicker_ref_srcvel = acc["fll"] / n, acc["flrs"] / n
         res.flicker_ratio = float(np.mean(ratios))
+        res.flicker_ratio_legacy_hrvel = float(np.mean(ratios_legacy))
+        res.flicker_ratio_detail_norm = float(np.mean(ratios_norm))
     return res
