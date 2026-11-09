@@ -1,0 +1,77 @@
+# Neural VFX Engine — conventions
+
+Full design: `SPEC.md`. This repo is currently building the **v0 2D demo** (see "Demo scope" in SPEC.md).
+
+## Environment
+- Windows 11, RTX 5080 (sm_120), Python 3.12 venv at `.venv/`.
+- Always run Python as `.venv/Scripts/python` (from the repo root). Never install into the global Python.
+- Packages: torch (cu128), warp-lang, pygame-ce, numpy, scipy, pytest.
+- Datasets/checkpoints are large: they live OUTSIDE OneDrive, under `vfx.core.paths.DATA_ROOT`
+  (default `%LOCALAPPDATA%/neural-vfx`). Never write big files inside the repo.
+
+## Commands
+- Tests: `.venv/Scripts/python -m pytest tests -q`
+- Bench: `.venv/Scripts/python -m bench.run`
+- Datagen: `.venv/Scripts/python -m vfx.datagen.build --version v1`
+- Train: `.venv/Scripts/python -m vfx.train.train --config vfx/train/configs/demo.json`
+- Demo app: `.venv/Scripts/python -m vfx.app.main`
+
+## Layout and ownership (one owner per directory — do not edit other owners' files)
+| Path | Owner |
+|---|---|
+| `vfx/core/` (fields.py, paths.py) | lead — interface changes need lead approval |
+| `vfx/sim/` | solver engineer |
+| `vfx/datagen/` | data engineer |
+| `vfx/model/`, `vfx/train/`, `vfx/runtime/` | ML/runtime engineer |
+| `vfx/render/`, `vfx/app/` | render/app engineer |
+| `tests/`, `bench/`, `vfx/eval/` | test/eval engineer |
+
+If you need something from another module that does not exist yet, code against the interface
+below; do not implement it yourself inside their directory. If an interface is wrong, report it.
+
+## Module interfaces (v0, 2D)
+All types come from `vfx.core.fields`.
+
+```python
+# vfx/sim/__init__.py
+class SolverConfig: ...            # dataclass of physical params, sensible defaults
+class Solver:
+    def __init__(self, res: int, config: SolverConfig | None = None, device="cuda"): ...
+    def reset(self, obstacles: list[Obstacle] = ()) -> FieldState      # ambient, empty
+    def step(self, state: FieldState, forces: Forces, dt: float) -> FieldState
+    # step may update state in place and return it. Deterministic for identical inputs.
+SOLVER_VERSION: str
+
+# vfx/datagen/__init__.py
+def sample_scenario(seed: int, split: str) -> Scenario          # split in {"train","test","ood"}
+def run(scenario: Scenario) -> dict                              # writes one scenario dir, returns metadata
+def load_dataset(version: str) -> "PairedDataset"               # see datagen README for format
+
+# vfx/runtime/__init__.py
+class Upscaler:                    # neural; owns temporal state (previous HR output)
+    def __init__(self, checkpoint_path: str | None = None, device="cuda"): ...
+    def reset(self) -> None
+    def infer(self, lr_state: FieldState) -> HRFields               # HR_RES x HR_RES
+    timings: dict[str, float]      # ms of last infer, measured with CUDA events
+def classical_upscale(lr_state: FieldState, mode="bicubic") -> HRFields   # baseline
+
+# vfx/render/__init__.py
+class Renderer:
+    def __init__(self, out_size: tuple[int, int], device="cuda"): ...
+    def draw(self, fields: HRFields, solid: torch.Tensor | None = None) -> torch.Tensor
+    # returns (out_h, out_w, 3) uint8 on cuda, already flipped so row 0 = top of screen
+
+# vfx/eval/metrics.py
+def spectrum_error(pred, ref) -> float      # log radial power-spectrum error of density
+def flicker(seq, velocities, dx, dt) -> float
+def l1(pred, ref) -> float
+```
+
+## Rules
+- No CPU copies (`.cpu()`, `.item()`, `.numpy()`, `print(tensor)`) in the frame loop. The ONLY
+  exception is the final display blit in `vfx/app/`.
+- Time GPU work with `torch.cuda.Event` / `wp.ScopedTimer(synchronize=True)`, never wall-clock without sync.
+- Small, readable modules. Each owner adds a short `README.md` in their directory.
+- The test agent never tests code it wrote; owners may add quick self-checks under their own dir
+  (`vfx/<mod>/selfcheck.py`) but the gate tests live in `tests/`.
+- Report numbers you measured; do not claim numbers you did not run.
