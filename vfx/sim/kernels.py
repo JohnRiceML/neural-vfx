@@ -18,6 +18,8 @@ P_N_EM = 3
 P_N_IMP = 4
 P_DX = 5
 P_AMB = 6
+P_KAPPA = 7
+P_CFLOOR = 8
 P_ALPHA = 16
 P_BETA = 17
 P_EPS = 18
@@ -236,7 +238,7 @@ def solid_at(solid: wp.array2d(dtype=float), y: int, x: int) -> bool:
 
 @wp.kernel
 def curl(f: wp.array3d(dtype=float), solid: wp.array2d(dtype=float), inv2dx: float,
-         w_out: wp.array2d(dtype=float)):
+         w_out: wp.array3d(dtype=float)):
     """omega = dvy/dx - dvx/dy, central differences; walls / solids count as zero velocity."""
     y, x = wp.tid()
     H = f.shape[1]
@@ -253,41 +255,67 @@ def curl(f: wp.array3d(dtype=float), solid: wp.array2d(dtype=float), inv2dx: flo
         vxt = f[C_VX, y + 1, x]
     if not solid_at(solid, y - 1, x):
         vxb = f[C_VX, y - 1, x]
-    w_out[y, x] = ((vyr - vyl) - (vxt - vxb)) * inv2dx
+    w_out[0, y, x] = ((vyr - vyl) - (vxt - vxb)) * inv2dx
+
+
+@wp.func
+def binom3(a: wp.array3d(dtype=float), c: int, solid: wp.array2d(dtype=float), y: int, x: int) -> float:
+    """[1,2,1]^2 / 16 average of channel c over fluid cells only (renormalised at walls / solids)."""
+    s = float(0.0)
+    ws = float(0.0)
+    for j in range(-1, 2):
+        for i in range(-1, 2):
+            if not solid_at(solid, y + j, x + i):
+                q = float((2 - wp.abs(i)) * (2 - wp.abs(j)))
+                s += q * a[c, y + j, x + i]
+                ws += q
+    if ws > 0.0:
+        return s / ws
+    return 0.0
+
+
+@wp.kernel
+def smooth_curl(w: wp.array3d(dtype=float), solid: wp.array2d(dtype=float), out: wp.array3d(dtype=float)):
+    """omega_s = [1,2,1]^2 smoothed vorticity (confinement acts on resolved vortices, not grid noise)."""
+    y, x = wp.tid()
+    out[0, y, x] = binom3(w, 0, solid, y, x)
 
 
 @wp.kernel
 def body_forces(f: wp.array3d(dtype=float), solid: wp.array2d(dtype=float),
-                omega: wp.array2d(dtype=float), prm: wp.array(dtype=float)):
-    """Buoyancy + vorticity confinement + wind marker force, explicit Euler, in place."""
+                omega: wp.array3d(dtype=float), prm: wp.array(dtype=float), force: wp.array3d(dtype=float)):
+    """Buoyancy + vorticity confinement + wind marker force -> force (2,H,W) (applied by apply_forces)."""
     y, x = wp.tid()
     if solid[y, x] > 0.5:
+        force[0, y, x] = 0.0
+        force[1, y, x] = 0.0
         return
     H = f.shape[1]
     W = f.shape[2]
-    dt = prm[P_DT]
-    dx = prm[P_DX]
     amb = prm[P_AMB]
     d = f[C_D, y, x]
     T = f[C_T, y, x]
     fx = 0.0
     fy = -prm[P_ALPHA] * d + prm[P_BETA] * (T - amb)
 
-    # vorticity confinement: N = grad|w| / |grad|w||, f = eps dx (N x w)
+    # vorticity confinement: N = grad|w| / sqrt(|grad|w||^2 + (floor |w|)^2), f = eps dx (N x w).
+    # The floor makes N -> 0 smoothly on ridges / flat regions of |w| where the unit vector is
+    # undefined (it used to point in a noise-driven direction there, at full force).
     eps = prm[P_EPS]
     if eps != 0.0:
         xr = wp.min(x + 1, W - 1)
         xl = wp.max(x - 1, 0)
         yt = wp.min(y + 1, H - 1)
         yb = wp.max(y - 1, 0)
-        gx = (wp.abs(omega[y, xr]) - wp.abs(omega[y, xl])) / float(wp.max(xr - xl, 1))
-        gy = (wp.abs(omega[yt, x]) - wp.abs(omega[yb, x])) / float(wp.max(yt - yb, 1))
-        mag = wp.sqrt(gx * gx + gy * gy) + 1.0e-20
+        gx = (wp.abs(omega[0, y, xr]) - wp.abs(omega[0, y, xl])) / float(wp.max(xr - xl, 1))
+        gy = (wp.abs(omega[0, yt, x]) - wp.abs(omega[0, yb, x])) / float(wp.max(yt - yb, 1))
+        w = omega[0, y, x]
+        fl = prm[P_CFLOOR] * w
+        mag = wp.sqrt(gx * gx + gy * gy + fl * fl) + 1.0e-20
         nx = gx / mag
         ny = gy / mag
-        w = omega[y, x]
-        fx += eps * dx * (ny * w)
-        fy += eps * dx * (-nx * w)
+        fx += eps * prm[P_DX] * (ny * w)
+        fy += eps * prm[P_DX] * (-nx * w)
 
     # wind: a uniform acceleration is a pure gradient in a closed box (the projection would
     # cancel it exactly), so it acts on the gas that carries smoke / fuel / heat instead.
@@ -298,5 +326,47 @@ def body_forces(f: wp.array3d(dtype=float), solid: wp.array2d(dtype=float),
         fx += wxv * m
         fy += wyv * m
 
-    f[C_VX, y, x] = f[C_VX, y, x] + fx * dt
-    f[C_VY, y, x] = f[C_VY, y, x] + fy * dt
+    force[0, y, x] = fx
+    force[1, y, x] = fy
+
+
+@wp.kernel
+def apply_forces(f: wp.array3d(dtype=float), solid: wp.array2d(dtype=float),
+                 force: wp.array3d(dtype=float), prm: wp.array(dtype=float)):
+    """u += dt * ([1,2,1]^2-smoothed force). Body forces are resolved over >= 2 cells: a force
+    that jumps cell to cell mostly feeds the grid-scale modes the collocated projection cannot
+    see (it turns their divergence into row/column-alternating velocity)."""
+    y, x = wp.tid()
+    if solid[y, x] > 0.5:
+        return
+    dt = prm[P_DT]
+    f[C_VX, y, x] = f[C_VX, y, x] + dt * binom3(force, 0, solid, y, x)
+    f[C_VY, y, x] = f[C_VY, y, x] + dt * binom3(force, 1, solid, y, x)
+
+
+@wp.func
+def nb_or(f: wp.array3d(dtype=float), solid: wp.array2d(dtype=float), c: int, y: int, x: int,
+          fb: float) -> float:
+    if solid_at(solid, y, x):
+        return fb
+    return f[c, y, x]
+
+
+@wp.kernel
+def diffuse_heat_fuel(src: wp.array3d(dtype=float), solid: wp.array2d(dtype=float),
+                      prm: wp.array(dtype=float), nsub: float, dst: wp.array3d(dtype=float)):
+    """One explicit substep of temperature + fuel diffusion (heat_diffusion, m^2/s), zero flux
+    through walls / solids. Conservative and monotone (lambda capped at 0.24)."""
+    y, x = wp.tid()
+    dx = prm[P_DX]
+    lam = wp.min(prm[P_KAPPA] * prm[P_DT] / (nsub * dx * dx), 0.24)
+    for c in range(C_T, C_F + 1):
+        v = src[c, y, x]
+        if solid[y, x] > 0.5 or lam <= 0.0:
+            dst[c, y, x] = v
+        else:
+            l = nb_or(src, solid, c, y, x - 1, v)
+            r = nb_or(src, solid, c, y, x + 1, v)
+            b = nb_or(src, solid, c, y - 1, x, v)
+            t = nb_or(src, solid, c, y + 1, x, v)
+            dst[c, y, x] = v + lam * (l + r + b + t - 4.0 * v)

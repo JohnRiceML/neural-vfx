@@ -3,8 +3,8 @@
 Step order (output velocity is divergence-free):
   1. advect density, velocity, temperature, fuel by u^n   (MacCormack, RK2 traces, clamped)
   2. density mass correction (global, deterministic tile reduction; see README)
-  3. emitters, impulses, combustion, cooling, dissipation
-  4. buoyancy, vorticity confinement, wind
+  3. emitters, impulses, combustion, cooling, dissipation; heat + fuel diffusion
+  4. buoyancy, vorticity confinement (smoothed vorticity), wind; force applied [1,2,1]^2-smoothed
   5. pressure projection (MG-PCG, exact for the face-averaged central divergence)
 
 The whole step is captured once per (state.data, state.solid) buffer pair as a CUDA graph;
@@ -31,7 +31,7 @@ _CFG_SLOTS = {
     "density_dissipation": K.P_DDISS, "temperature_cooling": K.P_COOL, "burn_rate": K.P_BURN,
     "ignition_temp": K.P_IGN, "burn_heat": K.P_BHEAT, "smoke_from_fuel": K.P_SMOKE,
     "pressure_tol": K.P_TOL, "pressure_max_iters": K.P_MAXIT, "max_temperature": K.P_TMAX,
-    "wind_marker_temp": K.P_WMARK,
+    "wind_marker_temp": K.P_WMARK, "heat_diffusion": K.P_KAPPA, "confinement_floor": K.P_CFLOOR,
 }
 
 
@@ -86,7 +86,11 @@ class Solver:
         z = lambda shape: wp.zeros(shape, dtype=float, device=self.wdev)
         self.hat = z((NUM_CHANNELS, N, N))
         self.adv = z((NUM_CHANNELS, N, N))
-        self.omega = z((N, N))
+        self.omega = z((1, N, N))
+        self.omega_s = z((1, N, N))
+        self.force = z((2, N, N))
+        # diffusion substeps (even: the ping-pong through `hat` ends back in the state)
+        self.n_diff = 2 * max(1, -(-N // 256))
         self.prm = z(K.P_SIZE)
         self.scal = z(K.S_SIZE)
         self.pressure = PressureSolver(N, N, self.wdev)
@@ -250,6 +254,11 @@ class Solver:
                         block_dim=256, device=d)
         wp.launch_tiled(self.k_fin_mass, dim=[1], inputs=[self.mass_part, self.scal], block_dim=256, device=d)
         wp.launch(K.sources, dim=dims, inputs=[self.adv, solid, self.prm, self.scal, data], device=d)
+        for k in range(self.n_diff):
+            a, b = (data, self.hat) if k % 2 == 0 else (self.hat, data)
+            wp.launch(K.diffuse_heat_fuel, dim=dims, inputs=[a, solid, self.prm, float(self.n_diff), b], device=d)
         wp.launch(K.curl, dim=dims, inputs=[data, solid, 0.5 * inv_dx, self.omega], device=d)
-        wp.launch(K.body_forces, dim=dims, inputs=[data, solid, self.omega, self.prm], device=d)
+        wp.launch(K.smooth_curl, dim=dims, inputs=[self.omega, solid, self.omega_s], device=d)
+        wp.launch(K.body_forces, dim=dims, inputs=[data, solid, self.omega_s, self.prm, self.force], device=d)
+        wp.launch(K.apply_forces, dim=dims, inputs=[data, solid, self.force, self.prm], device=d)
         self.pressure.record(data, K.C_VX, solid, self.prm, self.scal)

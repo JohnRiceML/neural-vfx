@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-SOLVER_VERSION: str = "sim2d-warp-0.1.0"
+SOLVER_VERSION: str = "sim2d-warp-0.2.0"
 
 
 @dataclass
@@ -18,6 +18,8 @@ class SolverConfig:
     # --- vorticity confinement: f = vorticity_eps * dx * (N x omega)   [vorticity_eps in 1/s]
     #     The dx factor makes the per-step velocity change of a grid-scale vortex resolution
     #     independent (it re-injects what the dx-scaled numerical dissipation removes).
+    #     omega is [1,2,1]^2-smoothed first and N = grad|w| / sqrt(|grad|w||^2 + (floor*|w|)^2),
+    #     so N fades out smoothly on vorticity ridges instead of flipping sign cell by cell.
     vorticity_eps: float = 6.0
     # --- decay (rates per second, exponential): d *= exp(-k dt), T-T_amb *= exp(-k dt)
     density_dissipation: float = 0.05
@@ -37,3 +39,9 @@ class SolverConfig:
     # --- extras (not part of the fixed name set; safe defaults)
     max_temperature: float = 3000.0   # K, hard cap + combustion saturation
     wind_marker_temp: float = 300.0    # kelvin above ambient that counts as a "full" wind marker
+    # m^2/s, diffusivity of temperature AND fuel (Lewis number 1). Gives the ignition front a
+    # finite world-space thickness; without it the bistable burn makes a 1-cell temperature
+    # step that the buoyancy turns into grid-scale noise. 0 disables. The effective value is
+    # capped at 0.24 * n_sub * dx^2 / dt (n_sub = 2 per 256 cells), i.e. ~9e-5 at 512^2, 30 Hz.
+    heat_diffusion: float = 5.0e-5
+    confinement_floor: float = 0.5     # see vorticity confinement above (0 = plain unit N)
