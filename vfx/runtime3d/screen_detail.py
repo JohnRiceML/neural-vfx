@@ -2,7 +2,10 @@
 
 Per frame:
   1. pick the processed region: aux["bbox"] = (x0, y0, x1, y1) screen pixels of the effect (or the whole
-     frame), grown to a multiple of `quantum` px (one CUDA graph per region size), clamped to the frame.
+     frame), grown per axis to the next of a few fixed sizes (`crop_fracs` of the frame side, rounded up to
+     `quantum` px) and shifted to stay inside the frame. So at most len(crop_fracs)^2 CUDA graphs exist per
+     frame size (36 by default, ~25 ms each), captured lazily or all at once by `warmup(H, W)`; an orbiting camera
+     never triggers a capture after that.
   2. copy the region of frame / aux / previous output into static buffers (plain slicing, no sync).
   3. graph: uint8 -> fp16, warp the previous output by the screen velocity (aux, px/frame), optional
      downscale to `process_scale`, ScreenNet -> Δrgb, bilinear upsample of Δ, add, clamp, -> uint8.
@@ -16,7 +19,7 @@ import torch
 import torch.nn.functional as F
 
 from vfx.model3d import AUX_CHANNELS, ScreenNet, ScreenNetConfig, load_screen_net, param_count
-from vfx.runtime3d.volume_upscaler import capture_graph
+from vfx.runtime3d.volume_upscaler import capture_graph, cudnn_tuned
 
 # the config we would train next (see README)
 DEFAULT_ARCH = dict(width=64, n_blocks=4, trunk_stride=4, hr_feats=4, hr_hidden=8, hr_kernel=1,
@@ -26,8 +29,11 @@ VEL_NORM = 16.0     # px/frame -> network units
 
 class ScreenDetail:
     def __init__(self, checkpoint_path=None, device="cuda", *, process_scale: float = 0.5, quantum: int = 64,
-                 cuda_graph: bool = True, channels_last: bool = True, **arch):
-        torch.backends.cudnn.benchmark = True
+                 crop_fracs=(0.25, 0.375, 0.5, 0.625, 0.75, 1.0), tune: bool = False, prewarm: bool = True, cuda_graph: bool = True,
+                 channels_last: bool = True, **arch):
+        self.crop_fracs = tuple(sorted(crop_fracs))
+        self.tune = tune          # cudnn autotune per crop shape: ~1 s per capture and no faster, see README
+        self.prewarm = prewarm    # capture every crop size on the first frame of a new frame size
         self.device = torch.device(device)
         if checkpoint_path:
             self.model, self.untrained = load_screen_net(checkpoint_path, device), False
@@ -49,6 +55,7 @@ class ScreenDetail:
         self._pool = torch.cuda.graph_pool_handle() if self.cuda_graph else None
         self._graphs: dict = {}
         self._bufs: dict = {}
+        self._store = None
         self._out = None
         self._ev = {k: torch.cuda.Event(enable_timing=True) for k in ("start", "net", "end")}
         self.reset()
@@ -87,32 +94,53 @@ class ScreenDetail:
         return out_u8
 
     def _alloc(self, key):
+        """Static graph buffers for a crop size = views into ONE shared max-size storage (only one crop
+        size runs per frame), so memory does not grow with the number of crop sizes."""
         if key not in self._bufs:
             ch, cw = key
-            z = dict(device=self.device)
-            self._bufs[key] = (torch.zeros(ch, cw, 3, dtype=torch.uint8, **z),
-                               torch.zeros(AUX_CHANNELS, ch, cw, dtype=torch.half, **z),
-                               torch.zeros(ch, cw, 3, dtype=torch.uint8, **z),
-                               torch.zeros(ch, cw, 3, dtype=torch.uint8, **z))
+            n = ch * cw
+            if self._store is None or self._store[0].numel() < 3 * n:
+                if self._bufs:
+                    raise RuntimeError("ScreenDetail: crop buffer outgrew its storage (captured graphs hold views)")
+                z = dict(device=self.device)
+                self._store = (torch.zeros(3 * n, dtype=torch.uint8, **z), torch.zeros(AUX_CHANNELS * n, dtype=torch.half, **z),
+                               torch.zeros(3 * n, dtype=torch.uint8, **z), torch.zeros(3 * n, dtype=torch.uint8, **z))
+            r, a, p, o = self._store
+            self._bufs[key] = (r[:3 * n].view(ch, cw, 3), a[:AUX_CHANNELS * n].view(AUX_CHANNELS, ch, cw),
+                               p[:3 * n].view(ch, cw, 3), o[:3 * n].view(ch, cw, 3))
+
+    def _reset_size(self, H, W):
+        """New frame size: drop graphs/buffers, size the shared storage for the largest crop."""
+        self._graphs.clear()
+        self._bufs.clear()
+        self._store = None
+        self._alloc((self.sizes(H)[-1], self.sizes(W)[-1]))
 
     def _run(self, key):
         if not self.cuda_graph:
-            with torch.inference_mode():
+            with torch.inference_mode(), cudnn_tuned(self.tune):
                 return self._body(key)
         g = self._graphs.get(key)
         if g is None:
-            g = self._graphs[key] = capture_graph(lambda: self._body(key), self.device, self._pool)
+            g = self._graphs[key] = capture_graph(lambda: self._body(key), self.device, self._pool, warm=1,
+                                                  tune=self.tune)
         g[0].replay()
         return g[1]
 
-    def _region(self, H, W, bbox):
+    def sizes(self, L: int) -> list[int]:
+        """The fixed crop sizes (px) used along an axis of length L."""
         q = self.quantum
+        return sorted({-(-max(int(L * f), 1) // q) * q for f in self.crop_fracs})
+
+    def _region(self, H, W, bbox):
         if bbox is None:
             x0, y0, x1, y1 = 0, 0, W, H
         else:
             x0, y0, x1, y1 = (int(v) for v in bbox)
         def fit(a, b, L):
-            n = -(-(b - a) // q) * q
+            a, b = max(a, 0), min(b, L)
+            sz = self.sizes(L)
+            n = next((v for v in sz if v >= b - a), sz[-1])
             if n >= L:
                 return 0, n, L            # whole axis; buffer padded to n
             a = min(max(a - (n - (b - a)) // 2, 0), L - n)
@@ -131,6 +159,9 @@ class ScreenDetail:
         if self._out is None or self._out[0].shape[:2] != (H, W):
             self._out = [torch.empty_like(frame) for _ in range(2)]
             self._cold = True
+            self._reset_size(H, W)
+            if self.prewarm:
+                self._capture_all(H, W)
         y0, x0, ch, cw, vh, vw = self._region(H, W, aux.get("bbox"))
         self._last_region = (y0, x0, vh, vw)
         key = (ch, cw)
@@ -139,6 +170,12 @@ class ScreenDetail:
         out.copy_(frame)
         self._alloc(key)
         rgb_b, aux_b, prev_b, _ = self._bufs[key]
+        if vh < ch or vw < cw:          # crop wider than the frame: zero the pad (storage is shared)
+            for t in (rgb_b, prev_b):
+                t[vh:].zero_()
+                t[:, vw:].zero_()
+            aux_b[:, vh:].zero_()
+            aux_b[:, :, vw:].zero_()
         rgb_b[:vh, :vw].copy_(frame[y0:y0 + vh, x0:x0 + vw])
         prev_b[:vh, :vw].copy_(prev_full[y0:y0 + vh, x0:x0 + vw])
         for i, name in enumerate(("transmittance", "depth")):
@@ -154,6 +191,25 @@ class ScreenDetail:
         self._frame += 1
         ev["end"].record()
         return out
+
+    def warmup(self, H: int, W: int) -> None:
+        """Capture the graphs of every crop size for an (H, W) frame up front (infer does this itself on
+        the first frame of a new size when prewarm=True: ~0.5 s once for 36 sizes at 1440p)."""
+        if not self.cuda_graph:
+            return
+        if self._out is None or self._out[0].shape[:2] != (H, W):
+            self._out = [torch.zeros(H, W, 3, device=self.device, dtype=torch.uint8) for _ in range(2)]
+            self._cold = True
+            self._reset_size(H, W)
+        self._capture_all(H, W)
+        torch.cuda.synchronize(self.device)
+
+    def _capture_all(self, H, W):
+        for ch in self.sizes(H):
+            for cw in self.sizes(W):
+                if (ch, cw) not in self._graphs:
+                    self._alloc((ch, cw))
+                    self._run((ch, cw))
 
     @property
     def timings(self) -> dict:

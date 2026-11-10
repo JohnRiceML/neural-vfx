@@ -47,9 +47,24 @@ it redraws with `reuse_volume=True` (skips pack/upload/light volume), shown in t
 "render X new vol / Y reuse". Each frame: render each visible view into one 1600x900 GPU
 canvas → ONE `.cpu()` blit → pygame. CUDA events per stage (`sim`, `sim_ref`, `upscale`,
 `neural_vol`, `detail`, `render`) are read only after that blit.
-HUD: fps / 1% low, GPU ms per stage, **tick-frame total** (sim + upscale + detail + render, i.e. the
-worst frame, the one with a sim tick) and the amortized total against the 6 ms budget with a bar,
-VRAM, mode, key help.
+### Window layout and HUD
+The views sit above a dedicated 210 px HUD strip, so the HUD never covers a view (single: one
+1600x690 view; side-by-side: two 799x690 views). `H` hides the strip and the views take the full window.
+Strip columns: status (modes, preset, fps / 1% low, march size, VRAM, sim step, dissipation) | GPU
+budget | key help. The budget table is for the main (left) view:
+
+| column | meaning |
+|---|---|
+| tick | GPU ms of the stage when it runs (one 30 Hz sim tick; render = new-volume draw / camera-only redraw) |
+| /frame | amortized per 60 Hz display frame, the figure the spec budgets: sim, volume upscale (trilinear or route A) and the render's volume prep run every other frame, so they count half; route B detail runs every frame; render = (new + reuse) / 2 |
+| budget | spec per-stage budget: sim 2.0, detail 2.5 (volume upscale or screen detail), render 1.5; frame 6.0 |
+
+Each stage has a bar (solid = /frame, outline = tick, white mark = its budget). The stacked bar is
+the /frame total against the 6 ms frame budget (grey ticks at the stage allocations 2.0 / 4.5; the outline
+is the tick-frame total, i.e. the worst frame). In side-by-side, a line gives the right view's own
+/frame and tick totals. If `bench3d/results/latest.json` exists, the last line is the speed ratio:
+measured direct 256³ sim ms/step (bench3d `brute256` rows, mean over march scales; `plume_sphere` for
+preset 2, `campfire` otherwise) / this view's tick-frame total. It is omitted for `ref128`.
 
 **The window renders at 1600x900 (800x450 marched at scale 0.5), not 1440p.** A 1440p canvas would
 make the single allowed CPU blit (~11 MB/frame) dominate the frame. The 1440p render cost is
@@ -63,14 +78,37 @@ fails, `_stubs.py` (torch toy solver, trilinear upscale) is used and listed in t
 `VolumeUpscaler` captures a CUDA graph per active-brick count on first use (hitches the first time
 the plume grows); `--warmup-neural` pre-captures all of them at start-up instead (took 70 s on the
 shared GPU). The toy stub solver is a slow torch fallback (~45 ms/tick), not a performance number. Route B gets
-`aux={"bbox": projected domain-cube bbox, "transmittance": renderer alpha}`; the bbox size is
-bucketed to quarters of the view because ScreenDetail captures one CUDA graph per crop size (an
-orbiting camera otherwise re-captured every few frames, ~1.9 s hitch each).
+`aux={"bbox": projected domain-cube bbox, "transmittance": renderer alpha}`. The exact bbox is passed:
+ScreenDetail now buckets crop sizes itself (fixed fractions of the frame), so the app-side bucketing
+workaround was removed. Checked: 900 headless frames of route B, orbiting and zooming (dist 1.0-4.4):
+4 graphs, 0 frames > 50 ms, max frame 11 ms.
 
 Files: `main.py` (window/headless loops, input, HUD layout), `pipeline.py` (GPU state, timers),
 `hud.py`, `presets.py`, `backends.py`, `_stubs.py`.
 
+## Presets: game-effect dissipation
+`Preset.sim` holds SolverConfig3D overrides applied to the 64³ runtime solver AND the 128³ reference
+(`Pipeline.set_sim_config`; Solver3D reads `config` every step, so there is no recapture). With the
+solver defaults (density dissipation 0.05 /s) the smoke never leaves the closed 1 m box and after
+~30 s it is a grey haze. Every preset now uses `density_dissipation 1.2 /s, temperature_cooling 5 /s`,
+with stronger emitters (fire fuel 7 -> 10, smoke 2.5 -> 4.0 / 2.0 -> 3.2) to keep the plume body.
+Steady state after 1800 sim steps (60 s), active 8³-cell bricks by the VolumeUpscaler definition
+(density > 1e-3 or T > ambient + 1 K, dilated 2 cells), and voxels with density > 0.02:
+
+| preset | active bricks (old config) | active bricks | voxels > 0.02 |
+|---|---|---|---|
+| 1 campfire | 100 % | 31 % | 0.8 % |
+| 2 plume + sphere | 100 % | 38 % | 1.4 % |
+| 3 twin torches | 100 % | 39 % | 0.7 % |
+| 4 box obstacle | 100 % | 39 % | 1.2 % |
+
+The fraction is flat from step 600 to 1800 (within ±3 points). The 1e-3 threshold plus the 2-cell
+dilation counts very thin smoke under the lid, so ~1/3 of the bricks stay active while the visible
+smoke is a localized plume. Fewer active bricks would need stronger dissipation (2.0 /s: 22-28 %),
+which shortens the visible plume. The 128³ reference plume rises faster than 64³ (see sim3d README),
+so it still reaches the lid and spreads there before it fades.
+
 ## Measured (shared GPU, 96 % busy with other processes; see render3d README)
-Window `--quit-after 10 --orbit`, campfire, trilinear 256�: 60.5 fps (capped), 1% low 55, 2.4 ms
+Window `--quit-after 10 --orbit`, campfire, trilinear 256³: 60.5 fps (capped), 1% low 55, 2.4 ms
 GPU per frame. Headless uncapped (lighter contention): trilinear 405 fps, route B 421 fps; route A
-110 fps (neural_vol 2.4 ms/tick); ref128 85 fps (128� full-quality sim 14.7 ms/tick).
+110 fps (neural_vol 2.4 ms/tick); ref128 85 fps (128³ full-quality sim 14.7 ms/tick).

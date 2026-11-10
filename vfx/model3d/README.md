@@ -15,3 +15,8 @@ Both nets zero-initialise their last conv, so an untrained net returns exactly i
   aux = transmittance, depth, screen velocity (px/frame / 16). Trunk at 1/`trunk_stride` resolution via
   PixelUnshuffle, PixelShuffle back, light 1x1 HR head.
 - `save_*/load_*` store `{"config", "state_dict"}` like the 2D checkpoints.
+- Untrained-output check (2026-11-09): on the live campfire preset the sandbox's `neural_vol` output equals
+  `classical_upscale_3d` to within fp16 rounding: |Δdensity| ≤ 2.4e-4, |ΔT| ≤ 1 K at 1870 K, over 200 steps. The
+  rendered frame shows the same fire as trilinear (see `vfx/runtime3d/README.md`).
+- The runtime captures its CUDA graphs at construction. To swap weights into a live `VolumeUpscaler`, use
+  `VolumeUpscaler.load_state_dict`, not `up.model.load_state_dict`.

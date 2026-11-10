@@ -324,7 +324,6 @@ def bench_recommended(state):
 def selfcheck() -> dict:
     """Correctness (not timing): sparse warp == dense warp at brick voxels; fused Warp HR path ==
     PyTorch VolumeNet with random (non-zero) head weights; untrained outputs == classical / input."""
-    from vfx.runtime3d.fused import FusedHR
     res = {}
     st = plume_state()
     g = torch.Generator(device=DEV).manual_seed(0)
@@ -346,8 +345,7 @@ def selfcheck() -> dict:
         torch.manual_seed(1)
         torch.nn.init.normal_(ut.model.hr2.weight, std=0.05)
         uf = VolumeUpscaler(fused=True, **kw)
-        uf.model.load_state_dict(ut.model.state_dict())
-        uf.fused = FusedHR(uf.model, DEV)
+        uf.load_state_dict(ut.model.state_dict())      # in place: graphs were captured at construction
         d = c = 0.0
         for _ in range(3):
             a, b = ut.infer(st, active=active), uf.infer(st, active=active)

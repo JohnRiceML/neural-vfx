@@ -23,10 +23,29 @@ from vfx.app3d.presets import DEFAULT_OBSTACLE, PRESETS, fire_emitter, puff_emit
 from vfx.render3d import camera_basis
 
 WIN_W, WIN_H = 1600, 900
+STRIP_H = 210                # HUD strip under the views (never overlaps them); H hides it
 BG = (8, 9, 12)
 TAP_S = 0.25                 # F shorter than this = toggle; longer = torch
 BUDGET_MS = 6.0
+STAGE_BUDGET = {"sim": 2.0, "detail": 2.5, "render": 1.5}     # spec, per 60 Hz frame
 MARCH_SCALES = [1.0, 0.5, 0.25]
+SHORT = {"raw": "raw 64³", "trilinear": "trilinear 256³", "neural_vol": "neural vol (A)",
+         "neural_screen": "neural screen (B)", "ref128": "ref 128³ sim"}
+DIM_TXT = (150, 158, 175)
+BENCH_JSON = Path(__file__).resolve().parents[2] / "bench3d" / "results" / "latest.json"
+
+
+def brute256_sim_ms() -> dict:
+    """Measured direct 256^3 sim ms/step per bench3d scene (mean over its march scales); {} if absent."""
+    try:
+        rows = json.loads(BENCH_JSON.read_text(encoding="utf-8")).get("rows", [])
+        out: dict = {}
+        for r in rows:
+            if r.get("pipeline") == "brute256" and isinstance(r.get("sim"), (int, float)):
+                out.setdefault(r["scene"], []).append(float(r["sim"]))
+        return {k: sum(v) / len(v) for k, v in out.items()}
+    except Exception:
+        return {}
 
 
 class Orbit:
@@ -120,6 +139,7 @@ class App:
         self.side = args.side_by_side
         self.paused = False
         self.hud_on = True
+        self.brute256 = brute256_sim_ms()
         self.load_preset(args.preset)
         self.canvas = torch.empty(WIN_H, WIN_W, 3, dtype=torch.uint8, device="cuda")
         self._clear_canvas()
@@ -134,6 +154,7 @@ class App:
         self.preset_id = k
         self.preset = PRESETS[k]
         self.ctl.clear()
+        self.pipe.set_sim_config(self.preset.sim)
         self.pipe.reset(self.preset.obstacles)
 
     def toggle_obstacle(self):
@@ -148,11 +169,15 @@ class App:
             if self.pipe.march_scale in MARCH_SCALES else 0
         self.pipe.set_march_scale(MARCH_SCALES[i])
 
+    def view_h(self) -> int:
+        return WIN_H - STRIP_H if self.hud_on else WIN_H
+
     def layout(self):
+        vh = self.view_h()
         if self.side:
             hw = WIN_W // 2
-            return [(self.mode, (0, 0, hw, WIN_H)), (self.mode2, (hw, 0, WIN_W - hw, WIN_H))]
-        return [(self.mode, (0, 0, WIN_W, WIN_H))]
+            return [(self.mode, (0, 0, hw - 1, vh)), (self.mode2, (hw + 1, 0, WIN_W - hw - 1, vh))]
+        return [(self.mode, (0, 0, WIN_W, vh))]
 
     def modes(self):
         return {m for m, _ in self.layout()}
@@ -171,9 +196,9 @@ class App:
         self.pipe.tick(self.ctl.forces(self.preset), self.modes())
 
     def compose(self) -> torch.Tensor:
-        if (self.side, self.mode, self.mode2) != getattr(self, "_last_layout", None):
+        if (self.side, self.mode, self.mode2, self.hud_on) != getattr(self, "_last_layout", None):
             self._clear_canvas()
-            self._last_layout = (self.side, self.mode, self.mode2)
+            self._last_layout = (self.side, self.mode, self.mode2, self.hud_on)
             if any(m not in self.pipe.vols for m in self.modes()):
                 self.sim_tick()                      # make sure newly visible modes have a volume
         cam = self.orbit.camera()
@@ -196,47 +221,77 @@ class App:
         return host
 
     # ------------------------------------------------------------------ HUD / stats
-    def budget(self, mode):
+    def stage_ms(self, mode, slot: int = 0) -> dict:
+        """GPU ms of one view's stages: per tick (30 Hz work) and per 60 Hz display frame (amortized:
+        sim / volume upscale / volume prep run every other frame, screen-space detail every frame)."""
         t = self.pipe.timer
         sim = t.last("sim_ref") if mode == "ref128" else t.last("sim")
-        up = {"trilinear": t.last("upscale"), "neural_vol": t.last("neural_vol")}.get(mode, 0.0)
-        det = t.last("detail") if mode == "neural_screen" else 0.0
-        return [("sim", sim), ("upscale", up), ("detail", det), ("render", t.last("render")),
-                ("view", t.last("render_view"))]
+        if mode == "trilinear":
+            det_tick, det_frame, det_lab = t.last("upscale"), 0.5 * t.last("upscale"), "detail  upscale@30"
+        elif mode == "neural_vol":
+            det_tick, det_frame, det_lab = t.last("neural_vol"), 0.5 * t.last("neural_vol"), "detail  net @30Hz"
+        elif mode == "neural_screen":
+            d = t.last(f"detail.{slot}")
+            det_tick, det_frame, det_lab = d, d, "detail  net @60Hz"
+        else:
+            det_tick = det_frame = 0.0
+            det_lab = "detail  (none)"
+        rn, rv = t.last(f"render.{slot}"), t.last(f"render_view.{slot}")
+        res = "128³" if mode == "ref128" else "64³"
+        return {
+            "rows": [("sim", f"sim {res}  @30Hz", f"{sim:5.2f}", 0.5 * sim, STAGE_BUDGET["sim"]),
+                     ("detail", det_lab, f"{det_tick:5.2f}", det_frame, STAGE_BUDGET["detail"]),
+                     ("render", "render  new|reuse", f"{rn:4.2f}|{rv:4.2f}", 0.5 * (rn + rv), STAGE_BUDGET["render"])],
+            "tick_ms": {"sim": sim, "detail": det_tick, "render": rn},
+            "tick_total": sim + det_tick + rn,
+            "frame_ms": 0.5 * sim + det_frame + 0.5 * (rn + rv),
+        }
 
-    def stats_lines(self):
+    def budget_info(self) -> dict:
+        b = self.stage_ms(self.mode, 0)
+        b.update(title="GPU ms" + (" (left)" if self.side else ""), limit=BUDGET_MS, stage_scale=4.0,
+                 note="solid = per 60 Hz frame, outline = this tick")
+        extra = []
+        if self.side:
+            r = self.stage_ms(self.mode2, 1)
+            extra.append((f"right view ({SHORT[self.mode2]}): {r['frame_ms']:4.2f} ms/frame, "
+                          f"{r['tick_total']:4.2f} tick", DIM_TXT))
+        scene = "plume_sphere" if self.preset_id == 2 else "campfire"
+        ref = self.brute256.get(scene)
+        if ref and self.mode != "ref128" and b["tick_total"] > 0:
+            extra.append((f"direct 256³ sim {ref:4.1f} ms/step (bench3d {scene}) = "
+                          f"{ref / b['tick_total']:4.1f}x this tick", (190, 200, 255)))
+        b["extra"] = extra
+        return b
+
+    def status_lines(self):
         ft = np.array(self.frame_ms)[30:][-600:]          # skip start-up frames (graph capture, kernel load)
         if not len(ft):
             ft = np.array([16.7])
         fps = 1000.0 / ft[-60:].mean()
         low = 1000.0 / np.sort(ft)[-max(1, len(ft) // 100):].mean()
-        full = self.budget(self.mode)
-        st = full[:4]                                   # tick frame: sim + upscale + detail + full render
-        worst = sum(ms for _, ms in st)
-        amort = 0.5 * (st[0][1] + st[1][1] + st[3][1] + full[4][1]) + st[2][1]
         peak = torch.cuda.max_memory_allocated() / 2 ** 20
         free, total = torch.cuda.mem_get_info()
-        W, Y, G, R = (235, 235, 240), (255, 210, 120), (150, 220, 150), (255, 130, 120)
-        r = self.pipe.renderers.get(((self.layout()[0][1][2], self.layout()[0][1][3]), 0))
-        rr = f"{r.mw}x{r.mh} march -> {r.out_w}x{r.out_h}" if r else "-"
+        W, Y, G, R = (225, 228, 235), (255, 210, 120), (140, 220, 140), (255, 120, 110)
+        lay = self.layout()[0][1]
+        r = self.pipe.renderers.get(((lay[2], lay[3]), 0))
+        rr = f"{r.mw}x{r.mh} -> {r.out_w}x{r.out_h}" if r else "-"
         lines = [
-            (f"mode   {LABELS[self.mode]}" + (f"  |  {LABELS[self.mode2]}" if self.side else ""), Y),
-            (f"preset {self.preset_id}: {self.preset.name}" + ("   [PAUSED]" if self.paused else ""), W),
-            None,
-            (f"fps {fps:6.1f}    1% low {low:6.1f}", G if low >= 50 else R),
-            (f"GPU ms  sim {st[0][1]:5.2f}/tick   upscale {st[1][1]:5.2f}/tick", W),
-            (f"        detail {st[2][1]:5.2f}   render {st[3][1]:5.2f} new vol / {full[4][1]:4.2f} reuse", W),
-            (f"        render {rr}, scale {self.pipe.march_scale:g}", (180, 185, 200)),
-            (f"total {worst:5.2f} ms tick-frame ({amort:4.2f} amortized) / {BUDGET_MS:.0f}", G if worst <= BUDGET_MS else R),
-            (f"VRAM peak torch {peak:6.0f} MB   device used {(total - free) / 2**20:6.0f} MB", W),
-            (f"sim step {self.pipe.sim_steps}   fires {len(self.ctl.fires)}" + ("   TORCH" if self.ctl.torch_on else ""), W),
+            (f"{SHORT[self.mode]}" + (f"  |  {SHORT[self.mode2]}" if self.side else ""), Y),
+            (f"preset {self.preset_id}: {self.preset.name}" + ("  [PAUSED]" if self.paused else ""), W),
+            (f"fps {fps:5.1f}   1% low {low:5.1f}", G if low >= 50 else R),
+            (f"march {rr}", DIM_TXT),
+            (f"VRAM torch peak {peak:4.0f} MB  dev {(total - free) / 2**20:5.0f}", W),
+            (f"sim step {self.pipe.sim_steps}  fires {len(self.ctl.fires)}" + ("  TORCH" if self.ctl.torch_on else ""), W),
+            (f"dissipation {self.pipe.sim_overrides.get('density_dissipation', '-')}/s  "
+             f"cooling {self.pipe.sim_overrides.get('temperature_cooling', '-')}/s", DIM_TXT),
         ]
         if self.b.stubs:
             lines.append(("stubs: " + ", ".join(self.b.stubs), R))
         for m in ("neural_vol", "neural_screen"):
             if not self.pipe.available(m):
-                lines.append((f"{m}: unavailable ({self.pipe.unavailable[m][:46]})", R))
-        return lines, st
+                lines.append((f"{m}: unavailable", R))
+        return lines
 
     def draw_hud(self, surf, hud, force=False):
         for mode, (x, y, w, h) in self.layout():
@@ -253,10 +308,8 @@ class App:
         now = time.perf_counter()
         if force or self._hud_cache is None or now - self._hud_t > 0.25:
             self._hud_t = now
-            lines, st = self.stats_lines()
-            self._hud_cache = hud.panel(lines, {"stages": st, "limit": BUDGET_MS}, width=560)
-        pos = (12, 72) if not self.side else (12, WIN_H - self._hud_cache.get_height() - 12)
-        surf.blit(self._hud_cache, pos)
+            self._hud_cache = hud.strip((WIN_W, STRIP_H), self.status_lines(), self.budget_info())
+        surf.blit(self._hud_cache, (0, WIN_H - STRIP_H))
 
     def stats(self, wall_s, warmup: int = 30):
         ft = np.array(self.frame_ms)[warmup:]
@@ -271,12 +324,16 @@ class App:
                 return None
             return {"mean": float(h.mean()), "p50": float(np.median(h)), "p99": float(np.percentile(h, 99)), "n": int(len(h))}
         gf = np.array(t.frame_hist)[warmup:]
-        r = self.pipe.renderers.get(((self.layout()[0][1][2], self.layout()[0][1][3]), 0))
+        lay = self.layout()[0][1]
+        r = self.pipe.renderers.get(((lay[2], lay[3]), 0))
         return {
             "frames": self.frames, "warmup_frames_excluded": warmup, "sim_steps": self.pipe.sim_steps, "wall_s": wall_s,
             "fps_mean": float(1000.0 / ft.mean()), "fps_1pct_low": float(1000.0 / worst.mean()),
             "frame_ms": {"mean": float(ft.mean()), "p99": float(np.percentile(ft, 99))},
-            "gpu_ms": {k: agg(k) for k in ("sim", "sim_ref", "upscale", "neural_vol", "detail", "render", "render_view")},
+            "gpu_ms": {k: agg(k) for k in ("sim", "sim_ref", "upscale", "neural_vol", "detail.0", "render.0",
+                                           "render_view.0", "detail.1", "render.1", "render_view.1")},
+            "budget_main_view": {k: self.stage_ms(self.mode, 0)[k] for k in ("tick_total", "frame_ms")},
+            "sim_config": self.pipe.sim_overrides,
             "gpu_ms_per_frame": {"mean": float(gf.mean()) if len(gf) else None,
                                  "p99": float(np.percentile(gf, 99)) if len(gf) else None},
             "blit_ms": {"mean": float(np.mean(self.blit_ms)), "p99": float(np.percentile(self.blit_ms, 99))},
@@ -387,6 +444,7 @@ def run_window(args):
                     app.paused = not app.paused
                 elif k == pygame.K_h:
                     app.hud_on = not app.hud_on
+                    app._hud_cache = None
                 elif k == pygame.K_c:
                     app.auto_orbit = not app.auto_orbit
                 elif k == pygame.K_f:

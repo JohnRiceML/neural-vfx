@@ -30,9 +30,9 @@ from vfx.render3d import kernels as K
 @dataclass
 class RenderParams3D:
     steps: float = 192.0                 # ray-march samples per meter (cube side = 1 m)
-    light_res: int = 64                  # light / shadow volume resolution
-    k_abs: float = 26.0
-    k_shadow: float = 40.0
+    light_res: int = 80                  # light / shadow volume resolution (prep runs at 30 Hz only)
+    k_abs: float = 40.0
+    k_shadow: float = 120.0              # strong self-shadowing; the scattering octaves fill it back in
     k_solid: float = 60.0
     k_amb: float = 14.0
     k_emit: float = 3.0
@@ -40,18 +40,23 @@ class RenderParams3D:
     emit_scale: float = 28.0
     soot: float = 0.9
     fire_light: float = 0.9
-    phase_g: float = 0.55
+    phase_g: float = 0.6
+    rim: float = 0.75                    # forward-lobe weight of the dual-lobe phase function
+    ms_a: float = 0.3                    # multiple-scattering octaves (energy, extinction, anisotropy)
+    ms_b: float = 0.5
+    ms_c: float = 0.5
     exposure: float = 1.0
+    contrast: float = 1.15               # power curve around mid-grey before ACES (1 = off)
     bloom: float = 0.7
     bloom_thresh: float = 0.8
     t_lo: float = 700.0
     t_hi: float = 3000.0
     t_ref: float = 1400.0
     d_eps: float = 2e-3
-    light_dir: tuple = (-0.55, 0.78, -0.30)      # toward the light (upper-left, camera side)
-    key_col: tuple = (1.50, 1.40, 1.25)
-    amb_col: tuple = (0.10, 0.13, 0.20)
-    smoke_albedo: tuple = (0.72, 0.72, 0.76)
+    light_dir: tuple = (-0.80, 0.50, -0.20)      # toward the light: low from the left -> form + long shadows
+    key_col: tuple = (1.35, 1.25, 1.08)
+    amb_col: tuple = (0.05, 0.065, 0.10)
+    smoke_albedo: tuple = (0.68, 0.68, 0.72)
     bg_top: tuple = (0.040, 0.048, 0.070)
     bg_bot: tuple = (0.008, 0.008, 0.012)
     floor_col: tuple = (0.030, 0.031, 0.036)
@@ -141,7 +146,8 @@ class VolumeRenderer:
     def _shade(self) -> K.Shade3D:
         p, s = self.p, K.Shade3D()
         for n in ("k_abs", "k_shadow", "k_solid", "k_amb", "k_emit", "emit_min", "emit_scale", "soot",
-                  "fire_light", "phase_g", "exposure", "bloom", "bloom_thresh", "t_lo", "t_hi", "d_eps", "floor"):
+                  "fire_light", "phase_g", "exposure", "bloom", "bloom_thresh", "t_lo", "t_hi", "d_eps", "floor",
+                  "ms_a", "ms_b", "ms_c", "rim", "contrast"):
             setattr(s, n, float(getattr(p, n)))
         L = np.asarray(p.light_dir, np.float64)
         L /= np.linalg.norm(L)

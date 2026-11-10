@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from collections import defaultdict, deque
 
+import dataclasses
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -69,6 +71,7 @@ class Pipeline:
         self.device = torch.device(device)
         self.solver = backends.Solver(LR_RES_3D, backends.runtime_config(), device=device)
         self.ref_solver = None
+        self.sim_overrides: dict = {}
         self.timer = GpuTimer()
         self.renderers: dict = {}
         self.march_scale = march_scale
@@ -86,6 +89,27 @@ class Pipeline:
         return mode not in self.unavailable
 
     # ------------------------------------------------------------------ scene
+    @staticmethod
+    def _cfg(factory, overrides: dict):
+        """factory(**overrides), keeping only fields the config type has (the stub has fewer)."""
+        base = factory()
+        names = {f.name for f in dataclasses.fields(base)} if dataclasses.is_dataclass(base) else set()
+        kw = {k: v for k, v in overrides.items() if k in names}
+        return factory(**kw) if kw else base
+
+    def _apply_config(self, solver, cfg) -> None:
+        # Solver3D reads `config` every step (uploaded with the forces, no graph recapture); the stub uses `cfg`
+        for attr in ("config", "cfg"):
+            if hasattr(solver, attr):
+                setattr(solver, attr, cfg)
+
+    def set_sim_config(self, overrides: dict) -> None:
+        """Preset SolverConfig3D overrides (dissipation etc.) for the 64^3 sim AND the 128^3 reference."""
+        self.sim_overrides = dict(overrides)
+        self._apply_config(self.solver, self._cfg(self.b.runtime_config, self.sim_overrides))
+        if self.ref_solver is not None:
+            self._apply_config(self.ref_solver, self._cfg(self.b.SolverConfig, self.sim_overrides))
+
     def reset(self, obstacles: list) -> None:
         self.obstacles = list(obstacles)
         self.state = self.solver.reset(self.obstacles)
@@ -107,7 +131,8 @@ class Pipeline:
     def _ensure_ref(self) -> None:
         """Start the 128^3 reference from the current 64^3 state (trilinear) so switching is seamless."""
         if self.ref_solver is None:
-            self.ref_solver = self.b.Solver(REF_RES, self.b.SolverConfig(), device=str(self.device))
+            self.ref_solver = self.b.Solver(REF_RES, self._cfg(self.b.SolverConfig, self.sim_overrides),
+                                            device=str(self.device))
         if self.ref_state is None:
             self.ref_state = self.ref_solver.reset(self.obstacles)
             up = F.interpolate(self.state.data[None], size=(REF_RES,) * 3, mode="trilinear", align_corners=False)[0]
@@ -186,14 +211,9 @@ class Pipeline:
             px, py = (sx + 1) * 0.5 * w, (1 - sy) * 0.5 * h
             x0, x1 = float(np.clip(px.min(), 0, w)), float(np.clip(px.max(), 0, w))
             y0, y1 = float(np.clip(py.min(), 0, h)), float(np.clip(py.max(), 0, h))
-            # bucket the box size to quarters of the view: ScreenDetail captures one CUDA graph per
-            # crop size, so a free-floating bbox (orbiting camera) would re-capture every few frames
-            bw = min(w, int(np.ceil((x1 - x0) / (w / 4)) * (w / 4)))
-            bh = min(h, int(np.ceil((y1 - y0) / (h / 4)) * (h / 4)))
-            cx, cy = 0.5 * (x0 + x1), 0.5 * (y0 + y1)
-            bx0 = int(np.clip(cx - bw / 2, 0, w - bw))
-            by0 = int(np.clip(cy - bh / 2, 0, h - bh))
-            bbox = (bx0, by0, bx0 + bw, by0 + bh)
+            # ScreenDetail buckets the crop size itself (fixed fractions of the frame -> a few CUDA graphs),
+            # so the exact projected box is passed (the app-side bucketing workaround is gone)
+            bbox = (int(x0), int(y0), int(np.ceil(x1)), int(np.ceil(y1)))
         r = self.renderer(size, slot)
         trans = r.hdr[..., 3]
         if trans.shape != (h, w):
@@ -209,11 +229,11 @@ class Pipeline:
         key = (mode, self.tick_id, id(self.solid_render), r.march_scale)
         reuse = r.app_key == key           # no sim tick since this view last prepared its volume
         r.app_key = key
-        t = self.timer.start("render_view" if reuse else "render")
+        t = self.timer.start(f"{'render_view' if reuse else 'render'}.{slot}")
         img = r.draw(vol, camera, self.solid_render, reuse_volume=reuse)
         self.timer.stop(t)
         if mode == "neural_screen":
-            t = self.timer.start("detail")
+            t = self.timer.start(f"detail.{slot}")
             try:
                 img = self.b.screen_detail.infer(img, self._screen_aux(camera, size, slot))
             except Exception as e:

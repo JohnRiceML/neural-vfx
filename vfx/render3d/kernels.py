@@ -33,6 +33,11 @@ class Shade3D:
     t_hi: float
     d_eps: float          # density below which a sample is treated as empty
     floor: float          # floor plane opacity (0 disables it)
+    ms_a: float           # multiple-scattering octaves: energy factor per octave (0 = single scattering)
+    ms_b: float           #   extinction factor per octave (light reaches deeper: T^(ms_b^i))
+    ms_c: float           #   anisotropy factor per octave (higher orders are more isotropic)
+    rim: float            # weight of the forward (back-lit silver lining) phase lobe
+    contrast: float       # filmic toe contrast applied before ACES (1 = off)
     light_dir: wp.vec3    # unit, TOWARD the light
     key_col: wp.vec3
     amb_col: wp.vec3
@@ -200,9 +205,9 @@ def light_volume(vol: wp.Texture3D, solid: wp.Texture3D, has_solid: int, lut: wp
     ld = p.light_dir
     tb = box_hit(pos, safe_inv(ld), wp.vec3(0.0, 0.0, 0.0), wp.vec3(1.0, 1.0, 1.0))
     t_exit = tb[1]
-    ds = 2.0 * inv                      # 2 light voxels per step: shadows are soft at this res anyway
+    ds = 1.5 * inv                      # 1.5 light voxels per step, jittered start (no shadow banding)
     od = float(0.0)
-    t = 0.5 * ds
+    t = (0.25 + 0.75 * ign(float(x) + 7.0 * float(z), float(y) + 13.0 * float(z))) * ds
     while t < t_exit:
         q = pos + ld * t
         s = wp.texture_sample(vol, q, dtype=wp.vec2f)
@@ -278,7 +283,15 @@ def march(vol: wp.Texture3D, light: wp.Texture3D, glow: wp.Texture3D, solid: wp.
     t_far = tb[1]
     ds = 1.0 / steps
     cos_t = wp.dot(d, ld)
-    phase = hg(cos_t, p.phase_g) * 0.7 + hg(cos_t, -0.25) * 0.3
+    # dual-lobe phase (forward silver lining + back lobe), and the same for the 2nd/3rd scattering
+    # octaves with anisotropy scaled by ms_c (Wrenninge-style multiple-scattering approximation)
+    ph0 = hg(cos_t, p.phase_g) * p.rim + hg(cos_t, -0.25) * (1.0 - p.rim)
+    ph1 = hg(cos_t, p.phase_g * p.ms_c) * p.rim + hg(cos_t, -0.25 * p.ms_c) * (1.0 - p.rim)
+    ph2 = hg(cos_t, p.phase_g * p.ms_c * p.ms_c) * p.rim + (1.0 - p.rim)
+    a1 = p.ms_a
+    a2 = p.ms_a * p.ms_a
+    b1 = p.ms_b
+    b2 = p.ms_b * p.ms_b
     if t_near < t_far:
         jit = ign(float(c), float(r))
         t0 = t_near + jit * ds
@@ -349,7 +362,9 @@ def march(vol: wp.Texture3D, light: wp.Texture3D, glow: wp.Texture3D, solid: wp.
                         gl = glow_at(glow, q)
                         sh = smoothstep(p.t_lo, p.t_lo + 500.0, Tk)
                         alb = p.smoke_albedo * (1.0 - p.soot * sh)
-                        lit = p.key_col * (lv[0] * phase) + p.amb_col * lv[1] + gl * p.fire_light
+                        tl = wp.max(lv[0], 1.0e-6)
+                        key = tl * ph0 + a1 * wp.pow(tl, b1) * ph1 + a2 * wp.pow(tl, b2) * ph2
+                        lit = p.key_col * key + p.amb_col * lv[1] + gl * p.fire_light
                         col = wp.cw_mul(alb, lit) * a
                     if hot:
                         col = col + emission(lut, p, dn, Tk) * ds
@@ -409,6 +424,46 @@ def sample_v4(a: wp.array2d(dtype=wp.vec4), u: float, v: float) -> wp.vec4:
 
 
 @wp.func
+def cr_w(t: float) -> wp.vec4:
+    """Catmull-Rom weights for taps at -1, 0, 1, 2."""
+    t2 = t * t
+    t3 = t2 * t
+    return wp.vec4(-0.5 * t3 + t2 - 0.5 * t, 1.5 * t3 - 2.5 * t2 + 1.0, -1.5 * t3 + 2.0 * t2 + 0.5 * t, 0.5 * t3 - 0.5 * t2)
+
+
+@wp.func
+def sample_v4_cr(a: wp.array2d(dtype=wp.vec4), u: float, v: float) -> wp.vec4:
+    """Catmull-Rom (bicubic) upsample of the march buffer: sharper than bilinear, no new detail;
+    clamped to the 2x2 bilinear footprint's range so edges do not ring."""
+    H = a.shape[0]
+    W = a.shape[1]
+    fx = u * float(W) - 0.5
+    fy = v * float(H) - 0.5
+    x0f = wp.floor(fx)
+    y0f = wp.floor(fy)
+    wx = cr_w(fx - x0f)
+    wy = cr_w(fy - y0f)
+    xi = int(x0f)
+    yi = int(y0f)
+    acc = wp.vec4(0.0, 0.0, 0.0, 0.0)
+    lo = wp.vec4(1.0e9, 1.0e9, 1.0e9, 1.0e9)
+    hi = wp.vec4(-1.0e9, -1.0e9, -1.0e9, -1.0e9)
+    for j in range(4):
+        yy = wp.clamp(yi - 1 + j, 0, H - 1)
+        row = wp.vec4(0.0, 0.0, 0.0, 0.0)
+        for i in range(4):
+            xx = wp.clamp(xi - 1 + i, 0, W - 1)
+            s = a[yy, xx]
+            row = row + s * wx[i]
+            if (i == 1 or i == 2) and (j == 1 or j == 2):
+                lo = wp.vec4(wp.min(lo[0], s[0]), wp.min(lo[1], s[1]), wp.min(lo[2], s[2]), wp.min(lo[3], s[3]))
+                hi = wp.vec4(wp.max(hi[0], s[0]), wp.max(hi[1], s[1]), wp.max(hi[2], s[2]), wp.max(hi[3], s[3]))
+        acc = acc + row * wy[j]
+    return wp.vec4(wp.clamp(acc[0], lo[0], hi[0]), wp.clamp(acc[1], lo[1], hi[1]),
+                   wp.clamp(acc[2], lo[2], hi[2]), wp.clamp(acc[3], lo[3], hi[3]))
+
+
+@wp.func
 def sample_v3(a: wp.array2d(dtype=wp.vec3), u: float, v: float) -> wp.vec3:
     H = a.shape[0]
     W = a.shape[1]
@@ -440,12 +495,17 @@ def composite(hdr: wp.array2d(dtype=wp.vec4), bloom: wp.array2d(dtype=wp.vec3), 
     if hdr.shape[0] == Ho and hdr.shape[1] == Wo:
         px = hdr[r, c]
     else:
-        px = sample_v4(hdr, u, v)
+        px = sample_v4_cr(hdr, u, v)
     vy = 1.0 - v
     vig = 1.0 - 0.6 * ((u - 0.5) * (u - 0.5) + (vy - 0.6) * (vy - 0.6))
     bg = (p.bg_bot * (1.0 - vy) + p.bg_top * vy) * vig
     col = wp.vec3(px[0], px[1], px[2]) + bg * px[3] + sample_v3(bloom, u, v) * p.bloom
     col = col * p.exposure
+    if p.contrast != 1.0:
+        # power curve around mid-grey 0.18: deeper shadows / brighter lights before the ACES shoulder
+        col = wp.vec3(0.18 * wp.pow(wp.max(col[0], 0.0) / 0.18, p.contrast),
+                      0.18 * wp.pow(wp.max(col[1], 0.0) / 0.18, p.contrast),
+                      0.18 * wp.pow(wp.max(col[2], 0.0) / 0.18, p.contrast))
     hh = wp.sin(float(r) * 12.9898 + float(c) * 78.233) * 43758.5453
     dither = (hh - wp.floor(hh)) - 0.5
     out[r, c, 0] = to_srgb8(aces(col[0]), dither)

@@ -11,11 +11,16 @@ trilinear upscale, `ScreenDetail` returns the input frame (the last conv is zero
 - `warp_prev_3d(prev_hr, lr_velocity, dx_hr, dt)` — dense semi-Lagrangian warp, the training reference
   (3D twin of `vfx.runtime.warp_prev`). `sample_bricks(...)` does the same warp only at active-brick voxels.
 - `VolumeUpscaler(checkpoint_path=None, device="cuda", **arch)` — route A. `infer(state, active=None) -> Volume`
-  (fp16 256³), `reset()`, `warmup(dt)`, `timings` (pre / net / post / total / processed_fraction).
+  (fp16 256³), `reset()`, `timings` (pre / net / post / total / processed_fraction).
   `active=` forces a brick-id set (bench/sandbox); otherwise the lagged GPU activity mask is used, as in the 2D Upscaler.
+  The constructor captures every CUDA graph it will ever use (`prewarm=True`, ~3 s once), so `infer` never captures.
+  `warmup(dt=SIM_DT)` is kept for callers; it is now a quick re-run. Load weights after construction only with
+  `load_state_dict(sd)` (or call `refresh_weights()` after in-place edits): the fused head keeps an fp32 copy that the
+  captured graphs read.
 - `ScreenDetail(checkpoint_path=None, device="cuda", process_scale=0.5, **arch)` — route B.
   `infer(frame (h,w,3) uint8, aux=None) -> (h,w,3) uint8`. Optional `aux` keys: `bbox` (x0,y0,x1,y1 px of the
-  effect), `transmittance`, `depth` (h,w), `velocity` (h,w,2) px/frame. `timings`.
+  effect), `transmittance`, `depth` (h,w), `velocity` (h,w,2) px/frame. `timings`, `warmup(H, W)`.
+  Pass the raw bbox: ScreenDetail buckets it itself (callers need no size bucketing).
 - `bench_selfcheck.py` — `.venv/Scripts/python -m vfx.runtime3d.bench_selfcheck [--quick] [--only ...]`.
   Runs correctness checks, then regenerates every table below. Writes `bench_results.json` (small) and prints markdown.
   About 5 min. `--only check,floor,recommended` takes about 30 s.
@@ -25,11 +30,11 @@ trilinear upscale, `ScreenDetail` returns the input frame (the last conv is zero
 trunk sees 12³ per brick.
 1. **pre graph** (fixed shape, 0.27 ms): fp16 cast, clamp, trilinear canvas for the whole 256³ (this canvas is the output
    outside active bricks), activity mask (density/T threshold, dilated 2 LR cells, pooled to bricks) copied async to pinned memory.
-2. **net graph**, one per active-count bucket (multiples of 8 bricks):
+2. **net graph**, one per batch *capacity* (see "No hitching" below):
    - gather the active LR bricks with their halo;
    - **Warp kernel 1** does the sparse warp of the previous HR output (back-trace along trilinear LR velocity of frame t-1),
      normalises it and writes it directly in `pixel_unshuffle3d` channels-last order;
-   - the cuDNN trunk runs, conv3d fp16 channels_last_3d;
+   - the cuDNN trunk runs, conv3d fp16 channels_last_3d, in chunks of at most 64 bricks;
    - **Warp kernel 2** does the 3D pixel shuffle, trilinear base, 1x1x1 HR head, residual, clamp and denorm, and scatters into the canvas.
 3. The two canvases alternate between frames (output t is prev t+1), so there is no 256³ copy.
    Above 50% occupancy the net runs once on the whole volume instead (`dense_above`).
@@ -40,12 +45,54 @@ what an engine compute shader would do. It is **1.5–2x faster** (variants tabl
 `VolumeNet.forward` by `selfcheck()`: the max density difference is 1e-3, which is fp16 rounding, against a net change of 0.04–0.2.
 
 ## How route B works (`screen_detail.py`, `vfx/model3d/screennet.py`)
-The processed region is the effect's screen bbox, rounded up to 64 px (or the whole frame). In it:
+The processed region is the effect's screen bbox, grown per axis to the next of 6 fixed sizes
+(`crop_fracs` = 0.25/0.375/0.5/0.625/0.75/1.0 of the frame side, rounded up to 64 px) and shifted to stay
+inside the frame, or the whole frame. In it:
 - inputs are uint8 → fp16, then avg-pooled to `process_scale`;
 - the previous output is warped by screen velocity at that resolution;
 - the ScreenNet trunk runs at 1/4 of that resolution (PixelUnshuffle), then PixelShuffle, a 1x1 HR head, and Δrgb;
 - Δrgb is bilinear-upsampled, added and clamped back to uint8, and pasted into the frame.
-One CUDA graph per region size; the two output buffers alternate.
+One CUDA graph per crop size (at most 36 per frame size); the two output buffers alternate.
+
+## No hitching (fixed 2026-11-09)
+Before this fix both runtimes captured a new CUDA graph for every distinct batch shape, and each capture
+re-ran cuDNN autotuning (`cudnn.benchmark`) for the new shape:
+- VolumeUpscaler: one graph per active-brick count rounded to 8, ~1.2–1.7 s each. A live plume changes its count
+  almost every step, and `warmup()` took 70 s.
+- ScreenDetail: one graph per 64-px crop size, 1–2.7 s each while the camera orbits.
+
+Now:
+- **VolumeUpscaler.** The active bricks are padded with duplicate ids up to a fixed capacity: 8, 16, 32, then
+  multiples of 32 up to `dense_above` x 512 = 256 (`bucket_sizes`). Above that it runs dense.
+  - Graphs: 10 capacities + dense, x2 alternating canvases = 22 net graphs + 2 pre graphs, all captured in the
+    constructor.
+  - `dt` is a device scalar (the fused kernel reads `dt/dx` from an array), so graphs no longer depend on `dt`.
+  - The cuDNN trunk runs in chunks of at most 64 bricks. cuDNN therefore only sees batch sizes 8/16/32/64 and the
+    dense 64³. Only the 64-brick chunk and dense are autotuned; smaller batches measured the same speed with
+    cuDNN's heuristic pick.
+  - Autotuning is scoped to our calls (`cudnn_tuned()`). The global `cudnn.benchmark` flag is no longer set, so the
+    caller's own convolutions are unaffected.
+  - Constructor cost: 2–3 s (it was 12 s with all 11 shapes autotuned). Steady-state ms are unchanged vs tuning every
+    full batch (10th percentile, padded capacity: 8 → 0.48, 64 → 1.23, 128 → 2.22, 256 → 4.26, dense → 4.13 ms).
+- **ScreenDetail.** At most 36 crop sizes exist per frame size.
+  - All of them are captured on the first frame of a new frame size: 0.3–0.5 s once at 1440p.
+  - Every crop size reuses views of one max-size buffer set, so VRAM does not grow with the number of sizes
+    (241 MiB peak at 1440p).
+  - cuDNN autotuning is off (`tune=False`). Measured at 1440p, the heuristic pick was as fast or faster (bbox ½: 1.20
+    vs 1.27 ms; full ½: 2.00 vs 2.37 ms), and with tuning each capture took ~1.3 s.
+  - Cost of the coarser crop: the 1536x832 bbox is processed as 1600x960, 0.92 ms (it was 0.77 ms at 64-px sizes).
+
+Measured on a shared GPU: 2–7% utilisation, but other engineers' processes held 2.7–4.1 GB and changed between runs.
+Frame time is wall clock with a sync around `infer` (captures included):
+
+| | before: worst frame | after: worst frame | after: median |
+|---|---|---|---|
+| VolumeUpscaler, 600 live steps of a 64³ Solver3D plume (smoke + fire + wind), occupancy 6% → 100% | **1394 ms** (49 frames > 10 ms, 60 graphs) | **5.1–10.8 ms** over 4 runs (0–1 frames > 10 ms, 24 graphs; GPU-side max 6.5 ms, dense) | 4.3 ms |
+| ScreenDetail, 200 random crop boxes at 2560x1440 | **2744 ms** (179 frames > 10 ms, 179 graphs; median 1082 ms) | first frame 287 ms (captures all 36), then **2.4 ms** | 0.71 ms |
+
+The bench script was a scratch file and is not in the repo. To reproduce, follow the protocol in the table: Solver3D(64)
+with emitters `smoke_emitter((0.45,0.08,0.5),0.09,4.0)` + `fire_emitter((0.6,0.08,0.45),0.06)`, wind (0.25,0,0.1);
+crop boxes drawn with seed 0.
 
 ## Measurement conditions — read before using the numbers
 - **The GPU was shared.** At the start of the final run nvidia-smi showed 97% utilisation and 6.9 GB used by other

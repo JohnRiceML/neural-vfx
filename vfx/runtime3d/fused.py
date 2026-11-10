@@ -55,7 +55,7 @@ def _tri(a: wp.array(dtype=wp.float16, ndim=4), c: int, pz: float, py: float, px
 @wp.kernel
 def prev_unshuffle_kernel(ids: wp.array(dtype=wp.int32), samp: wp.array(dtype=wp.float16, ndim=4),
                           prev: wp.array(dtype=wp.float16, ndim=4), P: wp.array(dtype=wp.float16, ndim=2),
-                          nb: int, b: int, s: int, R: int, N: int, vscale: float,
+                          nb: int, b: int, s: int, R: int, N: int, vscale: wp.array(dtype=float),
                           t_off: float, inv_d: float, inv_t: float, clip: float):
     t = wp.tid()
     sb = b * s
@@ -76,9 +76,10 @@ def prev_unshuffle_kernel(ids: wp.array(dtype=wp.int32), samp: wp.array(dtype=wp
     vx = _tri(samp, 2, pz, py, px, R, R, R)
     vy = _tri(samp, 3, pz, py, px, R, R, R)
     vz = _tri(samp, 4, pz, py, px, R, R, R)
-    qz = float(gz) - vz * vscale
-    qy = float(gy) - vy * vscale
-    qx = float(gx) - vx * vscale
+    vs = vscale[0]
+    qz = float(gz) - vz * vs
+    qy = float(gy) - vy * vs
+    qx = float(gx) - vx * vs
     d = _tri(prev, 0, qz, qy, qx, N, N, N)
     T = _tri(prev, 1, qz, qy, qx, N, N, N)
     cell = i * b * b * b + (lz // s) * b * b + (ly // s) * b + (lx // s)
@@ -162,10 +163,19 @@ class FusedHR:
                    f32(model.hr2.weight), model.hr2.bias.detach().float().contiguous()]
         self.w = [_wp(t) for t in self._w]
 
+    def refresh(self, model) -> None:
+        """Re-read the HR-head weights from `model` IN PLACE (captured CUDA graphs keep these buffers)."""
+        src = [model.hr1.weight, model.hr1.bias, model.hr2.weight, model.hr2.bias]
+        for dst, w in zip(self._w, src):
+            dst.copy_(w.detach().float().reshape(dst.shape))
+
     def prev_unshuffle(self, ids32, samp, prev, P2d, nb, b, R, N, vscale):
+        """vscale: (1,) float32 cuda tensor = dt / dx_hr (on the device, so CUDA graphs do not bake dt in)."""
         c = self.cfg
+        if not torch.is_tensor(vscale):
+            vscale = torch.full((1,), float(vscale), device=ids32.device, dtype=torch.float32)
         wp.launch(prev_unshuffle_kernel, dim=ids32.shape[0] * (b * c.scale) ** 3,
-                  inputs=[_wp(ids32), _wp(samp), _wp(prev), _wp(P2d), nb, b, c.scale, R, N, vscale,
+                  inputs=[_wp(ids32), _wp(samp), _wp(prev), _wp(P2d), nb, b, c.scale, R, N, _wp(vscale),
                           c.temp_offset, 1.0 / c.density_scale, 1.0 / c.temp_scale, c.input_clip],
                   device=self.dev, stream=_stream())
 

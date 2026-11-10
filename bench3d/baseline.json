@@ -1,0 +1,2113 @@
+{
+ "gpu": {
+  "ok": true,
+  "memory_total_mb": 16303.0,
+  "utilization_pct": [
+   2.0,
+   2.0,
+   2.0
+  ],
+  "memory_used_mb": [
+   2797.0,
+   2797.0,
+   2797.0
+  ],
+  "compute_processes": [],
+  "shared": false,
+  "reasons": [],
+  "after": {
+   "utilization_pct": [
+    100.0
+   ],
+   "compute_processes": [],
+   "shared": true
+  }
+ },
+ "runs": [
+  {
+   "scene": "campfire",
+   "pipeline": "raw64",
+   "configs": {
+    "ms0.5": {
+     "stages": {
+      "sim": {
+       "mean_ms": 0.8204230386018753,
+       "p50_ms": 0.7892799973487854,
+       "p95_ms": 1.093951940536499,
+       "max_ms": 1.1489919424057007,
+       "n": 100,
+       "hitches_gt50ms": 0
+      },
+      "render": {
+       "mean_ms": 0.8407343971729279,
+       "p50_ms": 0.8377280235290527,
+       "p95_ms": 1.1793279647827148,
+       "max_ms": 1.3104959726333618,
+       "n": 100,
+       "hitches_gt50ms": 0
+      }
+     },
+     "frame": {
+      "mean_ms": 1.6611574351787568,
+      "p50_ms": 1.675968050956726,
+      "p95_ms": 2.0106239318847656,
+      "max_ms": 2.1198079586029053,
+      "n": 100,
+      "hitches_gt50ms": 0
+     },
+     "wall_ms_per_frame": 1.6629330000432674,
+     "vram": {
+      "torch_peak_allocated_mb": 58.55517578125,
+      "device_used_delta_mb": 224.0
+     },
+     "renderer_timings": {
+      "prep": 0.13516800105571747,
+      "view": 0.4567039906978607,
+      "total": 0.591871976852417
+     }
+    },
+    "ms1": {
+     "stages": {
+      "sim": {
+       "mean_ms": 0.8421625614166259,
+       "p50_ms": 0.800320029258728,
+       "p95_ms": 1.095744013786316,
+       "max_ms": 1.1478400230407715,
+       "n": 100,
+       "hitches_gt50ms": 0
+      },
+      "render": {
+       "mean_ms": 3.175417277812958,
+       "p50_ms": 3.1634559631347656,
+       "p95_ms": 3.703711986541748,
+       "max_ms": 3.9495038986206055,
+       "n": 100,
+       "hitches_gt50ms": 0
+      }
+     },
+     "frame": {
+      "mean_ms": 4.01757982969284,
+      "p50_ms": 3.9665920734405518,
+      "p95_ms": 4.552192211151123,
+      "max_ms": 4.750879764556885,
+      "n": 100,
+      "hitches_gt50ms": 0
+     },
+     "wall_ms_per_frame": 4.019067000044743,
+     "vram": {
+      "torch_peak_allocated_mb": 176.54833984375,
+      "device_used_delta_mb": 344.0
+     },
+     "renderer_timings": {
+      "prep": 0.13923199474811554,
+      "view": 2.7177278995513916,
+      "total": 2.8569600582122803
+     }
+    }
+   },
+   "notes": [],
+   "sim_config": "runtime_config()",
+   "solver_version": "sim3d-warp-0.1.0",
+   "scene_source": "solver",
+   "divergence_max_after_warmup": 3.9094909880077466e-05,
+   "occupancy_start": {
+    "bricks16hr_4lr": 0.0625,
+    "bricks32hr_8lr": 0.09375,
+    "voxels": 0.0332794189453125
+   },
+   "occupancy_end": {
+    "bricks16hr_4lr": 0.90234375,
+    "bricks32hr_8lr": 0.990234375,
+    "voxels": 0.6317100524902344
+   },
+   "worker_seconds": 3.065466899992316
+  },
+  {
+   "scene": "campfire",
+   "pipeline": "tri256",
+   "configs": {
+    "ms0.5": {
+     "stages": {
+      "sim": {
+       "mean_ms": 0.8279110383987427,
+       "p50_ms": 0.7926719784736633,
+       "p95_ms": 1.05840003490448,
+       "max_ms": 1.1284799575805664,
+       "n": 100,
+       "hitches_gt50ms": 0
+      },
+      "detail": {
+       "mean_ms": 0.176074880361557,
+       "p50_ms": 0.1590079963207245,
+       "p95_ms": 0.40041598677635193,
+       "max_ms": 0.4994879961013794,
+       "n": 100,
+       "hitches_gt50ms": 0
+      },
+      "render": {
+       "mean_ms": 1.5173094391822814,
+       "p50_ms": 1.5144319534301758,
+       "p95_ms": 1.9397759437561035,
+       "max_ms": 2.0021119117736816,
+       "n": 100,
+       "hitches_gt50ms": 0
+      }
+     },
+     "frame": {
+      "mean_ms": 2.5212953519821166,
+      "p50_ms": 2.49782395362854,
+      "p95_ms": 2.929248094558716,
+      "max_ms": 3.239936113357544,
+      "n": 100,
+      "hitches_gt50ms": 0
+     },
+     "wall_ms_per_frame": 2.5222510000457987,
+     "vram": {
+      "torch_peak_allocated_mb": 234.46142578125,
+      "device_used_delta_mb": 480.0
+     },
+     "renderer_timings": {
+      "prep": 0.7151679992675781,
+      "view": 0.46697598695755005,
+      "total": 1.182144045829773
+     }
+    },
+    "ms1": {
+     "stages": {
+      "sim": {
+       "mean_ms": 0.8506582409143448,
+       "p50_ms": 0.799232006072998,
+       "p95_ms": 1.0568640232086182,
+       "max_ms": 1.1264640092849731,
+       "n": 100,
+       "hitches_gt50ms": 0
+      },
+      "detail": {
+       "mean_ms": 0.167672960460186,
+       "p50_ms": 0.15865600109100342,
+       "p95_ms": 0.16819199919700623,
+       "max_ms": 0.48745599389076233,
+       "n": 100,
+       "hitches_gt50ms": 0
+      },
+      "render": {
+       "mean_ms": 4.04112607717514,
+       "p50_ms": 3.9983999729156494,
+       "p95_ms": 4.580287933349609,
+       "max_ms": 4.805920124053955,
+       "n": 100,
+       "hitches_gt50ms": 0
+      }
+     },
+     "frame": {
+      "mean_ms": 5.059457297325134,
+      "p50_ms": 5.043712139129639,
+      "p95_ms": 5.56492805480957,
+      "max_ms": 5.931647777557373,
+      "n": 100,
+      "hitches_gt50ms": 0
+     },
+     "wall_ms_per_frame": 5.06089400005294,
+     "vram": {
+      "torch_peak_allocated_mb": 303.54833984375,
+      "device_used_delta_mb": 606.0
+     },
+     "renderer_timings": {
+      "prep": 0.809503972530365,
+      "view": 2.5979199409484863,
+      "total": 3.407423973083496
+     }
+    }
+   },
+   "notes": [],
+   "sim_config": "runtime_config()",
+   "solver_version": "sim3d-warp-0.1.0",
+   "scene_source": "solver",
+   "divergence_max_after_warmup": 3.9094909880077466e-05,
+   "occupancy_start": {
+    "bricks16hr_4lr": 0.0625,
+    "bricks32hr_8lr": 0.09375,
+    "voxels": 0.0332794189453125
+   },
+   "occupancy_end": {
+    "bricks16hr_4lr": 0.90234375,
+    "bricks32hr_8lr": 0.990234375,
+    "voxels": 0.6317100524902344
+   },
+   "worker_seconds": 3.2472087999922223
+  },
+  {
+   "scene": "campfire",
+   "pipeline": "routeA",
+   "configs": {
+    "ms0.5": {
+     "stages": {
+      "sim": {
+       "mean_ms": 0.8343907225131989,
+       "p50_ms": 0.7940800189971924,
+       "p95_ms": 1.0671039819717407,
+       "max_ms": 1.126911997795105,
+       "n": 100,
+       "hitches_gt50ms": 0
+      },
+      "detail": {
+       "mean_ms": 4.273831362724304,
+       "p50_ms": 4.294112205505371,
+       "p95_ms": 4.682208061218262,
+       "max_ms": 4.941279888153076,
+       "n": 100,
+       "hitches_gt50ms": 0
+      },
+      "render": {
+       "mean_ms": 1.5019251251220702,
+       "p50_ms": 1.5214719772338867,
+       "p95_ms": 1.868831992149353,
+       "max_ms": 2.0306239128112793,
+       "n": 100,
+       "hitches_gt50ms": 0
+      }
+     },
+     "frame": {
+      "mean_ms": 6.61014720916748,
+      "p50_ms": 6.646399974822998,
+      "p95_ms": 7.3106560707092285,
+      "max_ms": 7.426464080810547,
+      "n": 100,
+      "hitches_gt50ms": 0
+     },
+     "wall_ms_per_frame": 6.611339999944903,
+     "vram": {
+      "torch_peak_allocated_mb": 262.91552734375,
+      "device_used_delta_mb": 824.0
+     },
+     "renderer_timings": {
+      "prep": 0.7427520155906677,
+      "view": 0.4561919867992401,
+      "total": 1.1989439725875854
+     },
+     "upscaler_timings": {
+      "pre": 0.24934400618076324,
+      "net": 3.840640068054199,
+      "post": 0.007968000136315823,
+      "total": 4.097951889038086,
+      "processed_fraction": 1.0
+     }
+    },
+    "ms1": {
+     "stages": {
+      "sim": {
+       "mean_ms": 0.8534841549396515,
+       "p50_ms": 0.8024320006370544,
+       "p95_ms": 1.0904639959335327,
+       "max_ms": 1.1116160154342651,
+       "n": 100,
+       "hitches_gt50ms": 0
+      },
+      "detail": {
+       "mean_ms": 4.329705286026001,
+       "p50_ms": 4.347904205322266,
+       "p95_ms": 4.685279846191406,
+       "max_ms": 5.163487911224365,
+       "n": 100,
+       "hitches_gt50ms": 0
+      },
+      "render": {
+       "mean_ms": 4.038148803710937,
+       "p50_ms": 3.9807040691375732,
+       "p95_ms": 4.507711887359619,
+       "max_ms": 4.719679832458496,
+       "n": 100,
+       "hitches_gt50ms": 0
+      }
+     },
+     "frame": {
+      "mean_ms": 9.22133825302124,
+      "p50_ms": 9.232671737670898,
+      "p95_ms": 9.893600463867188,
+      "max_ms": 10.280320167541504,
+      "n": 100,
+      "hitches_gt50ms": 0
+     },
+     "wall_ms_per_frame": 9.223119000089355,
+     "vram": {
+      "torch_peak_allocated_mb": 380.90869140625,
+      "device_used_delta_mb": 950.0
+     },
+     "renderer_timings": {
+      "prep": 0.7921280264854431,
+      "view": 2.6306560039520264,
+      "total": 3.4227840900421143
+     },
+     "upscaler_timings": {
+      "pre": 0.24969600141048431,
+      "net": 4.108704090118408,
+      "post": 0.008191999979317188,
+      "total": 4.366591930389404,
+      "processed_fraction": 1.0
+     }
+    }
+   },
+   "notes": [],
+   "sim_config": "runtime_config()",
+   "solver_version": "sim3d-warp-0.1.0",
+   "scene_source": "solver",
+   "divergence_max_after_warmup": 3.9094909880077466e-05,
+   "occupancy_start": {
+    "bricks16hr_4lr": 0.0625,
+    "bricks32hr_8lr": 0.09375,
+    "voxels": 0.0332794189453125
+   },
+   "volume_upscaler": {
+    "untrained": true,
+    "params": 239322,
+    "sparse": true
+   },
+   "occupancy_end": {
+    "bricks16hr_4lr": 0.90234375,
+    "bricks32hr_8lr": 0.990234375,
+    "voxels": 0.6317100524902344
+   },
+   "worker_seconds": 6.836072800011607
+  },
+  {
+   "scene": "campfire",
+   "pipeline": "routeB",
+   "configs": {
+    "ms0.5": {
+     "stages": {
+      "sim": {
+       "mean_ms": 0.8359833586215973,
+       "p50_ms": 0.7966399788856506,
+       "p95_ms": 1.0803519487380981,
+       "max_ms": 1.1479359865188599,
+       "n": 100,
+       "hitches_gt50ms": 0
+      },
+      "render": {
+       "mean_ms": 0.8492179214954376,
+       "p50_ms": 0.8448960185050964,
+       "p95_ms": 1.1831680536270142,
+       "max_ms": 1.307360053062439,
+       "n": 100,
+       "hitches_gt50ms": 0
+      },
+      "detail": {
+       "mean_ms": 2.076866238117218,
+       "p50_ms": 1.9793920516967773,
+       "p95_ms": 2.303999900817871,
+       "max_ms": 2.4892799854278564,
+       "n": 100,
+       "hitches_gt50ms": 0
+      }
+     },
+     "frame": {
+      "mean_ms": 3.7620675230026244,
+      "p50_ms": 3.729952096939087,
+      "p95_ms": 4.272672176361084,
+      "max_ms": 4.485663890838623,
+      "n": 100,
+      "hitches_gt50ms": 0
+     },
+     "wall_ms_per_frame": 3.7628879999101628,
+     "vram": {
+      "torch_peak_allocated_mb": 254.40966796875,
+      "device_used_delta_mb": 566.0
+     },
+     "renderer_timings": {
+      "prep": 0.14099200069904327,
+      "view": 0.4593279957771301,
+      "total": 0.6003199815750122
+     },
+     "screen_detail_timings": {
+      "net": 1.9604480266571045,
+      "post": 0.010688000358641148,
+      "total": 1.9711359739303589,
+      "processed_fraction": 1.0
+     }
+    },
+    "ms1": {
+     "stages": {
+      "sim": {
+       "mean_ms": 0.8449167984724045,
+       "p50_ms": 0.80348801612854,
+       "p95_ms": 1.0660159587860107,
+       "max_ms": 1.1199040412902832,
+       "n": 100,
+       "hitches_gt50ms": 0
+      },
+      "render": {
+       "mean_ms": 3.176814386844635,
+       "p50_ms": 3.170815944671631,
+       "p95_ms": 3.7166080474853516,
+       "max_ms": 3.887615919113159,
+       "n": 100,
+       "hitches_gt50ms": 0
+      },
+      "detail": {
+       "mean_ms": 2.1001014363765718,
+       "p50_ms": 1.9900480508804321,
+       "p95_ms": 2.319295883178711,
+       "max_ms": 2.4841599464416504,
+       "n": 100,
+       "hitches_gt50ms": 0
+      }
+     },
+     "frame": {
+      "mean_ms": 6.1218326377868655,
+      "p50_ms": 6.12611198425293,
+      "p95_ms": 6.723104000091553,
+      "max_ms": 6.9319682121276855,
+      "n": 100,
+      "hitches_gt50ms": 0
+     },
+     "wall_ms_per_frame": 6.123263000044972,
+     "vram": {
+      "torch_peak_allocated_mb": 259.55126953125,
+      "device_used_delta_mb": 684.0
+     },
+     "renderer_timings": {
+      "prep": 0.13929599523544312,
+      "view": 2.793247938156128,
+      "total": 2.932543992996216
+     },
+     "screen_detail_timings": {
+      "net": 1.9746880531311035,
+      "post": 0.008799999952316284,
+      "total": 1.9834879636764526,
+      "processed_fraction": 1.0
+     }
+    }
+   },
+   "notes": [],
+   "sim_config": "runtime_config()",
+   "solver_version": "sim3d-warp-0.1.0",
+   "scene_source": "solver",
+   "divergence_max_after_warmup": 3.9094909880077466e-05,
+   "occupancy_start": {
+    "bricks16hr_4lr": 0.0625,
+    "bricks32hr_8lr": 0.09375,
+    "voxels": 0.0332794189453125
+   },
+   "screen_detail": {
+    "untrained": true,
+    "params": 424691
+   },
+   "occupancy_end": {
+    "bricks16hr_4lr": 0.90234375,
+    "bricks32hr_8lr": 0.990234375,
+    "voxels": 0.6317100524902344
+   },
+   "worker_seconds": 4.009885000006761
+  },
+  {
+   "scene": "campfire",
+   "pipeline": "brute128",
+   "configs": {
+    "ms0.5": {
+     "stages": {
+      "sim": {
+       "mean_ms": 4.130502724647522,
+       "p50_ms": 4.137887954711914,
+       "p95_ms": 4.5128960609436035,
+       "max_ms": 4.701312065124512,
+       "n": 100,
+       "hitches_gt50ms": 0
+      },
+      "render": {
+       "mean_ms": 0.8205987167358398,
+       "p50_ms": 0.8239679932594299,
+       "p95_ms": 1.1359360218048096,
+       "max_ms": 1.2741119861602783,
+       "n": 100,
+       "hitches_gt50ms": 0
+      }
+     },
+     "frame": {
+      "mean_ms": 4.951101446151734,
+      "p50_ms": 4.890912055969238,
+      "p95_ms": 5.4436798095703125,
+      "max_ms": 5.834720134735107,
+      "n": 100,
+      "hitches_gt50ms": 0
+     },
+     "wall_ms_per_frame": 4.952231000061147,
+     "vram": {
+      "torch_peak_allocated_mb": 114.64892578125,
+      "device_used_delta_mb": 546.0
+     },
+     "renderer_timings": {
+      "prep": 0.19171200692653656,
+      "view": 0.4260160028934479,
+      "total": 0.6177279949188232
+     }
+    },
+    "ms1": {
+     "stages": {
+      "sim": {
+       "mean_ms": 4.142544972896576,
+       "p50_ms": 4.164127826690674,
+       "p95_ms": 4.5649919509887695,
+       "max_ms": 4.748064041137695,
+       "n": 100,
+       "hitches_gt50ms": 0
+      },
+      "render": {
+       "mean_ms": 3.009462068080902,
+       "p50_ms": 3.0382080078125,
+       "p95_ms": 3.4587841033935547,
+       "max_ms": 3.810976028442383,
+       "n": 100,
+       "hitches_gt50ms": 0
+      }
+     },
+     "frame": {
+      "mean_ms": 7.15200704574585,
+      "p50_ms": 7.16537618637085,
+      "p95_ms": 7.820799827575684,
+      "max_ms": 8.309344291687012,
+      "n": 100,
+      "hitches_gt50ms": 0
+     },
+     "wall_ms_per_frame": 7.15369900004589,
+     "vram": {
+      "torch_peak_allocated_mb": 232.54833984375,
+      "device_used_delta_mb": 666.0
+     },
+     "renderer_timings": {
+      "prep": 0.19200000166893005,
+      "view": 2.151423931121826,
+      "total": 2.343424081802368
+     }
+    }
+   },
+   "notes": [],
+   "sim_config": "runtime_config()",
+   "solver_version": "sim3d-warp-0.1.0",
+   "scene_source": "solver",
+   "divergence_max_after_warmup": 0.00018728230497799814,
+   "worker_seconds": 3.911354299998493
+  },
+  {
+   "scene": "campfire",
+   "pipeline": "brute256",
+   "configs": {
+    "ms0.5": {
+     "stages": {
+      "sim": {
+       "mean_ms": 43.02876663208008,
+       "p50_ms": 42.999393463134766,
+       "p95_ms": 43.67375946044922,
+       "max_ms": 44.46054458618164,
+       "n": 30,
+       "hitches_gt50ms": 0
+      },
+      "render": {
+       "mean_ms": 1.3433514753977458,
+       "p50_ms": 1.2845120429992676,
+       "p95_ms": 1.54367995262146,
+       "max_ms": 1.5730559825897217,
+       "n": 30,
+       "hitches_gt50ms": 0
+      }
+     },
+     "frame": {
+      "mean_ms": 44.372118377685545,
+      "p50_ms": 44.403263092041016,
+      "p95_ms": 44.938560485839844,
+      "max_ms": 45.75737762451172,
+      "n": 30,
+      "hitches_gt50ms": 0
+     },
+     "wall_ms_per_frame": 44.37616666643104,
+     "vram": {
+      "torch_peak_allocated_mb": 562.55517578125,
+      "device_used_delta_mb": 3260.0
+     },
+     "renderer_timings": {
+      "prep": 1.0242880582809448,
+      "view": 0.4134399890899658,
+      "total": 1.4377280473709106
+     }
+    },
+    "ms1": {
+     "stages": {
+      "sim": {
+       "mean_ms": 43.17869656880696,
+       "p50_ms": 43.13542556762695,
+       "p95_ms": 43.841854095458984,
+       "max_ms": 43.95964813232422,
+       "n": 30,
+       "hitches_gt50ms": 0
+      },
+      "render": {
+       "mean_ms": 2.3330357472101846,
+       "p50_ms": 2.347775936126709,
+       "p95_ms": 2.5400640964508057,
+       "max_ms": 2.7337279319763184,
+       "n": 30,
+       "hitches_gt50ms": 0
+      }
+     },
+     "frame": {
+      "mean_ms": 45.511732228597005,
+      "p50_ms": 45.48857498168945,
+      "p95_ms": 46.24639892578125,
+      "max_ms": 46.247806549072266,
+      "n": 30,
+      "hitches_gt50ms": 0
+     },
+     "wall_ms_per_frame": 45.51599999977043,
+     "vram": {
+      "torch_peak_allocated_mb": 680.54833984375,
+      "device_used_delta_mb": 3386.0
+     },
+     "renderer_timings": {
+      "prep": 0.8110079765319824,
+      "view": 1.2377920150756836,
+      "total": 2.048799991607666
+     }
+    }
+   },
+   "notes": [],
+   "sim_config": "runtime_config()",
+   "solver_version": "sim3d-warp-0.1.0",
+   "scene_source": "solver",
+   "divergence_max_after_warmup": 0.000567028415389359,
+   "worker_seconds": 8.604981500000576
+  },
+  {
+   "scene": "campfire",
+   "pipeline": "sim64_default",
+   "configs": {
+    "step_only": {
+     "stages": {
+      "sim": {
+       "mean_ms": 0.8817529588937759,
+       "p50_ms": 0.8781120181083679,
+       "p95_ms": 1.144544005393982,
+       "max_ms": 1.1910079717636108,
+       "n": 100,
+       "hitches_gt50ms": 0
+      }
+     },
+     "frame": {
+      "mean_ms": 0.8817529588937759,
+      "p50_ms": 0.8781120181083679,
+      "p95_ms": 1.144544005393982,
+      "max_ms": 1.1910079717636108,
+      "n": 100,
+      "hitches_gt50ms": 0
+     },
+     "wall_ms_per_frame": 0.88296599991736,
+     "vram": {
+      "torch_peak_allocated_mb": 11.25,
+      "device_used_delta_mb": 126.0
+     }
+    }
+   },
+   "notes": [],
+   "sim_config": "SolverConfig3D() default",
+   "solver_version": "sim3d-warp-0.1.0",
+   "scene_source": "solver",
+   "divergence_max_after_warmup": 5.722021342080552e-06,
+   "occupancy_start": {
+    "bricks16hr_4lr": 0.0625,
+    "bricks32hr_8lr": 0.09375,
+    "voxels": 0.033100128173828125
+   },
+   "worker_seconds": 2.3649036999995587
+  },
+  {
+   "scene": "campfire",
+   "pipeline": "sim256_default",
+   "configs": {
+    "step_only": {
+     "stages": {
+      "sim": {
+       "mean_ms": 61.38590304056803,
+       "p50_ms": 61.70499038696289,
+       "p95_ms": 63.20249557495117,
+       "max_ms": 63.739585876464844,
+       "n": 30,
+       "hitches_gt50ms": 30
+      }
+     },
+     "frame": {
+      "mean_ms": 61.38590304056803,
+      "p50_ms": 61.70499038696289,
+      "p95_ms": 63.20249557495117,
+      "max_ms": 63.739585876464844,
+      "n": 30,
+      "hitches_gt50ms": 30
+     },
+     "wall_ms_per_frame": 61.39385999995284,
+     "vram": {
+      "torch_peak_allocated_mb": 720.0,
+      "device_used_delta_mb": 3254.0
+     }
+    }
+   },
+   "notes": [],
+   "sim_config": "SolverConfig3D() default",
+   "solver_version": "sim3d-warp-0.1.0",
+   "scene_source": "solver",
+   "divergence_max_after_warmup": 1.939719913934823e-05,
+   "worker_seconds": 8.076714900002116
+  },
+  {
+   "scene": "plume_sphere",
+   "pipeline": "raw64",
+   "configs": {
+    "ms0.5": {
+     "stages": {
+      "sim": {
+       "mean_ms": 0.8254953581094742,
+       "p50_ms": 0.7940800189971924,
+       "p95_ms": 1.056928038597107,
+       "max_ms": 1.1004799604415894,
+       "n": 100,
+       "hitches_gt50ms": 0
+      },
+      "render": {
+       "mean_ms": 0.8507027161121369,
+       "p50_ms": 0.8297600150108337,
+       "p95_ms": 1.1857600212097168,
+       "max_ms": 1.2317759990692139,
+       "n": 100,
+       "hitches_gt50ms": 0
+      }
+     },
+     "frame": {
+      "mean_ms": 1.6761980760097503,
+      "p50_ms": 1.6510080099105835,
+      "p95_ms": 1.9778879880905151,
+      "max_ms": 2.0259199142456055,
+      "n": 100,
+      "hitches_gt50ms": 0
+     },
+     "wall_ms_per_frame": 1.6770499999984168,
+     "vram": {
+      "torch_peak_allocated_mb": 59.58642578125,
+      "device_used_delta_mb": 226.0
+     },
+     "renderer_timings": {
+      "prep": 0.16735999286174774,
+      "view": 0.48127999901771545,
+      "total": 0.648639976978302
+     }
+    },
+    "ms1": {
+     "stages": {
+      "sim": {
+       "mean_ms": 0.8369407999515533,
+       "p50_ms": 0.8033919930458069,
+       "p95_ms": 1.0485759973526,
+       "max_ms": 1.1337599754333496,
+       "n": 100,
+       "hitches_gt50ms": 0
+      },
+      "render": {
+       "mean_ms": 2.7379523158073424,
+       "p50_ms": 2.741856098175049,
+       "p95_ms": 3.2865920066833496,
+       "max_ms": 3.5220799446105957,
+       "n": 100,
+       "hitches_gt50ms": 0
+      }
+     },
+     "frame": {
+      "mean_ms": 3.5748931169509888,
+      "p50_ms": 3.554719924926758,
+      "p95_ms": 4.114943981170654,
+      "max_ms": 4.3258562088012695,
+      "n": 100,
+      "hitches_gt50ms": 0
+     },
+     "wall_ms_per_frame": 3.5762190000968985,
+     "vram": {
+      "torch_peak_allocated_mb": 177.57958984375,
+      "device_used_delta_mb": 346.0
+     },
+     "renderer_timings": {
+      "prep": 0.1693120002746582,
+      "view": 2.2640960216522217,
+      "total": 2.43340802192688
+     }
+    }
+   },
+   "notes": [],
+   "sim_config": "runtime_config()",
+   "solver_version": "sim3d-warp-0.1.0",
+   "scene_source": "solver",
+   "divergence_max_after_warmup": 0.00013378470612224191,
+   "occupancy_start": {
+    "bricks16hr_4lr": 0.0673828125,
+    "bricks32hr_8lr": 0.1015625,
+    "voxels": 0.02967071533203125
+   },
+   "occupancy_end": {
+    "bricks16hr_4lr": 0.723876953125,
+    "bricks32hr_8lr": 0.859375,
+    "voxels": 0.4337310791015625
+   },
+   "worker_seconds": 3.1206194999977015
+  },
+  {
+   "scene": "plume_sphere",
+   "pipeline": "tri256",
+   "configs": {
+    "ms0.5": {
+     "stages": {
+      "sim": {
+       "mean_ms": 0.8266953581571579,
+       "p50_ms": 0.7943360209465027,
+       "p95_ms": 1.0546239614486694,
+       "max_ms": 1.1055680513381958,
+       "n": 100,
+       "hitches_gt50ms": 0
+      },
+      "detail": {
+       "mean_ms": 0.16130176022648812,
+       "p50_ms": 0.15663999319076538,
+       "p95_ms": 0.16249600052833557,
+       "max_ms": 0.5079039931297302,
+       "n": 100,
+       "hitches_gt50ms": 0
+      },
+      "render": {
+       "mean_ms": 1.5885779190063476,
+       "p50_ms": 1.5798720121383667,
+       "p95_ms": 1.946560025215149,
+       "max_ms": 2.006783962249756,
+       "n": 100,
+       "hitches_gt50ms": 0
+      }
+     },
+     "frame": {
+      "mean_ms": 2.576575038433075,
+      "p50_ms": 2.5602879524230957,
+      "p95_ms": 2.9863998889923096,
+      "max_ms": 3.0735039710998535,
+      "n": 100,
+      "hitches_gt50ms": 0
+     },
+     "wall_ms_per_frame": 2.5779160000092816,
+     "vram": {
+      "torch_peak_allocated_mb": 422.4609375,
+      "device_used_delta_mb": 598.0
+     },
+     "renderer_timings": {
+      "prep": 0.8492799997329712,
+      "view": 0.5028160214424133,
+      "total": 1.3520959615707397
+     }
+    },
+    "ms1": {
+     "stages": {
+      "sim": {
+       "mean_ms": 0.848795838356018,
+       "p50_ms": 0.8010240197181702,
+       "p95_ms": 1.1043519973754883,
+       "max_ms": 1.1405760049819946,
+       "n": 100,
+       "hitches_gt50ms": 0
+      },
+      "detail": {
+       "mean_ms": 0.16600416079163552,
+       "p50_ms": 0.1605439931154251,
+       "p95_ms": 0.16649599373340607,
+       "max_ms": 0.4556480050086975,
+       "n": 100,
+       "hitches_gt50ms": 0
+      },
+      "render": {
+       "mean_ms": 3.5724931144714356,
+       "p50_ms": 3.595616102218628,
+       "p95_ms": 4.134848117828369,
+       "max_ms": 4.393919944763184,
+       "n": 100,
+       "hitches_gt50ms": 0
+      }
+     },
+     "frame": {
+      "mean_ms": 4.587293131351471,
+      "p50_ms": 4.58073616027832,
+      "p95_ms": 5.126495838165283,
+      "max_ms": 5.357120037078857,
+      "n": 100,
+      "hitches_gt50ms": 0
+     },
+     "wall_ms_per_frame": 4.588950000033947,
+     "vram": {
+      "torch_peak_allocated_mb": 477.1728515625,
+      "device_used_delta_mb": 724.0
+     },
+     "renderer_timings": {
+      "prep": 0.8992639780044556,
+      "view": 2.040832042694092,
+      "total": 2.940095901489258
+     }
+    }
+   },
+   "notes": [],
+   "sim_config": "runtime_config()",
+   "solver_version": "sim3d-warp-0.1.0",
+   "scene_source": "solver",
+   "divergence_max_after_warmup": 0.00013378470612224191,
+   "occupancy_start": {
+    "bricks16hr_4lr": 0.0673828125,
+    "bricks32hr_8lr": 0.1015625,
+    "voxels": 0.02967071533203125
+   },
+   "occupancy_end": {
+    "bricks16hr_4lr": 0.723876953125,
+    "bricks32hr_8lr": 0.859375,
+    "voxels": 0.4337310791015625
+   },
+   "worker_seconds": 3.3233899000042584
+  },
+  {
+   "scene": "plume_sphere",
+   "pipeline": "routeA",
+   "configs": {
+    "ms0.5": {
+     "stages": {
+      "sim": {
+       "mean_ms": 0.8285231989622116,
+       "p50_ms": 0.7979840040206909,
+       "p95_ms": 1.0725760459899902,
+       "max_ms": 1.1293439865112305,
+       "n": 100,
+       "hitches_gt50ms": 0
+      },
+      "detail": {
+       "mean_ms": 4.29094241142273,
+       "p50_ms": 4.337088108062744,
+       "p95_ms": 4.694496154785156,
+       "max_ms": 4.946400165557861,
+       "n": 100,
+       "hitches_gt50ms": 0
+      },
+      "render": {
+       "mean_ms": 1.5827900850772858,
+       "p50_ms": 1.5738240480422974,
+       "p95_ms": 1.953984022140503,
+       "max_ms": 1.9701440334320068,
+       "n": 100,
+       "hitches_gt50ms": 0
+      }
+     },
+     "frame": {
+      "mean_ms": 6.702255654335022,
+      "p50_ms": 6.731296062469482,
+      "p95_ms": 7.208384037017822,
+      "max_ms": 7.43507194519043,
+      "n": 100,
+      "hitches_gt50ms": 0
+     },
+     "wall_ms_per_frame": 6.704041000048164,
+     "vram": {
+      "torch_peak_allocated_mb": 499.822265625,
+      "device_used_delta_mb": 904.0
+     },
+     "renderer_timings": {
+      "prep": 1.187391996383667,
+      "view": 0.5038080215454102,
+      "total": 1.6912000179290771
+     },
+     "upscaler_timings": {
+      "pre": 0.24694399535655975,
+      "net": 4.368127822875977,
+      "post": 0.008191999979317188,
+      "total": 4.623263835906982,
+      "processed_fraction": 1.0
+     }
+    },
+    "ms1": {
+     "stages": {
+      "sim": {
+       "mean_ms": 0.8609315186738968,
+       "p50_ms": 0.8049280047416687,
+       "p95_ms": 1.127519965171814,
+       "max_ms": 1.4542720317840576,
+       "n": 100,
+       "hitches_gt50ms": 0
+      },
+      "detail": {
+       "mean_ms": 4.383272323608399,
+       "p50_ms": 4.3821120262146,
+       "p95_ms": 4.899263858795166,
+       "max_ms": 5.123551845550537,
+       "n": 100,
+       "hitches_gt50ms": 0
+      },
+      "render": {
+       "mean_ms": 3.5667302298545835,
+       "p50_ms": 3.6004478931427,
+       "p95_ms": 4.113503932952881,
+       "max_ms": 4.224095821380615,
+       "n": 100,
+       "hitches_gt50ms": 0
+      }
+     },
+     "frame": {
+      "mean_ms": 8.81093402862549,
+      "p50_ms": 8.813759803771973,
+      "p95_ms": 9.588383674621582,
+      "max_ms": 10.156479835510254,
+      "n": 100,
+      "hitches_gt50ms": 0
+     },
+     "wall_ms_per_frame": 8.813313999999082,
+     "vram": {
+      "torch_peak_allocated_mb": 554.5341796875,
+      "device_used_delta_mb": 1030.0
+     },
+     "renderer_timings": {
+      "prep": 0.8822399973869324,
+      "view": 2.3767359256744385,
+      "total": 3.2589759826660156
+     },
+     "upscaler_timings": {
+      "pre": 0.2481600046157837,
+      "net": 3.8381760120391846,
+      "post": 0.0063680000603199005,
+      "total": 4.092703819274902,
+      "processed_fraction": 1.0
+     }
+    }
+   },
+   "notes": [],
+   "sim_config": "runtime_config()",
+   "solver_version": "sim3d-warp-0.1.0",
+   "scene_source": "solver",
+   "divergence_max_after_warmup": 0.00013378470612224191,
+   "occupancy_start": {
+    "bricks16hr_4lr": 0.0673828125,
+    "bricks32hr_8lr": 0.1015625,
+    "voxels": 0.02967071533203125
+   },
+   "volume_upscaler": {
+    "untrained": true,
+    "params": 239322,
+    "sparse": true
+   },
+   "occupancy_end": {
+    "bricks16hr_4lr": 0.723876953125,
+    "bricks32hr_8lr": 0.859375,
+    "voxels": 0.4337310791015625
+   },
+   "worker_seconds": 6.997418500002823
+  },
+  {
+   "scene": "plume_sphere",
+   "pipeline": "routeB",
+   "configs": {
+    "ms0.5": {
+     "stages": {
+      "sim": {
+       "mean_ms": 0.8301587194204331,
+       "p50_ms": 0.7997440099716187,
+       "p95_ms": 1.0625920295715332,
+       "max_ms": 1.1120959520339966,
+       "n": 100,
+       "hitches_gt50ms": 0
+      },
+      "render": {
+       "mean_ms": 0.8440617555379868,
+       "p50_ms": 0.8209599852561951,
+       "p95_ms": 1.101151943206787,
+       "max_ms": 1.2170560359954834,
+       "n": 100,
+       "hitches_gt50ms": 0
+      },
+      "detail": {
+       "mean_ms": 2.070974724292755,
+       "p50_ms": 1.9786880016326904,
+       "p95_ms": 2.3138558864593506,
+       "max_ms": 2.513472080230713,
+       "n": 100,
+       "hitches_gt50ms": 0
+      }
+     },
+     "frame": {
+      "mean_ms": 3.7451952123641967,
+      "p50_ms": 3.709120035171509,
+      "p95_ms": 4.1078081130981445,
+      "max_ms": 4.24403190612793,
+      "n": 100,
+      "hitches_gt50ms": 0
+     },
+     "wall_ms_per_frame": 3.7468470000021625,
+     "vram": {
+      "torch_peak_allocated_mb": 255.44091796875,
+      "device_used_delta_mb": 566.0
+     },
+     "renderer_timings": {
+      "prep": 0.17004799842834473,
+      "view": 0.48736000061035156,
+      "total": 0.6574079990386963
+     },
+     "screen_detail_timings": {
+      "net": 1.9612480401992798,
+      "post": 0.011711999773979187,
+      "total": 1.9729599952697754,
+      "processed_fraction": 1.0
+     }
+    },
+    "ms1": {
+     "stages": {
+      "sim": {
+       "mean_ms": 0.8473475182056427,
+       "p50_ms": 0.8048959970474243,
+       "p95_ms": 1.0711359977722168,
+       "max_ms": 1.1756160259246826,
+       "n": 100,
+       "hitches_gt50ms": 0
+      },
+      "render": {
+       "mean_ms": 2.732986235618591,
+       "p50_ms": 2.7435519695281982,
+       "p95_ms": 3.20361590385437,
+       "max_ms": 3.3787200450897217,
+       "n": 100,
+       "hitches_gt50ms": 0
+      },
+      "detail": {
+       "mean_ms": 2.0877766263484956,
+       "p50_ms": 1.9882559776306152,
+       "p95_ms": 2.319456100463867,
+       "max_ms": 2.535360097885132,
+       "n": 100,
+       "hitches_gt50ms": 0
+      }
+     },
+     "frame": {
+      "mean_ms": 5.668110384941101,
+      "p50_ms": 5.650464057922363,
+      "p95_ms": 6.254079818725586,
+      "max_ms": 6.412831783294678,
+      "n": 100,
+      "hitches_gt50ms": 0
+     },
+     "wall_ms_per_frame": 5.669225000019651,
+     "vram": {
+      "torch_peak_allocated_mb": 260.58251953125,
+      "device_used_delta_mb": 686.0
+     },
+     "renderer_timings": {
+      "prep": 0.17155200242996216,
+      "view": 2.2669119834899902,
+      "total": 2.4384639263153076
+     },
+     "screen_detail_timings": {
+      "net": 1.9749759435653687,
+      "post": 0.01071999967098236,
+      "total": 1.9856959581375122,
+      "processed_fraction": 1.0
+     }
+    }
+   },
+   "notes": [],
+   "sim_config": "runtime_config()",
+   "solver_version": "sim3d-warp-0.1.0",
+   "scene_source": "solver",
+   "divergence_max_after_warmup": 0.00013378470612224191,
+   "occupancy_start": {
+    "bricks16hr_4lr": 0.0673828125,
+    "bricks32hr_8lr": 0.1015625,
+    "voxels": 0.02967071533203125
+   },
+   "screen_detail": {
+    "untrained": true,
+    "params": 424691
+   },
+   "occupancy_end": {
+    "bricks16hr_4lr": 0.723876953125,
+    "bricks32hr_8lr": 0.859375,
+    "voxels": 0.4337310791015625
+   },
+   "worker_seconds": 4.060417900007451
+  },
+  {
+   "scene": "plume_sphere",
+   "pipeline": "brute128",
+   "configs": {
+    "ms0.5": {
+     "stages": {
+      "sim": {
+       "mean_ms": 4.136158397197724,
+       "p50_ms": 4.139840126037598,
+       "p95_ms": 4.543327808380127,
+       "max_ms": 4.79852819442749,
+       "n": 100,
+       "hitches_gt50ms": 0
+      },
+      "render": {
+       "mean_ms": 0.9574211245775223,
+       "p50_ms": 0.9654399752616882,
+       "p95_ms": 1.2202880382537842,
+       "max_ms": 1.2758079767227173,
+       "n": 100,
+       "hitches_gt50ms": 0
+      }
+     },
+     "frame": {
+      "mean_ms": 5.0935795116424565,
+      "p50_ms": 5.068416118621826,
+      "p95_ms": 5.7196478843688965,
+      "max_ms": 5.801472187042236,
+      "n": 100,
+      "hitches_gt50ms": 0
+     },
+     "wall_ms_per_frame": 5.094603999896208,
+     "vram": {
+      "torch_peak_allocated_mb": 125.9296875,
+      "device_used_delta_mb": 550.0
+     },
+     "renderer_timings": {
+      "prep": 0.2123199999332428,
+      "view": 0.5281280279159546,
+      "total": 0.740447998046875
+     }
+    },
+    "ms1": {
+     "stages": {
+      "sim": {
+       "mean_ms": 4.17160994052887,
+       "p50_ms": 4.181888103485107,
+       "p95_ms": 4.573056221008301,
+       "max_ms": 4.819104194641113,
+       "n": 100,
+       "hitches_gt50ms": 0
+      },
+      "render": {
+       "mean_ms": 2.843028173446655,
+       "p50_ms": 2.8487040996551514,
+       "p95_ms": 3.3452799320220947,
+       "max_ms": 3.6546239852905273,
+       "n": 100,
+       "hitches_gt50ms": 0
+      }
+     },
+     "frame": {
+      "mean_ms": 7.014638066291809,
+      "p50_ms": 6.974880218505859,
+      "p95_ms": 7.592512130737305,
+      "max_ms": 7.955967903137207,
+      "n": 100,
+      "hitches_gt50ms": 0
+     },
+     "wall_ms_per_frame": 7.016119000036269,
+     "vram": {
+      "torch_peak_allocated_mb": 240.67333984375,
+      "device_used_delta_mb": 670.0
+     },
+     "renderer_timings": {
+      "prep": 0.21855999529361725,
+      "view": 2.1289279460906982,
+      "total": 2.3474879264831543
+     }
+    }
+   },
+   "notes": [],
+   "sim_config": "runtime_config()",
+   "solver_version": "sim3d-warp-0.1.0",
+   "scene_source": "solver",
+   "divergence_max_after_warmup": 0.0023906815331429243,
+   "worker_seconds": 4.0362579000066034
+  },
+  {
+   "scene": "plume_sphere",
+   "pipeline": "brute256",
+   "configs": {
+    "ms0.5": {
+     "stages": {
+      "sim": {
+       "mean_ms": 43.02011070251465,
+       "p50_ms": 42.98726272583008,
+       "p95_ms": 43.54399871826172,
+       "max_ms": 43.75337600708008,
+       "n": 30,
+       "hitches_gt50ms": 0
+      },
+      "render": {
+       "mean_ms": 1.578274126847585,
+       "p50_ms": 1.5107840299606323,
+       "p95_ms": 1.799072027206421,
+       "max_ms": 1.8256959915161133,
+       "n": 30,
+       "hitches_gt50ms": 0
+      }
+     },
+     "frame": {
+      "mean_ms": 44.598384857177734,
+      "p50_ms": 44.62748718261719,
+      "p95_ms": 45.038272857666016,
+      "max_ms": 45.27849578857422,
+      "n": 30,
+      "hitches_gt50ms": 0
+     },
+     "wall_ms_per_frame": 44.60572666672912,
+     "vram": {
+      "torch_peak_allocated_mb": 799.4609375,
+      "device_used_delta_mb": 3358.0
+     },
+     "renderer_timings": {
+      "prep": 0.9599040150642395,
+      "view": 0.5117440223693848,
+      "total": 1.4716479778289795
+     }
+    },
+    "ms1": {
+     "stages": {
+      "sim": {
+       "mean_ms": 42.957349395751955,
+       "p50_ms": 42.95888137817383,
+       "p95_ms": 43.362144470214844,
+       "max_ms": 44.33184051513672,
+       "n": 30,
+       "hitches_gt50ms": 0
+      },
+      "render": {
+       "mean_ms": 2.5875871976216636,
+       "p50_ms": 2.537343978881836,
+       "p95_ms": 3.063391923904419,
+       "max_ms": 3.224384069442749,
+       "n": 30,
+       "hitches_gt50ms": 0
+      }
+     },
+     "frame": {
+      "mean_ms": 45.54493649800619,
+      "p50_ms": 45.550880432128906,
+      "p95_ms": 45.93110275268555,
+      "max_ms": 46.796382904052734,
+      "n": 30,
+      "hitches_gt50ms": 0
+     },
+     "wall_ms_per_frame": 45.549640000293344,
+     "vram": {
+      "torch_peak_allocated_mb": 854.1728515625,
+      "device_used_delta_mb": 3484.0
+     },
+     "renderer_timings": {
+      "prep": 0.9407039880752563,
+      "view": 1.370911955833435,
+      "total": 2.3116159439086914
+     }
+    }
+   },
+   "notes": [],
+   "sim_config": "runtime_config()",
+   "solver_version": "sim3d-warp-0.1.0",
+   "scene_source": "solver",
+   "divergence_max_after_warmup": 0.0034114329610019922,
+   "worker_seconds": 8.687947499987786
+  },
+  {
+   "scene": "plume_sphere",
+   "pipeline": "sim64_default",
+   "configs": {
+    "step_only": {
+     "stages": {
+      "sim": {
+       "mean_ms": 1.046760316491127,
+       "p50_ms": 1.0071359872817993,
+       "p95_ms": 1.2819520235061646,
+       "max_ms": 1.3384000062942505,
+       "n": 100,
+       "hitches_gt50ms": 0
+      }
+     },
+     "frame": {
+      "mean_ms": 1.046760316491127,
+      "p50_ms": 1.0071359872817993,
+      "p95_ms": 1.2819520235061646,
+      "max_ms": 1.3384000062942505,
+      "n": 100,
+      "hitches_gt50ms": 0
+     },
+     "wall_ms_per_frame": 1.0492559999693185,
+     "vram": {
+      "torch_peak_allocated_mb": 11.25,
+      "device_used_delta_mb": 126.0
+     }
+    }
+   },
+   "notes": [],
+   "sim_config": "SolverConfig3D() default",
+   "solver_version": "sim3d-warp-0.1.0",
+   "scene_source": "solver",
+   "divergence_max_after_warmup": 1.3342710190045182e-05,
+   "occupancy_start": {
+    "bricks16hr_4lr": 0.068603515625,
+    "bricks32hr_8lr": 0.111328125,
+    "voxels": 0.029850006103515625
+   },
+   "worker_seconds": 2.4528015999967465
+  },
+  {
+   "scene": "plume_sphere",
+   "pipeline": "sim256_default",
+   "configs": {
+    "step_only": {
+     "stages": {
+      "sim": {
+       "mean_ms": 73.90745544433594,
+       "p50_ms": 73.87996673583984,
+       "p95_ms": 74.47318267822266,
+       "max_ms": 74.55254364013672,
+       "n": 30,
+       "hitches_gt50ms": 30
+      }
+     },
+     "frame": {
+      "mean_ms": 73.90745544433594,
+      "p50_ms": 73.87996673583984,
+      "p95_ms": 74.47318267822266,
+      "max_ms": 74.55254364013672,
+      "n": 30,
+      "hitches_gt50ms": 30
+     },
+     "wall_ms_per_frame": 73.91498000021481,
+     "vram": {
+      "torch_peak_allocated_mb": 720.0,
+      "device_used_delta_mb": 3302.0
+     }
+    }
+   },
+   "notes": [],
+   "sim_config": "SolverConfig3D() default",
+   "solver_version": "sim3d-warp-0.1.0",
+   "scene_source": "solver",
+   "divergence_max_after_warmup": 7.364698376477463e-06,
+   "worker_seconds": 9.380037599999923
+  }
+ ],
+ "budget_ms": {
+  "sim": 2.0,
+  "detail": 2.5,
+  "render": 1.5,
+  "frame": 6.0
+ },
+ "budget_vram_mb": 4096,
+ "meta": {
+  "gpu": "NVIDIA GeForce RTX 5080",
+  "torch": "2.11.0+cu128",
+  "python": "3.12.0",
+  "iters": 100,
+  "warmup": 10,
+  "out_size_hw": [
+   1440,
+   2560
+  ],
+  "march_scales": [
+   0.5,
+   1.0
+  ],
+  "created": "2026-11-09 16:27:11"
+ },
+ "rows": [
+  {
+   "scene": "campfire",
+   "pipeline": "raw64",
+   "march_scale": "0.5",
+   "sim": 0.8204230386018753,
+   "detail": 0.0,
+   "render": 0.8407343971729279,
+   "frame": 1.6611574351787568,
+   "frame_p50": 1.675968050956726,
+   "frame_p95": 2.0106239318847656,
+   "wall": 1.6629330000432674,
+   "vram": 224.0,
+   "hitches": 0,
+   "frame_max": 2.1198079586029053,
+   "pass": {
+    "sim": true,
+    "detail": true,
+    "render": true,
+    "frame": true,
+    "vram": true
+   },
+   "pass_all": true,
+   "speedup_vs_brute256": 26.711567150714206,
+   "speedup_vs_brute256_default": 37.76237771780824
+  },
+  {
+   "scene": "campfire",
+   "pipeline": "raw64",
+   "march_scale": "1",
+   "sim": 0.8421625614166259,
+   "detail": 0.0,
+   "render": 3.175417277812958,
+   "frame": 4.01757982969284,
+   "frame_p50": 3.9665920734405518,
+   "frame_p95": 4.552192211151123,
+   "wall": 4.019067000044743,
+   "vram": 344.0,
+   "hitches": 0,
+   "frame_max": 4.750879764556885,
+   "pass": {
+    "sim": true,
+    "detail": true,
+    "render": false,
+    "frame": true,
+    "vram": true
+   },
+   "pass_all": false,
+   "speedup_vs_brute256": 11.328146336317245,
+   "speedup_vs_brute256_default": 15.860030537999236
+  },
+  {
+   "scene": "campfire",
+   "pipeline": "tri256",
+   "march_scale": "0.5",
+   "sim": 0.8279110383987427,
+   "detail": 0.176074880361557,
+   "render": 1.5173094391822814,
+   "frame": 2.5212953519821166,
+   "frame_p50": 2.49782395362854,
+   "frame_p95": 2.929248094558716,
+   "wall": 2.5222510000457987,
+   "vram": 480.0,
+   "hitches": 0,
+   "frame_max": 3.239936113357544,
+   "pass": {
+    "sim": true,
+    "detail": true,
+    "render": false,
+    "frame": true,
+    "vram": true
+   },
+   "pass_all": false,
+   "speedup_vs_brute256": 17.59893712682348,
+   "speedup_vs_brute256_default": 24.87977240217064
+  },
+  {
+   "scene": "campfire",
+   "pipeline": "tri256",
+   "march_scale": "1",
+   "sim": 0.8506582409143448,
+   "detail": 0.167672960460186,
+   "render": 4.04112607717514,
+   "frame": 5.059457297325134,
+   "frame_p50": 5.043712139129639,
+   "frame_p95": 5.56492805480957,
+   "wall": 5.06089400005294,
+   "vram": 606.0,
+   "hitches": 0,
+   "frame_max": 5.931647777557373,
+   "pass": {
+    "sim": true,
+    "detail": true,
+    "render": false,
+    "frame": true,
+    "vram": true
+   },
+   "pass_all": false,
+   "speedup_vs_brute256": 8.995378269653235,
+   "speedup_vs_brute256_default": 12.594026403081916
+  },
+  {
+   "scene": "campfire",
+   "pipeline": "routeA",
+   "march_scale": "0.5",
+   "sim": 0.8343907225131989,
+   "detail": 4.273831362724304,
+   "render": 1.5019251251220702,
+   "frame": 6.61014720916748,
+   "frame_p50": 6.646399974822998,
+   "frame_p95": 7.3106560707092285,
+   "wall": 6.611339999944903,
+   "vram": 824.0,
+   "hitches": 0,
+   "frame_max": 7.426464080810547,
+   "pass": {
+    "sim": true,
+    "detail": false,
+    "render": false,
+    "frame": false,
+    "vram": true
+   },
+   "pass_all": false,
+   "speedup_vs_brute256": 6.712727715979872,
+   "speedup_vs_brute256_default": 9.489842288076101
+  },
+  {
+   "scene": "campfire",
+   "pipeline": "routeA",
+   "march_scale": "1",
+   "sim": 0.8534841549396515,
+   "detail": 4.329705286026001,
+   "render": 4.038148803710937,
+   "frame": 9.22133825302124,
+   "frame_p50": 9.232671737670898,
+   "frame_p95": 9.893600463867188,
+   "wall": 9.223119000089355,
+   "vram": 950.0,
+   "hitches": 0,
+   "frame_max": 10.280320167541504,
+   "pass": {
+    "sim": true,
+    "detail": false,
+    "render": false,
+    "frame": false,
+    "vram": true
+   },
+   "pass_all": false,
+   "speedup_vs_brute256": 4.935480185176564,
+   "speedup_vs_brute256_default": 6.909944851757456
+  },
+  {
+   "scene": "campfire",
+   "pipeline": "routeB",
+   "march_scale": "0.5",
+   "sim": 0.8359833586215973,
+   "detail": 2.076866238117218,
+   "render": 0.8492179214954376,
+   "frame": 3.7620675230026244,
+   "frame_p50": 3.729952096939087,
+   "frame_p95": 4.272672176361084,
+   "wall": 3.7628879999101628,
+   "vram": 566.0,
+   "hitches": 0,
+   "frame_max": 4.485663890838623,
+   "pass": {
+    "sim": true,
+    "detail": true,
+    "render": true,
+    "frame": true,
+    "vram": true
+   },
+   "pass_all": true,
+   "speedup_vs_brute256": 11.794609774114518,
+   "speedup_vs_brute256_default": 16.67414370752697
+  },
+  {
+   "scene": "campfire",
+   "pipeline": "routeB",
+   "march_scale": "1",
+   "sim": 0.8449167984724045,
+   "detail": 2.1001014363765718,
+   "render": 3.176814386844635,
+   "frame": 6.1218326377868655,
+   "frame_p50": 6.12611198425293,
+   "frame_p95": 6.723104000091553,
+   "wall": 6.123263000044972,
+   "vram": 684.0,
+   "hitches": 0,
+   "frame_max": 6.9319682121276855,
+   "pass": {
+    "sim": true,
+    "detail": true,
+    "render": false,
+    "frame": false,
+    "vram": true
+   },
+   "pass_all": false,
+   "speedup_vs_brute256": 7.434331338572853,
+   "speedup_vs_brute256_default": 10.408474481068723
+  },
+  {
+   "scene": "campfire",
+   "pipeline": "brute128",
+   "march_scale": "0.5",
+   "sim": 4.130502724647522,
+   "detail": 0.0,
+   "render": 0.8205987167358398,
+   "frame": 4.951101446151734,
+   "frame_p50": 4.890912055969238,
+   "frame_p95": 5.4436798095703125,
+   "wall": 4.952231000061147,
+   "vram": 546.0,
+   "hitches": 0,
+   "frame_max": 5.834720134735107,
+   "pass": {
+    "sim": false,
+    "detail": true,
+    "render": true,
+    "frame": true,
+    "vram": true
+   },
+   "pass_all": false,
+   "speedup_vs_brute256": 8.962070129299002,
+   "speedup_vs_brute256_default": 12.669757466739522
+  },
+  {
+   "scene": "campfire",
+   "pipeline": "brute128",
+   "march_scale": "1",
+   "sim": 4.142544972896576,
+   "detail": 0.0,
+   "render": 3.009462068080902,
+   "frame": 7.15200704574585,
+   "frame_p50": 7.16537618637085,
+   "frame_p95": 7.820799827575684,
+   "wall": 7.15369900004589,
+   "vram": 666.0,
+   "hitches": 0,
+   "frame_max": 8.309344291687012,
+   "pass": {
+    "sim": false,
+    "detail": true,
+    "render": false,
+    "frame": false,
+    "vram": true
+   },
+   "pass_all": false,
+   "speedup_vs_brute256": 6.363490966590735,
+   "speedup_vs_brute256_default": 8.909238816491303
+  },
+  {
+   "scene": "campfire",
+   "pipeline": "brute256",
+   "march_scale": "0.5",
+   "sim": 43.02876663208008,
+   "detail": 0.0,
+   "render": 1.3433514753977458,
+   "frame": 44.372118377685545,
+   "frame_p50": 44.403263092041016,
+   "frame_p95": 44.938560485839844,
+   "wall": 44.37616666643104,
+   "vram": 3260.0,
+   "hitches": 0,
+   "frame_max": 45.75737762451172,
+   "pass": {
+    "sim": false,
+    "detail": true,
+    "render": true,
+    "frame": false,
+    "vram": true
+   },
+   "pass_all": false,
+   "speedup_vs_brute256": 1.0,
+   "speedup_vs_brute256_default": 1.4137088065534396
+  },
+  {
+   "scene": "campfire",
+   "pipeline": "brute256",
+   "march_scale": "1",
+   "sim": 43.17869656880696,
+   "detail": 0.0,
+   "render": 2.3330357472101846,
+   "frame": 45.511732228597005,
+   "frame_p50": 45.48857498168945,
+   "frame_p95": 46.24639892578125,
+   "wall": 45.51599999977043,
+   "vram": 3386.0,
+   "hitches": 0,
+   "frame_max": 46.247806549072266,
+   "pass": {
+    "sim": false,
+    "detail": true,
+    "render": false,
+    "frame": false,
+    "vram": true
+   },
+   "pass_all": false,
+   "speedup_vs_brute256": 1.0,
+   "speedup_vs_brute256_default": 1.400055231203457
+  },
+  {
+   "scene": "plume_sphere",
+   "pipeline": "raw64",
+   "march_scale": "0.5",
+   "sim": 0.8254953581094742,
+   "detail": 0.0,
+   "render": 0.8507027161121369,
+   "frame": 1.6761980760097503,
+   "frame_p50": 1.6510080099105835,
+   "frame_p95": 1.9778879880905151,
+   "wall": 1.6770499999984168,
+   "vram": 226.0,
+   "hitches": 0,
+   "frame_max": 2.0259199142456055,
+   "pass": {
+    "sim": true,
+    "detail": true,
+    "render": true,
+    "frame": true,
+    "vram": true
+   },
+   "pass_all": true,
+   "speedup_vs_brute256": 26.60687033082975,
+   "speedup_vs_brute256_default": 45.03389584534067
+  },
+  {
+   "scene": "plume_sphere",
+   "pipeline": "raw64",
+   "march_scale": "1",
+   "sim": 0.8369407999515533,
+   "detail": 0.0,
+   "render": 2.7379523158073424,
+   "frame": 3.5748931169509888,
+   "frame_p50": 3.554719924926758,
+   "frame_p95": 4.114943981170654,
+   "wall": 3.5762190000968985,
+   "vram": 346.0,
+   "hitches": 0,
+   "frame_max": 4.3258562088012695,
+   "pass": {
+    "sim": true,
+    "detail": true,
+    "render": false,
+    "frame": true,
+    "vram": true
+   },
+   "pass_all": false,
+   "speedup_vs_brute256": 12.740223276060144,
+   "speedup_vs_brute256_default": 21.397854464303506
+  },
+  {
+   "scene": "plume_sphere",
+   "pipeline": "tri256",
+   "march_scale": "0.5",
+   "sim": 0.8266953581571579,
+   "detail": 0.16130176022648812,
+   "render": 1.5885779190063476,
+   "frame": 2.576575038433075,
+   "frame_p50": 2.5602879524230957,
+   "frame_p95": 2.9863998889923096,
+   "wall": 2.5779160000092816,
+   "vram": 598.0,
+   "hitches": 0,
+   "frame_max": 3.0735039710998535,
+   "pass": {
+    "sim": true,
+    "detail": true,
+    "render": false,
+    "frame": true,
+    "vram": true
+   },
+   "pass_all": false,
+   "speedup_vs_brute256": 17.309173686748093,
+   "speedup_vs_brute256_default": 29.296926518813756
+  },
+  {
+   "scene": "plume_sphere",
+   "pipeline": "tri256",
+   "march_scale": "1",
+   "sim": 0.848795838356018,
+   "detail": 0.16600416079163552,
+   "render": 3.5724931144714356,
+   "frame": 4.587293131351471,
+   "frame_p50": 4.58073616027832,
+   "frame_p95": 5.126495838165283,
+   "wall": 4.588950000033947,
+   "vram": 724.0,
+   "hitches": 0,
+   "frame_max": 5.357120037078857,
+   "pass": {
+    "sim": true,
+    "detail": true,
+    "render": false,
+    "frame": true,
+    "vram": true
+   },
+   "pass_all": false,
+   "speedup_vs_brute256": 9.928499268279397,
+   "speedup_vs_brute256_default": 16.675420656935707
+  },
+  {
+   "scene": "plume_sphere",
+   "pipeline": "routeA",
+   "march_scale": "0.5",
+   "sim": 0.8285231989622116,
+   "detail": 4.29094241142273,
+   "render": 1.5827900850772858,
+   "frame": 6.702255654335022,
+   "frame_p50": 6.731296062469482,
+   "frame_p95": 7.208384037017822,
+   "wall": 6.704041000048164,
+   "vram": 904.0,
+   "hitches": 0,
+   "frame_max": 7.43507194519043,
+   "pass": {
+    "sim": true,
+    "detail": false,
+    "render": false,
+    "frame": false,
+    "vram": true
+   },
+   "pass_all": false,
+   "speedup_vs_brute256": 6.654235104912997,
+   "speedup_vs_brute256_default": 11.26273503493698
+  },
+  {
+   "scene": "plume_sphere",
+   "pipeline": "routeA",
+   "march_scale": "1",
+   "sim": 0.8609315186738968,
+   "detail": 4.383272323608399,
+   "render": 3.5667302298545835,
+   "frame": 8.81093402862549,
+   "frame_p50": 8.813759803771973,
+   "frame_p95": 9.588383674621582,
+   "wall": 8.813313999999082,
+   "vram": 1030.0,
+   "hitches": 0,
+   "frame_max": 10.156479835510254,
+   "pass": {
+    "sim": true,
+    "detail": false,
+    "render": false,
+    "frame": false,
+    "vram": true
+   },
+   "pass_all": false,
+   "speedup_vs_brute256": 5.169138294536888,
+   "speedup_vs_brute256_default": 8.68183127843608
+  },
+  {
+   "scene": "plume_sphere",
+   "pipeline": "routeB",
+   "march_scale": "0.5",
+   "sim": 0.8301587194204331,
+   "detail": 2.070974724292755,
+   "render": 0.8440617555379868,
+   "frame": 3.7451952123641967,
+   "frame_p50": 3.709120035171509,
+   "frame_p95": 4.1078081130981445,
+   "wall": 3.7468470000021625,
+   "vram": 566.0,
+   "hitches": 0,
+   "frame_max": 4.24403190612793,
+   "pass": {
+    "sim": true,
+    "detail": true,
+    "render": true,
+    "frame": true,
+    "vram": true
+   },
+   "pass_all": true,
+   "speedup_vs_brute256": 11.908160276917716,
+   "speedup_vs_brute256_default": 20.155352469206086
+  },
+  {
+   "scene": "plume_sphere",
+   "pipeline": "routeB",
+   "march_scale": "1",
+   "sim": 0.8473475182056427,
+   "detail": 2.0877766263484956,
+   "render": 2.732986235618591,
+   "frame": 5.668110384941101,
+   "frame_p50": 5.650464057922363,
+   "frame_p95": 6.254079818725586,
+   "wall": 5.669225000019651,
+   "vram": 686.0,
+   "hitches": 0,
+   "frame_max": 6.412831783294678,
+   "pass": {
+    "sim": true,
+    "detail": true,
+    "render": false,
+    "frame": true,
+    "vram": true
+   },
+   "pass_all": false,
+   "speedup_vs_brute256": 8.03529455230951,
+   "speedup_vs_brute256_default": 13.495686824517
+  },
+  {
+   "scene": "plume_sphere",
+   "pipeline": "brute128",
+   "march_scale": "0.5",
+   "sim": 4.136158397197724,
+   "detail": 0.0,
+   "render": 0.9574211245775223,
+   "frame": 5.0935795116424565,
+   "frame_p50": 5.068416118621826,
+   "frame_p95": 5.7196478843688965,
+   "wall": 5.094603999896208,
+   "vram": 550.0,
+   "hitches": 0,
+   "frame_max": 5.801472187042236,
+   "pass": {
+    "sim": false,
+    "detail": true,
+    "render": true,
+    "frame": true,
+    "vram": true
+   },
+   "pass_all": false,
+   "speedup_vs_brute256": 8.755804195308754,
+   "speedup_vs_brute256_default": 14.81978035262724
+  },
+  {
+   "scene": "plume_sphere",
+   "pipeline": "brute128",
+   "march_scale": "1",
+   "sim": 4.17160994052887,
+   "detail": 0.0,
+   "render": 2.843028173446655,
+   "frame": 7.014638066291809,
+   "frame_p50": 6.974880218505859,
+   "frame_p95": 7.592512130737305,
+   "wall": 7.016119000036269,
+   "vram": 670.0,
+   "hitches": 0,
+   "frame_max": 7.955967903137207,
+   "pass": {
+    "sim": false,
+    "detail": true,
+    "render": false,
+    "frame": false,
+    "vram": true
+   },
+   "pass_all": false,
+   "speedup_vs_brute256": 6.4928419781012146,
+   "speedup_vs_brute256_default": 10.905059094858709
+  },
+  {
+   "scene": "plume_sphere",
+   "pipeline": "brute256",
+   "march_scale": "0.5",
+   "sim": 43.02011070251465,
+   "detail": 0.0,
+   "render": 1.578274126847585,
+   "frame": 44.598384857177734,
+   "frame_p50": 44.62748718261719,
+   "frame_p95": 45.038272857666016,
+   "wall": 44.60572666672912,
+   "vram": 3358.0,
+   "hitches": 0,
+   "frame_max": 45.27849578857422,
+   "pass": {
+    "sim": false,
+    "detail": true,
+    "render": false,
+    "frame": false,
+    "vram": true
+   },
+   "pass_all": false,
+   "speedup_vs_brute256": 1.0,
+   "speedup_vs_brute256_default": 1.6925664418772048
+  },
+  {
+   "scene": "plume_sphere",
+   "pipeline": "brute256",
+   "march_scale": "1",
+   "sim": 42.957349395751955,
+   "detail": 0.0,
+   "render": 2.5875871976216636,
+   "frame": 45.54493649800619,
+   "frame_p50": 45.550880432128906,
+   "frame_p95": 45.93110275268555,
+   "wall": 45.549640000293344,
+   "vram": 3484.0,
+   "hitches": 0,
+   "frame_max": 46.796382904052734,
+   "pass": {
+    "sim": false,
+    "detail": true,
+    "render": false,
+    "frame": false,
+    "vram": true
+   },
+   "pass_all": false,
+   "speedup_vs_brute256": 1.0,
+   "speedup_vs_brute256_default": 1.6795509780830697
+  }
+ ]
+}
