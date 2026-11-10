@@ -107,6 +107,19 @@ and the lead decides; nobody edits a threshold to make a test pass.
 - Gate 3: windowed demo — solver → half-resolution march (colour + alpha/depth/motion) → detail →
   present; orbit camera, fire/smoke at the cursor, raw/neural toggle, per-stage GPU ms against 6 ms.
 
+### Gate 2 — native detail inference (`infer/`): what "passes" means
+API: `infer/nvfx_detail.h` (raw DirectML graph built from the exported ONNX weights; ONNX Runtime DML kept
+as an option). Reference: `vfx.runtime3d.ScreenDetail(latest.pt).infer(frame, aux)` at 2560×1440 on real
+rendered frames + aux (campfire and plume + sphere), FP16 on both sides.
+
+| # | Check | Threshold |
+|---|---|---|
+| D1 | Output vs PyTorch, 8-bit units, for bboxes hitting ≥ 5 different crop buckets incl. the 1/3-screen one (1536×832 → 1600×960) and full frame, both scenes | max abs ≤ 2; pixels differing by more than 1: ≤ 0.01 %; processed region identical to Python's; pixels outside it identical to the input |
+| D2 | Same inputs twice | bit-identical output |
+| D3 | 200 random bboxes (seed 0) in sequence after creation | no call takes more than 10 ms of CPU wall time; every output still meets D1 on a sample of 10 |
+| D4 | No host sync: `nvfx_detail_run` called with ≥ 20 ms of GPU work already queued | returns in < 1 ms |
+| T3 | GPU ms (timestamp queries, pre + net + post) at 2560×1440, 1/3-screen bbox, FP16, median and p10 of ≥ 300 frames; full frame reported too; PyTorch in the same sitting alongside | ≤ 2.5 ms (budget), on an idle GPU for the figure of record |
+
 ### Gate 3a — native ray-marcher (`render/`): what "passes" means
 Reference: `vfx.render3d.VolumeRenderer((1440, 2560), march_scale=0.5)` with default `RenderParams3D`,
 `return_aux=True`, fed the same 64³ state (uploaded to the native solver with `nvfx_solver_upload_state`),

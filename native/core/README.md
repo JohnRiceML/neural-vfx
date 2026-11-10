@@ -12,6 +12,15 @@
 - `nvfx_last_error()` is thread-local.
 - Resource helpers: committed buffers (default / upload / readback; upload and readback are persistently mapped)
   and 3D textures with UAV access.
+- `texture2d.cpp`: the `nvfx_texture2d_*` test/tool helpers. `create` makes a committed 1-mip Texture2D with
+  the given format and flags in the given initial state. `upload` and `download` work on any Texture2D on the
+  context's device, including textures created by other modules. They copy subresource 0 only, use
+  `GetCopyableFootprints` with an upload or readback buffer, and repack rows between the footprint pitch and the
+  caller's `row_pitch` (which must be at least one texture row). Each recording does `state` -> COPY_DEST or
+  COPY_SOURCE -> `state`, then submits and waits. `download` first waits for the context queue to go idle.
+  `release` calls `IUnknown::Release`. On a compute queue, `state` must be one that is legal on compute queues.
+  Formats with block compression or planes are not handled. The helpers compile, but **have not run yet**.
+  `nvfx_selfcheck --tex-only` tests the round trip.
 
 ## Caveats
 - `enable_debug_layer = 1` returns `NVFX_ERR_UNSUPPORTED` on this machine. The D3D12 debug layer (Windows

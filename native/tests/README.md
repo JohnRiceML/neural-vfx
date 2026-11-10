@@ -13,6 +13,8 @@ The native solver (`native/core`, `native/sim`) is a black box here and is reach
 | `test_p3_noise_floor.py` | P3 noise-floor **measurement** (not a gate): Python rounding-perturbation ensemble vs the backend (section below) |
 | `test_harness_controls.py` | struct layouts, conversions, the memorylessness of the P1 reference, the skip path, negative controls, `dump_reference` replay |
 | `../tools/nvfx_scenes.py` | scenes from `vfx/sim3d/selfcheck.py`: `campfire`, `plume` (+SPHERE), `determinism`, `stress`, `mass_box` |
+| `test_gate2.py`, `gate2_checks.py`, `nvfx_detail_ctypes.py` | Gate 2 (native detail inference), section below |
+| `../tools/detail_frames.py` | Gate 2 inputs: real 2560×1440 frames + aux rendered by the Python reference |
 | `../tools/dump_reference.py` | stored references for non-Python consumers (format in its docstring; output under `%LOCALAPPDATA%\neural-vfx\native_ref`) |
 
 ## Run (from the worktree root)
@@ -119,6 +121,45 @@ Measured 2026-11-09 against nvfx 0.1, with the GPU shared with a training job at
 The zero-perturbation control was bit-identical. The backend's step-1 difference is rounding-level: rel_l2 is 0.9–2.7e-7 per channel. Backend trajectories do not separate earlier than perturbed Python ones.
 For plume, the backend's velocity rel_l2 is 1.2e-6 at step 20, while the ensemble median is 1.3e-4. The matched-amplitude members track the backend almost exactly (1.8e-4 at step 30 for both).
 Mass is far inside the noise in both scenes, and the centroid distance is z ≤ 1.3 and below 0.01 m in every member.
+
+## Gate 2 — native detail inference (`test_gate2.py`, `gate2_checks.py`, `nvfx_detail_ctypes.py`, `../tools/detail_frames.py`)
+The runner is a black box here. The harness was written from `infer/nvfx_detail.h`, `include/nvfx.h` and the "how to run" part of `infer/README.md`.
+The reference is `vfx.runtime3d.ScreenDetail(latest.pt).infer(frame, aux)`, run in-process in the same session.
+
+**Contract gap.** `nvfx_detail_run` takes `ID3D12Resource*` textures, and no public function creates a Texture2D or copies CPU data into or out of one.
+The tests use four proposed helpers: `nvfx_texture2d_create`, `nvfx_texture2d_release`, `nvfx_texture2d_upload` and `nvfx_texture2d_download`. Their exact signatures are in the `nvfx_detail_ctypes.py` docstring.
+Every native test skips with that message until `nvfx.dll` exports them.
+
+Inputs: `detail_frames.py` runs `Solver3D` with the default config for 150 steps (campfire, plume + sphere) and renders with `VolumeRenderer((1440, 2560), march_scale=0.5).draw(..., return_aux=True, velocity, prev_camera)`.
+The camera is `camera_at(1.3)` and the previous camera is `camera_at(1.32)`. The frames are cached under `native/build/gate2_cache/`.
+The aux data is float16 on both sides. The native colour texture carries a non-constant A pattern, so the "A passed through" behaviour can be observed.
+The ONNX model's `screennet.json` `checkpoint_sha256` must equal the SHA-256 of the checkpoint that Python loads, or the native tests error.
+
+| test | what |
+|---|---|
+| `test_unit_*` | struct layouts, D1 comparator on synthetic data (including the 0.01 % boundary at 100 and 101 px out of 1e6), bbox plans. Needs no GPU and no DLL. |
+| `HC2_py_{self,alpha0,shift64}` | harness controls with no DLL. Python is compared with Python through the D1 comparator: a second instance must PASS; alpha zeroed and the bbox shifted by 64 px must FAIL. |
+| `D1_{campfire,plume}` | 12 bboxes per scene: the effect bbox, 5 centred sizes covering every width bucket including 1536×832 → 1600×960, tall/flat cases, two corners, explicit full frame and `None`/(0,0,0,0). The output is pre-filled with garbage first. |
+| `D1_region_sweep` | `nvfx_detail_region` against `ScreenDetail._region` on about 3000 bboxes, including partly off-screen ones |
+| `D1_NC_{alpha0,shift64}` | negative controls: the native side gets alpha = 0 or the bbox shifted by 64 px, and D1 must FAIL. For alpha0 the pixel part must fail by itself. |
+| `D2_*` | run → A, run → B (pre-filled with different garbage), another bbox, then the same frame → A again. All three outputs must be bit-identical. Done for the 1/3 bbox and the full frame. |
+| `D3` | a fresh `NvfxDetail`, then the 200 seed-0 random bboxes (alternating scenes). Each call's wall time is measured in Python. Calls 0, 22, …, 199 are downloaded and must pass D1. |
+| `D4` | `QueueLoad` queues 64³ solver steps (tol 0, 256 iteration slots) on the same context, then `nvfx_detail_run` is timed. The test checks that ≥ 20 ms of work was still queued ahead of the call (wall time to idle after the return, minus the frame's own GPU ms). Otherwise it reports PRECONDITION NOT MET. |
+| `T3` | 30 warm-up runs, then ≥ 300 distinct `get_timings` frames, read without blocking. Reports the median, p10 and p90 of pre, net, post, their sum, total and cpu. The 1/3 bbox is gated; the full frame is reported. PyTorch `ScreenDetail.timings` is measured in the same session, and `nvidia-smi` is read before and after. |
+
+Run: `%PY% -m pytest native/tests/test_gate2.py -q -s` (`-k unit` runs without a GPU). The env vars are listed in the `test_gate2.py` docstring.
+Output: `native/build/test_results/gate2_native.json` and `.md`.
+
+Gate 2 interpretations made by this harness (for the lead; no threshold changed):
+1. D1 "pixels differing by more than 1": a pixel counts if any of R, G, B differs by more than 1. The denominator is the processed region, which is stricter; the whole-frame fraction is reported too.
+2. D1 compares RGB only, because Python returns RGB. A pass-through (stated in the header) is reported as `a_passthrough` and is not gated.
+3. T3 "pre + net + post" is gated on `total_ms` (first to last timestamp, which is ≥ the sum). The sum is reported.
+   The table asks for the median and **p10**. p10 is the fast tail, so p90 is reported as well.
+4. Degenerate bboxes differ by design: in native, `x1 <= x0` means the whole frame; Python's `ScreenDetail` uses the smallest bucket. Full-frame parity therefore uses `None` in Python against (0,0,0,0) in native, plus an explicit (0,0,W,H) on both sides.
+5. D3 "after creation" means the first 200 `nvfx_detail_run` calls of a fresh object, with input uploads (synchronizing) before them. The CPU time is wall time around the ctypes call, which is stricter than `cpu_ms`.
+6. D4 does not say how to queue 20 ms of GPU work. The harness uses the public solver API on the same context and verifies the backlog.
+7. The table names no camera or step count for the D1 frames. This harness uses 150 steps with `camera_at(1.3)`, as `infer/` did for export verification.
+8. The PyTorch `total` includes the full-frame `out.copy_(frame)`, so it is not the same quantity as the native `total_ms`.
 
 ## Contract ambiguities found (for the lead)
 1. **ε in rel_l2 is unspecified.** This harness uses 1e-12.

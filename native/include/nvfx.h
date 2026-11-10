@@ -80,6 +80,17 @@ NVFX_API NvfxResult nvfx_context_wait_idle(NvfxContext* ctx);
 NVFX_API void*      nvfx_context_device(NvfxContext* ctx);
 NVFX_API void*      nvfx_context_queue(NvfxContext* ctx);
 
+/* --- Texture2D helpers for tests and tools (implemented in core/). All synchronize. ---
+ * dxgi_format, resource_flags and state are DXGI_FORMAT / D3D12_RESOURCE_FLAGS / D3D12_RESOURCE_STATES values.
+ * data is tightly described by row_pitch bytes per row, row 0 first. */
+NVFX_API NvfxResult nvfx_texture2d_create(NvfxContext* ctx, int32_t width, int32_t height, uint32_t dxgi_format,
+                                          uint32_t resource_flags, uint32_t state, void** out_resource);
+NVFX_API void       nvfx_texture2d_release(void* resource);
+/* resource is in `state` on entry and is left in `state`. */
+NVFX_API NvfxResult nvfx_texture2d_upload(NvfxContext* ctx, void* resource, uint32_t state, const void* data, uint32_t row_pitch);
+/* Waits for the context queue first, then copies the texture out. */
+NVFX_API NvfxResult nvfx_texture2d_download(NvfxContext* ctx, void* resource, uint32_t state, void* data, uint32_t row_pitch);
+
 /* ---------------------------------------------------------------- solver */
 typedef struct NvfxSolver NvfxSolver;
 

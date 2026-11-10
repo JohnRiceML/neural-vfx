@@ -1,5 +1,5 @@
 ﻿// nvfx_selfcheck: owner self-check of the native sim3d solver, through the public C API only.
-//   nvfx_selfcheck [--quick] [--debug] [--bench-only]
+//   nvfx_selfcheck [--quick] [--debug] [--bench-only] [--tex-only]
 // Timings (GPU timestamps, median of >= 200 steps after warm-up, split by stage), PCG iteration cost
 // and skipped-iteration cost, divergence, projection of a random field, mass drift over 1000 closed-box
 // steps, rerun determinism, and the 1000-step stress run. Not the gate tests (native/tests/).
@@ -137,17 +137,55 @@ static bool finite_all(const std::vector<float>& v) {
     return true;
 }
 
+// nvfx_texture2d_* round trip: odd size, caller row pitch padded past the texture row (and != footprint pitch).
+static bool tex_roundtrip(NvfxContext* ctx) {
+    struct Case { const char* name; DXGI_FORMAT fmt; uint32_t bpp; uint32_t flags; uint32_t state; } cases[] = {
+        {"R8G8B8A8_UNORM", DXGI_FORMAT_R8G8B8A8_UNORM, 4, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE},
+        {"R32G32B32A32_FLOAT", DXGI_FORMAT_R32G32B32A32_FLOAT, 16, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+         D3D12_RESOURCE_STATE_UNORDERED_ACCESS}};
+    const int W = 67, H = 33;
+    bool all = true;
+    for (auto& c : cases) {
+        uint32_t pitch = W * c.bpp + 12;
+        std::vector<uint8_t> in(size_t(pitch) * H, 0), out(size_t(pitch) * H, 0xCD);
+        for (int y = 0; y < H; ++y)
+            for (uint32_t x = 0; x < W * c.bpp; ++x) {
+                uint8_t* p = &in[size_t(y) * pitch + x];
+                *p = uint8_t((x * 7 + y * 13) & 0xFF);
+                if (c.bpp == 16 && x % 4 == 3) *p = 0x3F;   // keep every float finite and normal (no NaN canonicalisation)
+            }
+        void* t = nullptr;
+        CHECK(nvfx_texture2d_create(ctx, W, H, c.fmt, c.flags, c.state, &t));
+        CHECK(nvfx_texture2d_upload(ctx, t, c.state, in.data(), pitch));
+        CHECK(nvfx_texture2d_download(ctx, t, c.state, out.data(), pitch));
+        nvfx_texture2d_release(t);
+        bool same = true;
+        for (int y = 0; y < H; ++y)
+            same = same && std::memcmp(&in[size_t(y) * pitch], &out[size_t(y) * pitch], size_t(W) * c.bpp) == 0;
+        std::printf("texture2d round trip %-18s %dx%d pitch %u: identical = %d\n", c.name, W, H, pitch, int(same));
+        all = all && same;
+    }
+    return all;
+}
+
 int main(int argc, char** argv) {
-    bool quick = false, debug = false, bench_only = false;
+    bool quick = false, debug = false, bench_only = false, tex_only = false;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--quick")) quick = true;
         if (!std::strcmp(argv[i], "--debug")) debug = true;
         if (!std::strcmp(argv[i], "--bench-only")) bench_only = true;
+        if (!std::strcmp(argv[i], "--tex-only")) tex_only = true;
     }
     std::printf("%s\n", nvfx_version_string());
     NvfxContextDesc cd = {-1, debug ? 1 : 0};
     NvfxContext* ctx;
     CHECK(nvfx_context_create(&cd, &ctx));
+    if (tex_only) {
+        bool good = tex_roundtrip(ctx);
+        nvfx_context_destroy(ctx);
+        return good ? 0 : 1;
+    }
+    tex_roundtrip(ctx);
     const int N = 64;
     const size_t n3 = size_t(N) * N * N;
     NvfxSolverConfig def, rt;
