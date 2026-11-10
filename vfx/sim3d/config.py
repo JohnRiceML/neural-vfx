@@ -61,9 +61,9 @@ class SolverConfig3D:
 
 def fused_config(**kw) -> SolverConfig3D:
     """Fused pressure solve, adaptive: 2 V-cycles + 4 Chebyshev sweeps, then more cycles until the
-    normalized residual < 5e-5 (at most 12 cycles). The tail is what handles cold starts and impulses
-    (adaptive tail NOT YET MEASURED - see README)."""
-    base = dict(pressure_mode="fused", pressure_tol=5e-5, pressure_max_iters=12)
+    normalized residual < 5e-5 (at most 24 cycles). The tail handles cold starts and sudden changes:
+    measured <= 8.8e-5 cold, <= 7.5e-5 in the 1000-step stress run (README)."""
+    base = dict(pressure_mode="fused", pressure_tol=5e-5, pressure_max_iters=24)
     base.update(kw)
     return SolverConfig3D(**base)
 

@@ -4,7 +4,8 @@
 
 1. uniform flow, sub-grid off: every particle moves exactly u*dt per tick (RK2 of a constant field)
 2. smoke plume past a sphere (preset 2), 150 ticks: particle smoke mass vs grid mass, restriction of the volume to 64^3
-   vs the solver density, no live particle inside a solid, everything finite
+   vs the solver density (compared with the same error of a plain trilinear upsample), no live particle inside a
+   solid, everything finite
 3. campfire (preset 1): fire temperature carried (max of the volume temperature vs the grid's), smoke from fuel
 4. determinism: particle state bit-identical on rerun; the deposited volume only differs at float-atomic rounding
 """
@@ -70,8 +71,10 @@ def main():
     ratio = dg["particle_mass"] / dg["grid_mass"]
     check("particle mass tracks grid mass", 0.75 < ratio < 1.25,
           f"particle {dg['particle_mass']:.4g} vs grid {dg['grid_mass']:.4g} (ratio {ratio:.3f}), alive {dg['alive']}")
-    check("volume restricts to solver density", dg["restrict_rel_err"] < 0.15,
-          f"rel L1 {dg['restrict_rel_err']:.3f} (trilinear ratio field; volume mass {dg['volume_mass']:.4g})")
+    extra = dg["restrict_rel_err"] - dg["tri_restrict_rel_err"]
+    check("volume restricts to solver density (beyond trilinear)", extra < 0.08,
+          f"rel L1 {dg['restrict_rel_err']:.3f} vs {dg['tri_restrict_rel_err']:.3f} for the plain trilinear upsample "
+          f"(+{extra:.3f}); volume mass {dg['volume_mass']:.4g} vs grid {dg['grid_mass']:.4g}")
     check("no particles in solids", in_solid == 0, f"{in_solid} live particles in solid cells")
     check("finite", bool(torch.isfinite(dp.dens).all() and torch.isfinite(dp.temp).all()), "density/temperature")
 

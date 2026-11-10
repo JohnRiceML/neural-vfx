@@ -353,7 +353,7 @@ def restrict(dep_m: wp.array3d(dtype=float), dep_h: wp.array3d(dtype=float), dep
 @wp.kernel
 def compose(dep_m: wp.array3d(dtype=float), dep_h: wp.array3d(dtype=float), coarse: wp.array4d(dtype=float),
             data: wp.array4d(dtype=float), res: int, inv_dx: float, fdx: float, amb: float,
-            n_full: float, strength: float, mod_max: float,
+            n_full: float, strength: float, mod_max: float, h_strength: float, h_mod_max: float,
             dens: wp.array3d(dtype=float), temp: wp.array3d(dtype=float)):
     """Fine cell: rho = up(G) * (1 - b + b * clamp(P / up(R(P)), 0, mod_max)); same for heat with H.
     up = trilinear from the sim grid, R = box restriction; P / up(R(P)) is the particle detail modulation (mean 1
@@ -371,9 +371,10 @@ def compose(dep_m: wp.array3d(dtype=float), dep_h: wp.array3d(dtype=float), coar
     if rm > 1.0e-12:
         md = wp.min(dep_m[z, y, x] / rm, mod_max)
     if rh > 1.0e-6:
-        mh = wp.min(dep_h[z, y, x] / rh, mod_max)
+        mh = wp.min(dep_h[z, y, x] / rh, h_mod_max)
+    bh = b * h_strength / wp.max(strength, 1.0e-6)
     dens[z, y, x] = g * (1.0 - b + b * md)
-    temp[z, y, x] = amb + th * (1.0 - b + b * mh)
+    temp[z, y, x] = amb + th * (1.0 - bh + bh * mh)
 
 
 @wp.kernel

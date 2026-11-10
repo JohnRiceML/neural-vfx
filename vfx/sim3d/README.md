@@ -113,10 +113,16 @@ iteration, without CG**. It runs `pressure_smooth` exact-K sweeps, then `pressur
 `pressure_smooth` sweeps). The sweeps use Chebyshev weights on [0.5, 2] by default (λmax(D⁻¹K) measured
 1.976). With `pressure_tol > 0`, it runs further cycles while 0.5·max|r| ≥ tol·max|u*| (GPU-side test,
 `capture_while`), up to `pressure_max_iters` cycles in total. There are no dot products. Levels:
-* `fused_config()`: adaptive, tol 5e-5, ≤ 12 cycles. **Not yet measured** (the GPU was handed back
-  to training first).
+* `fused_config()`: adaptive, tol 5e-5, ≤ 24 cycles. **Meets the 1e-4 gate everywhere measured**:
+  cold `project()` 7.3e-5 (open, 9 cycles) / 8.8e-5 (sphere, 15 cycles; with the earlier 12-cycle cap it
+  stopped at 3.4e-4). Stress run (1000 steps): max 7.5e-5 (impulse-step median 4.6e-5). On the step of / after
+  a sudden change in the plume + sphere run (6 m/s impulse; sphere removed; sphere put back; new
+  strong emitter): ≤ 6.4e-5, using 3-7 cycles; ordinary steps use 2-4. A `SolverConfig3D(pressure_mode="fused")` with
+  the default tol 2e-5 / 40: cold 2.0e-5 / 3.6e-5 (11 / 17 cycles).
 * `fused_fixed_config()` (`pressure_tol=0`): a fixed cost. This is a **LOWER-QUALITY LEVEL**: it misses the
-  1e-4 gate on a cold `project()` (about 1.1e-2, test engineer's run) and on impulse steps.
+  1e-4 gate on a cold `project()` (1.8e-2 open / 2.8e-2 sphere) and after sudden changes (impulse
+  3.3e-3 then 4.9e-3; obstacle removed/added 3.0e-4 / 9.3e-4; new emitter 9.3e-4), recovering over a few
+  steps; stress run max 7.5e-3. Warm-start alone is not good enough the step after a change.
 
 Measured with the fixed 2/3/4 cycles (64³, warm start, max normalized div over 150-300 steps, every
 10th step; GPU SHARED at 97-100 % by a training job):
@@ -170,14 +176,25 @@ Measured at S = 128 (GPU shared, so correctness only): fine mass +0.00019 % over
 equals the 128³ raster, and fine solids hold exactly 0 / ambient. Reruns are bit-identical (PCG and fused).
 The 1000-step stress run is finite (fine Tmax 2649 K).
 The restriction was first a fluid-weighted average, and the test engineer measured coarse vs fine mass
-off by 0.83 %. It is now the plain box average, so coarse = avgpool(fine) exactly on coarse fluid cells.
-**Re-measure pending.** Cost at 96/128/192 and peak VRAM: **pending idle GPU.**
+off by 0.83 %. It is now the plain box average: coarse vs avgpool(fine) on coarse fluid cells is rel L1
+0.0, mass rel 0.0 (plume + sphere, 90 steps). Cost at 96/128/192 and peak VRAM: **pending idle GPU.**
+
+What it does to the 64³ state (step 150, 8³-pooled rel L2 vs the default 64³ run; in brackets, the
+default 64³ vs true 128³, for scale): density 0.29 (0.46) campfire, 0.30 (0.57) plume. The 64³ state
+from `scalar_res=128` **is not the default path**. Its large-scale change is about half the 64↔128 gap,
+caused by the restricted scalars feeding buoyancy. Datasets and trained nets assume the default path.
+Pictures (`sim3d_v2/*_step150*.png`): the fine field has sharp edges and thin rolled sheets that the
+64³ field smears into blocks. Its texture is smooth, ribbon-like swirls (64³ velocity), not the small-scale
+turbulence of a true 128³ run, and the overall shape still follows the 64³ flow.
 
 ### Resolution-consistent confinement (opt-in): `confinement_ref_res`
 `vorticity_eps` is used as `vorticity_eps · res / confinement_ref_res`. This keeps ε·dx, the
 confinement per unit vorticity, equal to that of a `confinement_ref_res`³ run. 64³ with ref 128 gives ε = 3,
 the value the solver-correction study found cuts the error against 128³ by 63 %. `0` = off (default,
-bit-identical). Not yet measured here.
+bit-identical). Measured here at step 150: 8³-pooled density rel L1 vs true 128³ is 0.29 vs 0.50 for
+the default (campfire) and 0.57 vs 0.65 (plume). The smoke centroid is 0.752 vs 0.676 (128³: 0.763) and 0.488 vs 0.399
+(128³: 0.582). Combined with 128³ scalars it is the closest to the true 128³ picture: a straighter
+column, less bushy.
 
 ## Caveats
 - Collocated wide-stencil projection: odd-even velocity modes are invisible to the gated divergence, as in 2D.

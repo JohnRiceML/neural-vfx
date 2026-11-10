@@ -26,6 +26,8 @@ DEFAULTS = dict(
     n_full=4.0,          # particles per fine cell (restricted to 64^3) for full particle weight
     strength=1.0,        # weight of the particle modulation (0 = plain trilinear upsample of the solver fields)
     mod_max=8.0,         # cap on the per-cell modulation P / up(R(P))
+    heat_strength=0.5,   # weight of the particle modulation of temperature (emission is very nonlinear in T)
+    heat_mod_max=2.0,    # cap on the temperature modulation H / up(R(H))
     blur=0,              # [1,2,1]^3 passes on the fine deposit before composing
     fused=True,          # deposit inside the advect kernel (fast); False = separate kernels (stage timing)
     seed=1,
@@ -121,7 +123,7 @@ class DetailParticles:
         wp.launch(K.vort_mag, dim=(res, res, res), inputs=[data, res, 0.5 / sp.dx, self._wmag], device=self._wp_dev)
         wp.launch(K.vel_field, dim=(sp.vres,) * 3, inputs=[data, self._wmag, sp, self._vel], device=self._wp_dev)
         wp.launch(K.update, dim=self.n, inputs=[self.pos, self.q, self.n, self.head, k_new, self._vel, solid,
-                                               em, n_em, sp, 1e-9, inv_fdx, nf, dep_m, dep_h, dep_n, fused],
+                                               em, n_em, sp, self._m_eps, inv_fdx, nf, dep_m, dep_h, dep_n, fused],
                   device=self._wp_dev)
         if k_new > 0:
             wp.launch(K.seed, dim=k_new, inputs=[self.pos, self.q, self.n, self.head, k_new, data, self._vel, solid,
@@ -143,6 +145,7 @@ class DetailParticles:
         wp.launch(K.compose, dim=(nf, nf, nf),
                   inputs=[dep_m, dep_h, self._coarse, data, res, 1.0 / sp.dx, DOMAIN_SIZE / nf, sp.amb,
                           float(self.p["n_full"]), float(self.p["strength"]), float(self.p["mod_max"]),
+                          float(self.p["heat_strength"]) * float(self.p["strength"]), float(self.p["heat_mod_max"]),
                           wp.from_torch(self.dens), wp.from_torch(self.temp)], device=self._wp_dev)
         e3 = ev()
         self._events = [("advect" if not fused else "advect+deposit", e0, e1), ("deposit", e1, e2),
@@ -175,6 +178,10 @@ class DetailParticles:
                     particle_fuel=float(q[alive, 1].sum()), grid_mass=float(g.sum() * dx3),
                     volume_mass=float(self.dens.sum() * (DOMAIN_SIZE / self.out_res) ** 3),
                     restrict_rel_err=float((dens_c - g).abs().sum() / g.abs().sum().clamp(min=1e-12)),
+                    # the same measure for the plain trilinear upsample of the solver density (strength = 0)
+                    tri_restrict_rel_err=float((torch.nn.functional.avg_pool3d(torch.nn.functional.interpolate(
+                        g[None, None], size=(self.out_res,) * 3, mode="trilinear", align_corners=False), f)[0, 0] - g
+                    ).abs().sum() / g.abs().sum().clamp(min=1e-12)),
                     coverage_mean=float((wp.to_torch(self._coarse)[2][g > 0.02] / self.p["n_full"]).clamp(max=1).mean()) if (g > 0.02).any() else 0.0)
 
     # ------------------------------------------------------------------ internals
@@ -237,4 +244,8 @@ class DetailParticles:
                            k0, k0 + ke, e.density_rate * dt * w / max(ke, 1), e.fuel_rate * dt * w / max(ke, 1))
             k0 += ke
         self.em_dev.copy_(h, non_blocking=True)
+        # cull threshold relative to the per-particle seed mass (an absolute one kills small particles of large rings)
+        seeds = [a[i * K.EM_STRIDE + 10] + a[i * K.EM_STRIDE + 11] for i in range(len(ems))
+                 if a[i * K.EM_STRIDE + 10] + a[i * K.EM_STRIDE + 11] > 0]
+        self._m_eps = 0.5 * self.p["life_eps"] * min(seeds) if seeds else 0.0
         return len(ems), (k0 if tot > 0 else 0)
