@@ -84,7 +84,28 @@ workaround was removed. Checked: 900 headless frames of route B, orbiting and zo
 4 graphs, 0 frames > 50 ms, max frame 11 ms.
 
 Files: `main.py` (window/headless loops, input, HUD layout), `pipeline.py` (GPU state, timers),
-`hud.py`, `presets.py`, `backends.py`, `_stubs.py`.
+`hud.py`, `presets.py`, `backends.py`, `_stubs.py`, `compare.py` (offline route B comparison).
+
+## Route B: trained checkpoint, aux (2026-11-09)
+* **Aux**: in `neural_screen` the raw 64³ view is drawn with `return_aux=True, velocity=<64³ state
+  velocity>, prev_camera=<camera one SIM_DT ago>` and ScreenDetail gets
+  `{"bbox", "alpha", "depth", "motion", "transmittance"}` (render3d README "Aux buffers"; `transmittance`
+  = renderer T, kept for the current ScreenDetail). prev_camera = the camera of the draw at the same
+  position within the previous sim tick (`Pipeline.prev_camera`), so motion is pixels per SIM_DT on
+  every 60 Hz frame, as in the dataset. Adds ~0.15 ms to that view's render.
+* **Checkpoint**: `backends.route_b_checkpoint()` asks `vfx.runtime3d` for a default path
+  (`default_screen_checkpoint()` / `SCREEN_CHECKPOINT` / `DEFAULT_CHECKPOINT`; none exists yet) and
+  falls back to `vfx.core.paths.CHECKPOINTS / "screen3d" / "latest.pt"`. If that file exists (or
+  `--screen-ckpt PATH` is given) ScreenDetail loads it, the red UNTRAINED label is replaced by a green
+  `trained: <dir>/<file> (<mtime>)`, and the stats JSON lists it under `trained`.
+* **Comparison**: `python -m vfx.app3d.compare --preset K --frames N --out DIR [--size 960x540]
+  [--every 1] [--warmup 90] [--orbit-deg 1] [--screen-ckpt PATH] [--no-hr]` runs the 64³ sim with an
+  orbiting camera and writes labelled strips `frame_XXXX.png` (raw 64³ | trilinear 256³ | route B |
+  guided 256³ reference), `contact_sheet.png` (8 frames) and `timings.json` (per-stage GPU ms, GPU
+  note). The guided 256³ panel uses `vfx.datagen3d.sim.run_pair` with `guide3d.DEFAULT_GUIDE` (that
+  run also provides the 64³ state, same runtime config as the sandbox); if it cannot be imported or
+  fails, the panel is skipped and the 64³ sim runs on the sandbox backends. Route B runs every sim
+  step (its temporal state), with the same aux as the sandbox.
 
 ## Presets: game-effect dissipation
 `Preset.sim` holds SolverConfig3D overrides applied to the 64³ runtime solver AND the 128³ reference

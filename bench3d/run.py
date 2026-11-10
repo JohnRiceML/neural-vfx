@@ -8,12 +8,22 @@
 Question answered: is the SPEC per-effect budget reachable on the RTX 5080?
     64^3 sim <= 2.0 ms, detail <= 2.5 ms, 1440p render <= 1.5 ms, total <= 6.0 ms, peak VRAM <= 4 GB.
 
-Complete pipelines, each on two fixed scenes (campfire; smoke plume past a sphere), rendered at 2560x1440
-with march_scale 0.5 and 1.0:
+Complete pipelines, rendered at 2560x1440 with march_scale 0.5 and 1.0, on two scene sets:
+    closed   the two original fixed scenes (campfire; smoke plume past a sphere) with the solver's own
+             closed-box config (smoke never leaves, so occupancy keeps growing) -- kept for continuity with
+             the stored baseline;
+    presets  the four sandbox presets (vfx/app3d/presets.py: campfire, plume past a sphere, twin torches + wind,
+             box obstacle) with their dissipating SolverConfig3D overrides applied to EVERY solver of the line
+             (64^3 runtime_config, 128^3 / 256^3 SolverConfig3D, as the sandbox does for its reference), pre-
+             simulated 150 steps (5 s) to a steady, localized plume: route A at realistic game occupancy.
+    --scene-set closed|presets|all (default all).
     raw64     64^3 sim -> render the 64^3 volume
     tri256    64^3 sim -> classical_upscale_3d (trilinear 256^3) -> render
     routeA    64^3 sim -> VolumeUpscaler (256^3, empty bricks skipped) -> render
-    routeB    64^3 sim -> render the 64^3 volume -> ScreenDetail on the 1440p frame
+    routeB    64^3 sim -> render the 64^3 volume (+ aux: alpha, depth, motion, when the renderer supports
+              return_aux) -> ScreenDetail on the 1440p frame with that aux and the projected domain bbox (as the
+              sandbox passes it). Uses the TRAINED checkpoint when vfx.eval3d.checkpoint.screen_checkpoint()
+              finds one (reported with its path), else the untrained default architecture ("untrained").
     brute128  128^3 sim -> render
     brute256  256^3 sim -> render (the thing the neural path is meant to replace; its sim stage is the
               "direct 256^3 step time")
@@ -58,7 +68,11 @@ BUDGET = {"sim": 2.0, "detail": 2.5, "render": 1.5, "frame": 6.0}
 BUDGET_VRAM_MB = 4096
 OUT_SIZE = (1440, 2560)                  # (h, w): 1440p
 MARCH_SCALES = (0.5, 1.0)                # low first: Warp's pool keeps freed blocks, so 1.0 sees 0.5's leftovers
-SCENES = ("campfire", "plume_sphere")
+CLOSED_SCENES = ("campfire", "plume_sphere")
+PRESET_SCENES = ("p1_campfire", "p2_plume_sphere", "p3_torches_wind", "p4_box_obstacle")
+SCENES = CLOSED_SCENES + PRESET_SCENES
+SCENE_SETS = {"closed": CLOSED_SCENES, "presets": PRESET_SCENES, "all": SCENES}
+WARM_STEPS_PRESET = 150
 PIPELINES = ("raw64", "tri256", "routeA", "routeB", "brute128", "brute256", "sim64_default", "sim256_default")
 NEURAL = ("routeA", "routeB")
 WARM_STEPS = 60
@@ -142,8 +156,12 @@ def time_frames(stages, iters: int, warmup: int) -> dict:
 
 
 def scene_def(name: str):
+    """-> (obstacles, forces); preset scenes see preset_overrides() for their solver config."""
     from vfx.core.fields3d import Emitter3D, Forces3D, Obstacle3D
 
+    if name in PRESET_SCENES:
+        p = _preset(name)
+        return list(p.obstacles), Forces3D(emitters=list(p.emitters), wind=tuple(p.wind))
     if name == "campfire":
         return [], Forces3D(emitters=[Emitter3D(pos=(0.5, 0.1, 0.5), radius=0.08, density_rate=1.0, temperature=1300.0,
                                                 fuel_rate=2.5, velocity=(0.0, 0.5, 0.0))])
@@ -152,6 +170,52 @@ def scene_def(name: str):
                 Forces3D(emitters=[Emitter3D(pos=(0.5, 0.12, 0.5), radius=0.07, density_rate=1.5, temperature=450.0,
                                              velocity=(0.0, 1.0, 0.0))]))
     raise ValueError(name)
+
+
+def _preset(name: str):
+    from vfx.app3d.presets import PRESETS
+
+    return PRESETS[PRESET_SCENES.index(name) + 1]
+
+
+def preset_overrides(name: str) -> dict:
+    """SolverConfig3D overrides of a scene ({} for the closed-box scenes)."""
+    return dict(_preset(name).sim) if name in PRESET_SCENES else {}
+
+
+def make_config(factory, overrides: dict):
+    """factory(**overrides) keeping only fields the config has (like the sandbox's Pipeline._cfg)."""
+    import dataclasses
+
+    base = factory()
+    if not overrides:
+        return base
+    names = {f.name for f in dataclasses.fields(base)} if dataclasses.is_dataclass(base) else set(overrides)
+    kw = {k: v for k, v in overrides.items() if k in names}
+    try:
+        return factory(**kw)
+    except TypeError:
+        for k, v in kw.items():
+            setattr(base, k, v)
+        return base
+
+
+def domain_bbox(cam, h: int, w: int):
+    """Projected bbox (x0, y0, x1, y1) of the 1 m domain cube, as the sandbox passes it to ScreenDetail."""
+    import numpy as np
+    from vfx.render3d import camera_basis
+
+    b = camera_basis(cam, w / h)
+    o, fw, rt, up, th = b[0:3], b[3:6], b[6:9], b[9:12], b[12]
+    c = np.array([[x, y, z] for x in (0, 1) for y in (0, 1) for z in (0, 1)], np.float32) - o
+    zc = c @ fw
+    if (zc <= 1e-3).any():
+        return (0, 0, w, h)
+    sx = (c @ rt) / zc / (th * w / h)
+    sy = (c @ up) / zc / th
+    px, py = (sx + 1) * 0.5 * w, (1 - sy) * 0.5 * h
+    return (int(np.clip(px.min(), 0, w)), int(np.clip(py.min(), 0, h)),
+            int(np.ceil(np.clip(px.max(), 0, w))), int(np.ceil(np.clip(py.max(), 0, h))))
 
 
 def synthetic_state(res: int):
@@ -203,6 +267,10 @@ def worker(scene: str, pipeline: str, iters: int, warmup: int, scales) -> dict:
     used0 = used_mb()
     res_out: dict = {"scene": scene, "pipeline": pipeline, "configs": {}, "notes": []}
     obstacles, forces = scene_def(scene)
+    overrides = preset_overrides(scene)
+    warm_steps = WARM_STEPS_PRESET if scene in PRESET_SCENES else WARM_STEPS
+    res_out["sim_overrides"] = overrides
+    res_out["warm_steps"] = warm_steps
     sim_res = {"brute128": 128, "brute256": 256, "sim256_default": 256}.get(pipeline, 64)
     use_default_cfg = pipeline.endswith("_default")
     if sim_res == 256:
@@ -215,14 +283,15 @@ def worker(scene: str, pipeline: str, iters: int, warmup: int, scales) -> dict:
 
         cfg = None
         if not use_default_cfg and hasattr(sim, "runtime_config"):
-            cfg = sim.runtime_config()
-            res_out["sim_config"] = "runtime_config()"
+            cfg = make_config(sim.runtime_config, overrides)
+            res_out["sim_config"] = "runtime_config()" + (f" + {overrides}" if overrides else "")
         else:
-            res_out["sim_config"] = "SolverConfig3D() default"
+            cfg = make_config(sim.SolverConfig3D, overrides) if overrides else None
+            res_out["sim_config"] = "SolverConfig3D() default" + (f" + {overrides}" if overrides else "")
         res_out["solver_version"] = getattr(sim, "SOLVER3D_VERSION", None)
         solver = sim.Solver3D(sim_res, cfg)
         state = solver.reset(obstacles)
-        for _ in range(WARM_STEPS):
+        for _ in range(warm_steps):
             state = solver.step(state, forces, SIM_DT)
         torch.cuda.synchronize()
         res_out["scene_source"] = "solver"
@@ -270,11 +339,17 @@ def worker(scene: str, pipeline: str, iters: int, warmup: int, scales) -> dict:
                 holder["vol"] = vu.infer(holder["st"])
         elif pipeline == "routeB":
             torch.manual_seed(0)
-            sd = rt.ScreenDetail(None, device="cuda")
-            res_out["screen_detail"] = {"untrained": getattr(sd, "untrained", None), "params": getattr(sd, "params", None)}
+            from vfx.eval3d.checkpoint import screen_checkpoint
+
+            ck, ck_src = screen_checkpoint()
+            sd = rt.ScreenDetail(str(ck) if ck else None, device="cuda")
+            res_out["screen_detail"] = {"untrained": getattr(sd, "untrained", ck is None), "params": getattr(sd, "params", None),
+                                        "checkpoint": str(ck) if ck else None, "checkpoint_source": ck_src}
 
             def detail():
-                holder["out"] = sd.infer(holder["img"], None)
+                a = dict(holder.get("aux") or {})
+                a["bbox"] = holder["bbox"]
+                holder["out"] = sd.infer(holder["img"], a)
     except Exception as e:  # noqa: BLE001
         if pipeline in ("tri256", "routeA", "routeB"):
             res_out["skipped"] = f"vfx.runtime3d unavailable for {pipeline}: {e!r}"
@@ -299,8 +374,19 @@ def worker(scene: str, pipeline: str, iters: int, warmup: int, scales) -> dict:
             torch.cuda.reset_peak_memory_stats()
             renderer = rd.VolumeRenderer(OUT_SIZE, device="cuda", march_scale=ms)
 
+            import inspect
+
+            want_aux = pipeline == "routeB" and "return_aux" in inspect.signature(renderer.draw).parameters
+            holder["bbox"] = domain_bbox(cam, *OUT_SIZE)
+            if pipeline == "routeB":
+                res_out["render_aux"] = want_aux
+
             def render():
-                holder["img"] = renderer.draw(holder["vol"], cam, solid)
+                if want_aux:
+                    holder["img"], holder["aux"] = renderer.draw(holder["vol"], cam, solid, return_aux=True,
+                                                                 velocity=holder["st"].velocity)
+                else:
+                    holder["img"] = renderer.draw(holder["vol"], cam, solid)
 
             if pipeline in ("raw64", "routeB", "brute128", "brute256"):
                 def render_raw():
@@ -367,6 +453,7 @@ def evaluate(res: dict) -> list[dict]:
                    "frame_p50": t["frame"]["p50_ms"], "frame_p95": t["frame"]["p95_ms"],
                    "wall": t["wall_ms_per_frame"], "vram": vram_of(t), "hitches": t["frame"].get("hitches_gt50ms", 0),
                    "frame_max": t["frame"]["max_ms"]}
+            row["note"] = net_note(r)
             row["pass"] = {k: (row[k] is not None and row[k] <= BUDGET[k]) for k in BUDGET}
             row["pass"]["vram"] = row["vram"] <= BUDGET_VRAM_MB
             row["pass_all"] = all(row["pass"].values())
@@ -380,6 +467,18 @@ def evaluate(res: dict) -> list[dict]:
     return rows
 
 
+def net_note(r: dict) -> str:
+    """'' for classical lines; for route A/B: 'untrained' or 'trained <checkpoint file>'."""
+    if r["pipeline"] == "routeB":
+        sd = r.get("screen_detail") or {}
+        ck = sd.get("checkpoint")
+        aux = "" if r.get("render_aux") is None else (", aux" if r.get("render_aux") else ", no aux")
+        return (f"trained {Path(ck).parent.name}/{Path(ck).name}" if ck and not sd.get("untrained") else "untrained") + aux
+    if r["pipeline"] == "routeA":
+        return "untrained" if (r.get("volume_upscaler") or {}).get("untrained", True) else "trained"
+    return ""
+
+
 def fmt(x, nd=2):
     return "-" if x is None else f"{x:.{nd}f}"
 
@@ -389,7 +488,8 @@ def write_report(res: dict, rows: list[dict], path: Path):
     L = ["# bench3d — 3D feasibility report", "",
          f"Created {res['meta']['created']} on {res['meta'].get('gpu', '?')}, torch {res['meta'].get('torch', '?')}; "
          f"{res['meta']['iters']} timed frames (256^3: up to 30) after {res['meta']['warmup']} warm-up frames, scenes "
-         f"pre-simulated {WARM_STEPS} steps. Output 2560x1440. GPU times from torch.cuda.Event.", ""]
+         f"pre-simulated {WARM_STEPS} steps (closed-box scenes) / {WARM_STEPS_PRESET} steps (sandbox presets `p*`, "
+         f"dissipating configs). Output 2560x1440. GPU times from torch.cuda.Event.", ""]
     if g.get("shared"):
         L += ["> **WARNING: GPU WAS SHARED during this run — numbers are not representative.**", ">"]
         L += [f"> - {x}" for x in g.get("reasons", [])]
@@ -407,13 +507,14 @@ def write_report(res: dict, rows: list[dict], path: Path):
           "## Pipelines x stages (mean ms; ✔ within budget, ✘ over)", "",
           "| scene | pipeline | march | sim | detail | render | frame (p50 / p95) | frames > 50 ms (max) | host wall/frame | VRAM MB | all | x vs brute256 |",
           "|---|---|---|---|---|---|---|---|---|---|---|---|"]
+    pipe_label = lambda r: r["pipeline"] + (f" ({r['note']})" if r.get("note") else "")
 
     def ck(row, k):
         return "✔" if row["pass"][k] else "✘"
 
     for r in sorted(rows, key=lambda r: (r["scene"], PIPELINES.index(r["pipeline"]), r["march_scale"])):
         sp = r.get("speedup_vs_brute256")
-        L.append(f"| {r['scene']} | {r['pipeline']} | {r['march_scale']} | {fmt(r['sim'])} {ck(r, 'sim')} | "
+        L.append(f"| {r['scene']} | {pipe_label(r)} | {r['march_scale']} | {fmt(r['sim'])} {ck(r, 'sim')} | "
                  f"{fmt(r['detail'])} {ck(r, 'detail')} | {fmt(r['render'])} {ck(r, 'render')} | "
                  f"{fmt(r['frame'])} ({fmt(r['frame_p50'])} / {fmt(r['frame_p95'])}) {ck(r, 'frame')} | "
                  f"{r['hitches']} ({r['frame_max']:.0f}) | {fmt(r['wall'])} | "
@@ -434,6 +535,13 @@ def write_report(res: dict, rows: list[dict], path: Path):
             s = t["stages"]["sim"]
             L.append(f"| {r['scene']} | {r['pipeline']} ({key}) | {r.get('sim_config')} | "
                      f"{s['mean_ms']:.2f} / {s['p50_ms']:.2f} / {s['p95_ms']:.2f} | {fmt(r.get('divergence_max_after_warmup'), 6) if r.get('divergence_max_after_warmup') is not None else '-'} |")
+    rb = [r for r in res["runs"] if r["pipeline"] == "routeB" and r.get("screen_detail")]
+    if rb:
+        sd = rb[0]["screen_detail"]
+        what = (f"TRAINED checkpoint {sd.get('checkpoint')}" if sd.get("checkpoint") and not sd.get("untrained")
+                else f"untrained default architecture ({sd.get('checkpoint_source')})")
+        L += ["", f"Route B network: {what}; {sd.get('params')} parameters; renderer aux "
+              f"{'on' if rb[0].get('render_aux') else 'off'}."]
     L += ["", "Occupancy of the 64^3 state (fraction of active bricks: density > 1e-3 or T > ambient + 1 K):", ""]
     for r in res["runs"]:
         if r["pipeline"] == "raw64" and "occupancy_start" in r:
@@ -492,14 +600,15 @@ def compare(res: dict, base: dict) -> list[str]:
 
 
 def print_table(rows):
-    print(f"\n{'scene':13s} {'pipeline':9s} {'ms':>4s} {'sim':>7s} {'detail':>7s} {'render':>7s} {'frame':>7s} "
+    print(f"\n{'scene':15s} {'pipeline':9s} {'ms':>4s} {'sim':>7s} {'detail':>7s} {'render':>7s} {'frame':>7s} "
           f"{'p95':>7s} {'wall':>7s} {'VRAM':>6s}  result  x/brute256")
     for r in sorted(rows, key=lambda r: (r["scene"], PIPELINES.index(r["pipeline"]), r["march_scale"])):
         fails = [k for k, v in r["pass"].items() if not v]
         sp = r.get("speedup_vs_brute256")
-        print(f"{r['scene']:13s} {r['pipeline']:9s} {r['march_scale']:>4s} {fmt(r['sim']):>7s} {fmt(r['detail']):>7s} "
+        print(f"{r['scene']:15s} {r['pipeline']:9s} {r['march_scale']:>4s} {fmt(r['sim']):>7s} {fmt(r['detail']):>7s} "
               f"{fmt(r['render']):>7s} {fmt(r['frame']):>7s} {fmt(r['frame_p95']):>7s} {fmt(r['wall']):>7s} "
-              f"{r['vram']:6.0f}  {'PASS' if not fails else 'FAIL ' + ','.join(fails)}  {'-' if sp is None else f'{sp:.1f}x'}")
+              f"{r['vram']:6.0f}  {'PASS' if not fails else 'FAIL ' + ','.join(fails)}  {'-' if sp is None else f'{sp:.1f}x'}"
+              f"  {r.get('note', '')}")
 
 
 def main(argv=None) -> int:
@@ -507,10 +616,11 @@ def main(argv=None) -> int:
     ap.add_argument("--update-baseline", action="store_true")
     ap.add_argument("--iters", type=int, default=100)
     ap.add_argument("--warmup", type=int, default=10)
-    ap.add_argument("--scenes", default=",".join(SCENES))
+    ap.add_argument("--scenes", default=None, help="comma list; overrides --scene-set")
+    ap.add_argument("--scene-set", default="all", choices=sorted(SCENE_SETS))
     ap.add_argument("--pipelines", default=",".join(PIPELINES))
     ap.add_argument("--scales", default=",".join(f"{s:g}" for s in MARCH_SCALES))
-    ap.add_argument("--quick", action="store_true", help="20 frames, campfire only")
+    ap.add_argument("--quick", action="store_true", help="20 frames, campfire + p1_campfire only")
     ap.add_argument("--no-compare", action="store_true")
     ap.add_argument("--strict", action="store_true", help="fail on regressions even when the GPU is shared")
     ap.add_argument("--timeout", type=int, default=1200, help="seconds per worker")
@@ -523,8 +633,10 @@ def main(argv=None) -> int:
         print(RESULT_TAG + json.dumps(r))
         return 0
 
+    if args.scenes is None:
+        args.scenes = ",".join(SCENE_SETS[args.scene_set])
     if args.quick:
-        args.iters, args.warmup, args.scenes = 20, 5, "campfire"
+        args.iters, args.warmup, args.scenes = 20, 5, "campfire,p1_campfire"
     gpu = gpu_check()                                  # before this process touches CUDA
     print("nvidia-smi:", json.dumps({k: gpu.get(k) for k in ("utilization_pct", "memory_used_mb", "shared")}))
     if gpu.get("shared"):

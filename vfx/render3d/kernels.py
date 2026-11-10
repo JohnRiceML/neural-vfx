@@ -254,153 +254,211 @@ def glow_at(glow: wp.Texture3D, q: wp.vec3) -> wp.vec3:
     return wp.vec3(g4[0], g4[1], g4[2]) / (1.0 + 60.0 * dout * dout)
 
 
-@wp.kernel
-def march(vol: wp.Texture3D, light: wp.Texture3D, glow: wp.Texture3D, solid: wp.Texture3D,
-          occ: wp.array3d(dtype=wp.uint8), occ_s: wp.array3d(dtype=wp.uint8), has_solid: int,
-          solid_res: float, lut: wp.array(dtype=wp.vec3), p: Shade3D, cam: wp.array(dtype=float),
-          steps: float, out: wp.array2d(dtype=wp.vec4)):
-    """One ray per pixel: front-to-back compositing of smoke/fire inside [0,1]^3, opaque obstacles
-    (solid iso 0.5), then the floor plane y=0. Writes (premultiplied radiance rgb, transmittance)."""
-    r, c = wp.tid()
-    h = out.shape[0]
-    w = out.shape[1]
-    o = wp.vec3(cam[0], cam[1], cam[2])
-    fw = wp.vec3(cam[3], cam[4], cam[5])
-    rt = wp.vec3(cam[6], cam[7], cam[8])
-    up = wp.vec3(cam[9], cam[10], cam[11])
-    th = cam[12]
-    aspect = cam[13]
-    sx = (2.0 * (float(c) + 0.5) / float(w) - 1.0) * th * aspect
-    sy = (1.0 - 2.0 * (float(r) + 0.5) / float(h)) * th
-    d = wp.normalize(fw + rt * sx + up * sy)
-    invd = safe_inv(d)
-    ld = p.light_dir
+@wp.func
+def project_px(q: wp.vec3, cam: wp.array(dtype=float), out_w: float, out_h: float) -> wp.vec2:
+    """World point -> continuous output-pixel coordinates (x right, y down) for a camera basis."""
+    rel = q - wp.vec3(cam[0], cam[1], cam[2])
+    z = wp.max(wp.dot(rel, wp.vec3(cam[3], cam[4], cam[5])), 1.0e-4)
+    sx = wp.dot(rel, wp.vec3(cam[6], cam[7], cam[8])) / (z * cam[12] * cam[13])
+    sy = wp.dot(rel, wp.vec3(cam[9], cam[10], cam[11])) / (z * cam[12])
+    return wp.vec2((sx + 1.0) * 0.5 * out_w, (1.0 - sy) * 0.5 * out_h)
 
-    rad = wp.vec3(0.0, 0.0, 0.0)
-    T = float(1.0)
-    tb = box_hit(o, invd, wp.vec3(0.0, 0.0, 0.0), wp.vec3(1.0, 1.0, 1.0))
-    t_near = wp.max(tb[0], 0.0)
-    t_far = tb[1]
-    ds = 1.0 / steps
-    cos_t = wp.dot(d, ld)
-    # dual-lobe phase (forward silver lining + back lobe), and the same for the 2nd/3rd scattering
-    # octaves with anisotropy scaled by ms_c (Wrenninge-style multiple-scattering approximation)
-    ph0 = hg(cos_t, p.phase_g) * p.rim + hg(cos_t, -0.25) * (1.0 - p.rim)
-    ph1 = hg(cos_t, p.phase_g * p.ms_c) * p.rim + hg(cos_t, -0.25 * p.ms_c) * (1.0 - p.rim)
-    ph2 = hg(cos_t, p.phase_g * p.ms_c * p.ms_c) * p.rim + (1.0 - p.rim)
-    a1 = p.ms_a
-    a2 = p.ms_a * p.ms_a
-    b1 = p.ms_b
-    b2 = p.ms_b * p.ms_b
-    if t_near < t_far:
-        jit = ign(float(c), float(r))
-        t0 = t_near + jit * ds
-        t = t0
-        t_prev = t_near
-        while t < t_far:
-            q = o + d * t
-            bx = wp.clamp(int(q[0] * float(BRICKS)), 0, BRICKS - 1)
-            by = wp.clamp(int(q[1] * float(BRICKS)), 0, BRICKS - 1)
-            bz = wp.clamp(int(q[2] * float(BRICKS)), 0, BRICKS - 1)
-            o_d = occ[bz, by, bx]
-            o_s = wp.uint8(0)
-            if has_solid != 0:
-                o_s = occ_s[bz, by, bx]
-            if o_d == wp.uint8(0) and o_s == wp.uint8(0):
-                # skip to the exit of this empty brick, staying on the jittered step lattice
-                inv_b = 1.0 / float(BRICKS)
-                lo = wp.vec3(float(bx), float(by), float(bz)) * inv_b
-                bb = box_hit(o, invd, lo, lo + wp.vec3(inv_b, inv_b, inv_b))
-                k = wp.ceil((bb[1] - t0) / ds + 1.0e-4)
-                t_prev = t
-                t = wp.max(t0 + k * ds, t + ds)
-                continue
-            if o_s != wp.uint8(0):
-                if wp.texture_sample(solid, q, dtype=float) > 0.5:
-                    # refine the surface crossing between t_prev and t
-                    a = t_prev
-                    b = t
-                    for _i in range(5):
-                        m = 0.5 * (a + b)
-                        if wp.texture_sample(solid, o + d * m, dtype=float) > 0.5:
-                            b = m
-                        else:
-                            a = m
-                    ph = o + d * b
-                    e = 1.0 / solid_res
-                    gx = wp.texture_sample(solid, ph + wp.vec3(e, 0.0, 0.0), dtype=float) - wp.texture_sample(solid, ph - wp.vec3(e, 0.0, 0.0), dtype=float)
-                    gy = wp.texture_sample(solid, ph + wp.vec3(0.0, e, 0.0), dtype=float) - wp.texture_sample(solid, ph - wp.vec3(0.0, e, 0.0), dtype=float)
-                    gz = wp.texture_sample(solid, ph + wp.vec3(0.0, 0.0, e), dtype=float) - wp.texture_sample(solid, ph - wp.vec3(0.0, 0.0, e), dtype=float)
-                    n = -wp.vec3(gx, gy, gz)
-                    if wp.length(n) < 1.0e-6:
-                        n = -d
-                    n = wp.normalize(n)
-                    lq = ph + n * 0.03
-                    lv = wp.texture_sample(light, lq, dtype=wp.vec2f)
-                    gl = glow_at(glow, lq)
-                    ndl = wp.max(wp.dot(n, ld), 0.0)
-                    hv = wp.normalize(ld - d)
-                    spec = wp.pow(wp.max(wp.dot(n, hv), 0.0), 40.0) * 0.25
-                    hemi = 0.45 + 0.55 * (0.5 + 0.5 * n[1])
-                    fres = wp.pow(1.0 - wp.max(wp.dot(n, -d), 0.0), 4.0) * 0.08
-                    col = wp.cw_mul(p.obst_col, p.key_col * (ndl * lv[0]) + p.amb_col * (hemi * lv[1]) + gl * (2.0 * p.fire_light))
-                    col = col + p.key_col * (spec * lv[0]) + p.amb_col * fres
-                    rad = rad + col * T
-                    T = 0.0
-                    break
-            if o_d != wp.uint8(0):
-                s = wp.texture_sample(vol, q, dtype=wp.vec2f)
-                dn = s[0]
-                Tk = s[1]
-                hot = Tk > p.t_lo
-                if dn > p.d_eps or hot:
-                    sigma = p.k_abs * wp.max(dn, 0.0)
-                    a = 1.0 - wp.exp(-sigma * ds)
-                    col = wp.vec3(0.0, 0.0, 0.0)
-                    if a > 1.0e-5:
-                        lv = wp.texture_sample(light, q, dtype=wp.vec2f)
-                        gl = glow_at(glow, q)
-                        sh = smoothstep(p.t_lo, p.t_lo + 500.0, Tk)
-                        alb = p.smoke_albedo * (1.0 - p.soot * sh)
-                        tl = wp.max(lv[0], 1.0e-6)
-                        key = tl * ph0 + a1 * wp.pow(tl, b1) * ph1 + a2 * wp.pow(tl, b2) * ph2
-                        lit = p.key_col * key + p.amb_col * lv[1] + gl * p.fire_light
-                        col = wp.cw_mul(alb, lit) * a
-                    if hot:
-                        col = col + emission(lut, p, dn, Tk) * ds
-                    rad = rad + col * T
-                    T = T * (1.0 - a)
-                    if T < 0.004:
+
+def _make_march(AUX: bool):
+    """Two compiled variants of one source. AUX=False is the plain colour march: the aux code is
+    removed at codegen by wp.static, so it costs nothing and the colour code is unchanged. AUX=True
+    additionally accumulates, in the same loop from the same samples, the opacity-weighted (T*a)
+    mean distance and velocity, projects the mean point once at the end, and writes (alpha,
+    alpha*depth, alpha*motion_x, alpha*motion_y) into `aux` (premultiplied, so the upsample to output res does
+    not bleed across silhouettes; aux_resolve divides it back out)."""
+
+    @wp.kernel(module="unique")
+    def march(vol: wp.Texture3D, light: wp.Texture3D, glow: wp.Texture3D, solid: wp.Texture3D,
+              occ: wp.array3d(dtype=wp.uint8), occ_s: wp.array3d(dtype=wp.uint8), has_solid: int,
+              solid_res: float, lut: wp.array(dtype=wp.vec3), p: Shade3D, cam: wp.array(dtype=float),
+              steps: float, out: wp.array2d(dtype=wp.vec4),
+              vel: wp.Texture3D, has_vel: int, cam_prev: wp.array(dtype=float), vel_dt: float,
+              out_w: float, out_h: float, aux: wp.array2d(dtype=wp.vec4)):
+        """One ray per pixel: front-to-back compositing of smoke/fire inside [0,1]^3, opaque obstacles
+        (solid iso 0.5), then the floor plane y=0. Writes (premultiplied radiance rgb, transmittance)
+        and, in the AUX variant, the aux sums (see _make_march)."""
+        r, c = wp.tid()
+        h = out.shape[0]
+        w = out.shape[1]
+        o = wp.vec3(cam[0], cam[1], cam[2])
+        fw = wp.vec3(cam[3], cam[4], cam[5])
+        rt = wp.vec3(cam[6], cam[7], cam[8])
+        up = wp.vec3(cam[9], cam[10], cam[11])
+        th = cam[12]
+        aspect = cam[13]
+        sx = (2.0 * (float(c) + 0.5) / float(w) - 1.0) * th * aspect
+        sy = (1.0 - 2.0 * (float(r) + 0.5) / float(h)) * th
+        d = wp.normalize(fw + rt * sx + up * sy)
+        invd = safe_inv(d)
+        ld = p.light_dir
+
+        rad = wp.vec3(0.0, 0.0, 0.0)
+        T = float(1.0)
+        tb = box_hit(o, invd, wp.vec3(0.0, 0.0, 0.0), wp.vec3(1.0, 1.0, 1.0))
+        t_near = wp.max(tb[0], 0.0)
+        t_far = tb[1]
+        ds = 1.0 / steps
+        cos_t = wp.dot(d, ld)
+        # dual-lobe phase (forward silver lining + back lobe), and the same for the 2nd/3rd scattering
+        # octaves with anisotropy scaled by ms_c (Wrenninge-style multiple-scattering approximation)
+        ph0 = hg(cos_t, p.phase_g) * p.rim + hg(cos_t, -0.25) * (1.0 - p.rim)
+        ph1 = hg(cos_t, p.phase_g * p.ms_c) * p.rim + hg(cos_t, -0.25 * p.ms_c) * (1.0 - p.rim)
+        ph2 = hg(cos_t, p.phase_g * p.ms_c * p.ms_c) * p.rim + (1.0 - p.rim)
+        a1 = p.ms_a
+        a2 = p.ms_a * p.ms_a
+        b1 = p.ms_b
+        b2 = p.ms_b * p.ms_b
+        if wp.static(AUX):
+            Tm = float(1.0)                     # transmittance of the medium only (not solid / floor)
+            aw = float(0.0)                     # sum of opacity weights T*a
+            ad = float(0.0)                     # sum w * distance
+            av = wp.vec3(0.0, 0.0, 0.0)         # sum w * velocity
+        if t_near < t_far:
+            jit = ign(float(c), float(r))
+            t0 = t_near + jit * ds
+            t = t0
+            t_prev = t_near
+            while t < t_far:
+                q = o + d * t
+                bx = wp.clamp(int(q[0] * float(BRICKS)), 0, BRICKS - 1)
+                by = wp.clamp(int(q[1] * float(BRICKS)), 0, BRICKS - 1)
+                bz = wp.clamp(int(q[2] * float(BRICKS)), 0, BRICKS - 1)
+                o_d = occ[bz, by, bx]
+                o_s = wp.uint8(0)
+                if has_solid != 0:
+                    o_s = occ_s[bz, by, bx]
+                if o_d == wp.uint8(0) and o_s == wp.uint8(0):
+                    # skip to the exit of this empty brick, staying on the jittered step lattice
+                    inv_b = 1.0 / float(BRICKS)
+                    lo = wp.vec3(float(bx), float(by), float(bz)) * inv_b
+                    bb = box_hit(o, invd, lo, lo + wp.vec3(inv_b, inv_b, inv_b))
+                    k = wp.ceil((bb[1] - t0) / ds + 1.0e-4)
+                    t_prev = t
+                    t = wp.max(t0 + k * ds, t + ds)
+                    continue
+                if o_s != wp.uint8(0):
+                    if wp.texture_sample(solid, q, dtype=float) > 0.5:
+                        # refine the surface crossing between t_prev and t
+                        a = t_prev
+                        b = t
+                        for _i in range(5):
+                            m = 0.5 * (a + b)
+                            if wp.texture_sample(solid, o + d * m, dtype=float) > 0.5:
+                                b = m
+                            else:
+                                a = m
+                        ph = o + d * b
+                        e = 1.0 / solid_res
+                        gx = wp.texture_sample(solid, ph + wp.vec3(e, 0.0, 0.0), dtype=float) - wp.texture_sample(solid, ph - wp.vec3(e, 0.0, 0.0), dtype=float)
+                        gy = wp.texture_sample(solid, ph + wp.vec3(0.0, e, 0.0), dtype=float) - wp.texture_sample(solid, ph - wp.vec3(0.0, e, 0.0), dtype=float)
+                        gz = wp.texture_sample(solid, ph + wp.vec3(0.0, 0.0, e), dtype=float) - wp.texture_sample(solid, ph - wp.vec3(0.0, 0.0, e), dtype=float)
+                        n = -wp.vec3(gx, gy, gz)
+                        if wp.length(n) < 1.0e-6:
+                            n = -d
+                        n = wp.normalize(n)
+                        lq = ph + n * 0.03
+                        lv = wp.texture_sample(light, lq, dtype=wp.vec2f)
+                        gl = glow_at(glow, lq)
+                        ndl = wp.max(wp.dot(n, ld), 0.0)
+                        hv = wp.normalize(ld - d)
+                        spec = wp.pow(wp.max(wp.dot(n, hv), 0.0), 40.0) * 0.25
+                        hemi = 0.45 + 0.55 * (0.5 + 0.5 * n[1])
+                        fres = wp.pow(1.0 - wp.max(wp.dot(n, -d), 0.0), 4.0) * 0.08
+                        col = wp.cw_mul(p.obst_col, p.key_col * (ndl * lv[0]) + p.amb_col * (hemi * lv[1]) + gl * (2.0 * p.fire_light))
+                        col = col + p.key_col * (spec * lv[0]) + p.amb_col * fres
+                        rad = rad + col * T
                         T = 0.0
                         break
-            t_prev = t
-            t = t + ds
+                if o_d != wp.uint8(0):
+                    s = wp.texture_sample(vol, q, dtype=wp.vec2f)
+                    dn = s[0]
+                    Tk = s[1]
+                    hot = Tk > p.t_lo
+                    if dn > p.d_eps or hot:
+                        sigma = p.k_abs * wp.max(dn, 0.0)
+                        a = 1.0 - wp.exp(-sigma * ds)
+                        col = wp.vec3(0.0, 0.0, 0.0)
+                        if a > 1.0e-5:
+                            lv = wp.texture_sample(light, q, dtype=wp.vec2f)
+                            gl = glow_at(glow, q)
+                            sh = smoothstep(p.t_lo, p.t_lo + 500.0, Tk)
+                            alb = p.smoke_albedo * (1.0 - p.soot * sh)
+                            tl = wp.max(lv[0], 1.0e-6)
+                            key = tl * ph0 + a1 * wp.pow(tl, b1) * ph1 + a2 * wp.pow(tl, b2) * ph2
+                            lit = p.key_col * key + p.amb_col * lv[1] + gl * p.fire_light
+                            col = wp.cw_mul(alb, lit) * a
+                        if hot:
+                            col = col + emission(lut, p, dn, Tk) * ds
+                        if wp.static(AUX):
+                            wgt = T * a
+                            if wgt > 0.0:
+                                aw += wgt
+                                ad += wgt * t
+                                if has_vel != 0:
+                                    v4 = wp.texture_sample(vel, q, dtype=wp.vec4f)
+                                    av = av + wp.vec3(v4[0], v4[1], v4[2]) * wgt
+                        rad = rad + col * T
+                        T = T * (1.0 - a)
+                        if T < 0.004:
+                            T = 0.0
+                            if wp.static(AUX):
+                                Tm = 0.0
+                            break
+                        if wp.static(AUX):
+                            Tm = T
+                t_prev = t
+                t = t + ds
 
-    # floor plane y = 0 (behind everything inside the cube, see README)
-    if T > 0.0 and d[1] < -1.0e-4 and o[1] > 0.0:
-        tf = -o[1] / d[1]
-        pf = o + d * tf
-        cx = pf[0] - 0.5
-        cz = pf[2] - 0.5
-        rr = wp.sqrt(cx * cx + cz * cz)
-        fade = (1.0 - smoothstep(0.35, 1.9, rr)) * p.floor
-        if fade > 0.0:
-            pix = tf * 2.0 * th / float(h)                   # world size of one pixel at the floor
-            gs = 0.125
-            gxl = wp.abs(pf[0] / gs - wp.round(pf[0] / gs)) * gs
-            gzl = wp.abs(pf[2] / gs - wp.round(pf[2] / gs)) * gs
-            line = 1.0 - smoothstep(0.0, 1.2 * pix + 0.0015, wp.min(gxl, gzl))
-            inside = pf[0] >= 0.0 and pf[0] <= 1.0 and pf[2] >= 0.0 and pf[2] <= 1.0
-            lq = wp.vec3(pf[0], 0.004, pf[2])
-            lv = light_at(light, ld, lq)
-            gl = glow_at(glow, lq)
-            base = p.floor_col + p.grid_col * (line * wp.where(inside, 1.0, 0.45))
-            lit = p.key_col * (ld[1] * lv[0]) + p.amb_col * (0.6 + 0.4 * lv[1]) + gl * (2.5 * p.fire_light)
-            fc = wp.cw_mul(base, lit)
-            rad = rad + fc * (T * fade)
-            T = T * (1.0 - fade)
+        # floor plane y = 0 (behind everything inside the cube, see README)
+        if T > 0.0 and d[1] < -1.0e-4 and o[1] > 0.0:
+            tf = -o[1] / d[1]
+            pf = o + d * tf
+            cx = pf[0] - 0.5
+            cz = pf[2] - 0.5
+            rr = wp.sqrt(cx * cx + cz * cz)
+            fade = (1.0 - smoothstep(0.35, 1.9, rr)) * p.floor
+            if fade > 0.0:
+                pix = tf * 2.0 * th / float(h)                   # world size of one pixel at the floor
+                gs = 0.125
+                gxl = wp.abs(pf[0] / gs - wp.round(pf[0] / gs)) * gs
+                gzl = wp.abs(pf[2] / gs - wp.round(pf[2] / gs)) * gs
+                line = 1.0 - smoothstep(0.0, 1.2 * pix + 0.0015, wp.min(gxl, gzl))
+                inside = pf[0] >= 0.0 and pf[0] <= 1.0 and pf[2] >= 0.0 and pf[2] <= 1.0
+                lq = wp.vec3(pf[0], 0.004, pf[2])
+                lv = light_at(light, ld, lq)
+                gl = glow_at(glow, lq)
+                base = p.floor_col + p.grid_col * (line * wp.where(inside, 1.0, 0.45))
+                lit = p.key_col * (ld[1] * lv[0]) + p.amb_col * (0.6 + 0.4 * lv[1]) + gl * (2.5 * p.fire_light)
+                fc = wp.cw_mul(base, lit)
+                rad = rad + fc * (T * fade)
+                T = T * (1.0 - fade)
 
-    out[r, c] = wp.vec4(rad[0], rad[1], rad[2], T)
+        out[r, c] = wp.vec4(rad[0], rad[1], rad[2], T)
+        if wp.static(AUX):
+            al = 1.0 - Tm
+            if aw > 1.0e-6 and al > 0.0:
+                # opacity-weighted mean point on the ray and mean velocity; the point was at
+                # (qm - vm*dt) one sim step ago, seen through the previous camera. The current
+                # projection of any point on this ray is the pixel centre itself.
+                dep = ad / aw
+                qm = o + d * dep
+                qp = qm - av * (vel_dt / aw)
+                cur = wp.vec2((float(c) + 0.5) * out_w / float(w), (float(r) + 0.5) * out_h / float(h))
+                mv = cur - project_px(qp, cam_prev, out_w, out_h)
+                aux[r, c] = wp.vec4(al, dep * al, mv[0] * al, mv[1] * al)
+            else:
+                aux[r, c] = wp.vec4(0.0, 0.0, 0.0, 0.0)
+
+    return march
+
+
+march = _make_march(False)
+march_aux = _make_march(True)
 
 
 # ---------------------------------------------------------------------- composite
@@ -511,3 +569,30 @@ def composite(hdr: wp.array2d(dtype=wp.vec4), bloom: wp.array2d(dtype=wp.vec3), 
     out[r, c, 0] = to_srgb8(aces(col[0]), dither)
     out[r, c, 1] = to_srgb8(aces(col[1]), dither)
     out[r, c, 2] = to_srgb8(aces(col[2]), dither)
+
+
+# ---------------------------------------------------------------------- aux (return_aux=True)
+@wp.kernel
+def aux_resolve(aux: wp.array2d(dtype=wp.vec4), out: wp.array3d(dtype=wp.float16), a_min: float):
+    """March-res premultiplied aux -> output-res (4,h,w) fp16 [alpha, depth, motion_x, motion_y]:
+    bilinear upsample, then un-premultiply; depth/motion = 0 where alpha < a_min."""
+    r, c = wp.tid()
+    Ho = out.shape[1]
+    Wo = out.shape[2]
+    x = wp.vec4(0.0, 0.0, 0.0, 0.0)
+    if aux.shape[0] == Ho and aux.shape[1] == Wo:
+        x = aux[r, c]
+    else:
+        x = sample_v4(aux, (float(c) + 0.5) / float(Wo), (float(r) + 0.5) / float(Ho))
+    al = x[0]
+    dep = float(0.0)
+    mx = float(0.0)
+    my = float(0.0)
+    if al >= a_min:
+        dep = x[1] / al
+        mx = x[2] / al
+        my = x[3] / al
+    out[0, r, c] = wp.float16(al)
+    out[1, r, c] = wp.float16(dep)
+    out[2, r, c] = wp.float16(mx)
+    out[3, r, c] = wp.float16(my)

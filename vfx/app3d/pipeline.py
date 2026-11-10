@@ -24,7 +24,7 @@ LABELS = {
     "neural_screen": "neural screen-space (route B)",
     "ref128": "reference: direct 128³ sim",
 }
-UNTRAINED = {"neural_vol", "neural_screen"}
+UNTRAINED = {"neural_vol", "neural_screen"}     # unless Pipeline.is_trained(mode) (a checkpoint was loaded)
 REF_RES = 128
 SOLID_RENDER_RES = 128          # obstacles are rasterized at this res for display in every mode
 
@@ -84,6 +84,7 @@ class Pipeline:
         self.unavailable = dict(backends.reasons)
         self.neural_live = False          # VolumeUpscaler temporal state valid (ran last tick)
         self.tick_id = 0                  # renderers re-prepare their volume only when this changes
+        self.cam_hist: dict = {}          # view slot -> {tick_id: [cameras drawn during that tick]}
 
     def available(self, mode: str) -> bool:
         return mode not in self.unavailable
@@ -196,8 +197,26 @@ class Pipeline:
         for r in self.renderers.values():
             r.set_march_scale(s)
 
-    def _screen_aux(self, camera, size, slot: int = 0) -> dict:
-        """Route-B aux: bbox of the projected domain cube (host math, no sync) + transmittance."""
+    def is_trained(self, mode: str) -> str | None:
+        """Checkpoint name if `mode` runs trained weights, else None (route B: see backends)."""
+        return self.b.trained.get(mode)
+
+    def prev_camera(self, camera, slot: int):
+        """The camera one sim step (SIM_DT) ago for this view: the camera of the draw at the same
+        position within the previous sim tick (sim 30 Hz, display 60 Hz -> 2 draws per tick), so
+        motion vectors are in pixels per SIM_DT on every display frame, as in the training data."""
+        h = self.cam_hist.setdefault(slot, {})
+        cur = h.setdefault(self.tick_id, [])
+        prev = h.get(self.tick_id - 1)
+        pc = prev[min(len(cur), len(prev) - 1)] if prev else None
+        cur.append(camera)
+        for k in [k for k in h if k < self.tick_id - 1]:
+            del h[k]
+        return pc
+
+    def _screen_aux(self, camera, size, slot: int = 0, aux: dict | None = None) -> dict:
+        """Route-B aux: bbox of the projected domain cube (host math, no sync) + the renderer's aux
+        (alpha, depth, motion: see render3d README) + legacy 'transmittance' (= renderer T)."""
         w, h = size
         b = camera_basis(camera, w / h)
         o, fw, rt, up, th = b[0:3], b[3:6], b[6:9], b[9:12], b[12]
@@ -218,7 +237,7 @@ class Pipeline:
         trans = r.hdr[..., 3]
         if trans.shape != (h, w):
             trans = F.interpolate(trans[None, None], size=(h, w), mode="bilinear", align_corners=False)[0, 0]
-        return {"bbox": bbox, "transmittance": trans}
+        return {"bbox": bbox, "transmittance": trans, **(aux or {})}
 
     @torch.no_grad()
     def draw(self, mode: str, camera, size, slot: int = 0) -> torch.Tensor | None:
@@ -230,12 +249,16 @@ class Pipeline:
         reuse = r.app_key == key           # no sim tick since this view last prepared its volume
         r.app_key = key
         t = self.timer.start(f"{'render_view' if reuse else 'render'}.{slot}")
-        img = r.draw(vol, camera, self.solid_render, reuse_volume=reuse)
+        if mode == "neural_screen":     # route B: render with aux (alpha, depth, motion) from the same march
+            img, aux = r.draw(vol, camera, self.solid_render, reuse_volume=reuse, return_aux=True,
+                              velocity=self.state.velocity, prev_camera=self.prev_camera(camera, slot))
+        else:
+            img, aux = r.draw(vol, camera, self.solid_render, reuse_volume=reuse), None
         self.timer.stop(t)
         if mode == "neural_screen":
             t = self.timer.start(f"detail.{slot}")
             try:
-                img = self.b.screen_detail.infer(img, self._screen_aux(camera, size, slot))
+                img = self.b.screen_detail.infer(img, self._screen_aux(camera, size, slot, aux))
             except Exception as e:
                 self.unavailable["neural_screen"] = f"{type(e).__name__}: {str(e)[:120]}"
             self.timer.stop(t)

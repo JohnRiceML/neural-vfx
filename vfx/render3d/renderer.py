@@ -22,6 +22,7 @@ import torch
 import torch.nn.functional as F
 import warp as wp
 
+from vfx.core.fields import SIM_DT
 from vfx.core.fields3d import Camera, Volume
 from vfx.render.blackbody import blackbody_lut
 from vfx.render3d import kernels as K
@@ -105,8 +106,8 @@ class VolumeRenderer:
         lut = blackbody_lut(self.p.t_lo, self.p.t_hi, 256, t_ref=self.p.t_ref)
         self.lut_t = torch.from_numpy(lut).to(self.device)
         self.lut_wp = wp.from_torch(self.lut_t, dtype=wp.vec3)
-        self._cam_dev = torch.zeros(16, device=self.device)
-        self._cam_pin = [torch.zeros(16).pin_memory() for _ in range(4)]
+        self._cam_dev = torch.zeros(32, device=self.device)        # [current camera | previous camera]
+        self._cam_pin = [torch.zeros(32).pin_memory() for _ in range(4)]
         self._cam_i = 0
         self._vol: dict = {}                # per volume shape: packed array, texture, occupancy
         self._graphs: dict = {}
@@ -117,6 +118,9 @@ class VolumeRenderer:
         self._wp_stream_key = None
         self._make_light()
         self._dummy_solid()
+        self._vel_tex = self._vel_tex0 = self._tex(2, 2, 2, 4, wp.float16)
+        self._vel_buf = None
+        self._vel_key = None
         self.set_output(out_size, march_scale)
 
     # ------------------------------------------------------------------ configuration
@@ -130,6 +134,8 @@ class VolumeRenderer:
         self.hdr = torch.zeros(self.mh, self.mw, 4, device=self.device)
         bh, bw = max(2, self.mh // 4), max(2, self.mw // 4)
         self.bloom_buf = torch.zeros(bh, bw, 3, device=self.device)
+        self._aux_hdr = None                      # (mh, mw, 4) premultiplied aux at march res (lazy)
+        self._aux_out = None                      # (4, out_h, out_w) fp16 at output res (lazy)
         self._graphs.clear()
 
     def set_march_scale(self, s: float) -> None:
@@ -220,17 +226,41 @@ class VolumeRenderer:
         self._solid_res = float(max(D, H, W))
         self._solid_key = key
 
+    def _upload_velocity(self, velocity: torch.Tensor) -> None:
+        """(3,D,H,W) m/s (x,y,z) -> 4-channel fp16 texture (hardware trilinear, cell-centred)."""
+        _, D, H, W = velocity.shape
+        if self._vel_buf is None or tuple(self._vel_buf.shape[:3]) != (D, H, W):
+            self._vel_buf = torch.zeros(D, H, W, 4, dtype=torch.float16, device=self.device)
+            self._vel_wp = wp.from_torch(self._vel_buf, dtype=wp.vec4h)
+            self._vel_tex = self._tex(D, H, W, 4, wp.float16)
+            self._graphs.clear()
+        self._vel_buf[..., :3].copy_(velocity.permute(1, 2, 3, 0))
+        self._vel_tex.copy_from(self._vel_wp)
+
+    def _ensure_aux(self) -> None:
+        if self._aux_out is None:
+            self._aux_hdr = torch.zeros(self.mh, self.mw, 4, device=self.device)
+            self._aux_out = torch.zeros(4, self.out_h, self.out_w, dtype=torch.float16, device=self.device)
+            self.aux = {"alpha": self._aux_out[0], "depth": self._aux_out[1], "motion": self._aux_out[2:4]}
+
     # ------------------------------------------------------------------ main entry
     @torch.no_grad()
     def draw(self, volume: Volume, camera: Camera, solid: torch.Tensor | None = None,
-             reuse_volume: bool = False) -> torch.Tensor:
+             reuse_volume: bool = False, *, return_aux: bool = False, velocity: torch.Tensor | None = None,
+             prev_camera: Camera | None = None):
         """Render to (out_h, out_w, 3) uint8 cuda, row 0 = top. The result is an internal buffer
         reused by the next draw(). Timings ('prep', 'view', 'total' ms) resolve lazily.
 
         reuse_volume=True skips the volume-only work (pack, texture upload, light + glow volumes)
         and re-renders the volume this renderer prepared last with the new camera. Callers that
         simulate at 30 Hz and render at 60 Hz pass it on frames without a new volume. Only valid if
-        the previous draw() of THIS renderer was given the same volume/solid and nothing changed."""
+        the previous draw() of THIS renderer was given the same volume/solid and nothing changed.
+
+        return_aux=True -> (frame, aux), aux = {"alpha" (h,w), "depth" (h,w), "motion" (2,h,w)} fp16
+        cuda at out_size, computed in the same march as the colour (see README "Aux buffers"); also
+        internal buffers reused by the next draw. `velocity` (3,D,H,W) m/s at any resolution and
+        `prev_camera` (the camera of the previous sim step) feed "motion"; both optional and
+        ignored when return_aux=False (which runs the unchanged colour-only march)."""
         has_solid = solid is not None
         if reuse_volume and self._last_vol_key is not None and self._last_vol_key[1] == has_solid:
             shape = self._last_vol_key[0]
@@ -245,7 +275,10 @@ class VolumeRenderer:
         with wp.ScopedStream(self._stream(), sync_enter=False, sync_exit=False):
             pin = self._cam_pin[self._cam_i]
             self._cam_i = (self._cam_i + 1) % len(self._cam_pin)
-            pin.copy_(torch.from_numpy(camera_basis(camera, self.mw / self.mh)))
+            asp = self.mw / self.mh
+            cb = camera_basis(camera, asp)
+            pin[:16].copy_(torch.from_numpy(cb))
+            pin[16:].copy_(torch.from_numpy(camera_basis(prev_camera, asp) if (return_aux and prev_camera is not None) else cb))
             self._cam_dev.copy_(pin, non_blocking=True)
             if not reuse_volume:
                 dens, temp = volume.density, volume.temperature
@@ -265,12 +298,25 @@ class VolumeRenderer:
                 self._mark(self.profile, "pack")
                 self._run(("prep", shape, has_solid, id(self.solid_tex)), lambda: self._prep(res, has_solid))
                 self._last_vol_key = (shape, has_solid)
+            has_vel = 0
+            if return_aux:
+                self._ensure_aux()
+                if velocity is not None:
+                    vkey = (velocity.data_ptr(), tuple(velocity.shape))
+                    if not reuse_volume or vkey != self._vel_key:     # same contract as reuse_volume
+                        self._upload_velocity(velocity)
+                        self._vel_key = vkey
+                    has_vel = 1
             ev[1].record()
             if self.profile and reuse_volume:
                 self._mark(True, "start")
-            self._run(("view", shape, has_solid, id(self.solid_tex)), lambda: self._view(res, has_solid))
+            key = ("view", shape, has_solid, id(self.solid_tex), bool(return_aux), has_vel,
+                   id(self._vel_tex) if return_aux else 0)
+            self._run(key, lambda: self._view(res, has_solid, return_aux, has_vel))
         ev[2].record()
         self._events = ev
+        if return_aux:
+            return self.out, self.aux
         return self.out
 
     def _run(self, key, fn) -> None:
@@ -339,15 +385,22 @@ class VolumeRenderer:
         self.glow_tex.copy_from(self.glow_arr)
         self._mark(prof, "light")
 
-    def _view(self, res, has_solid: bool) -> None:
-        """Camera-dependent work: march, bloom, composite."""
+    def _view(self, res, has_solid: bool, aux: bool = False, has_vel: int = 0) -> None:
+        """Camera-dependent work: march (+ aux), bloom, composite."""
         p, prof = self.p, self.profile
         shade = self._shade()
-        wp.launch(K.march, dim=(self.mh, self.mw),
+        aux_hdr = self._aux_hdr if aux else self.hdr        # unused by the colour-only variant
+        wp.launch(K.march_aux if aux else K.march, dim=(self.mh, self.mw),
                   inputs=[res["tex"], self.light_tex, self.glow_tex, self.solid_tex, res["occ"], self.occ_s,
                           int(has_solid), float(self._solid_res), self.lut_wp, shade,
-                          wp.from_torch(self._cam_dev), float(p.steps), wp.from_torch(self.hdr, dtype=wp.vec4)])
+                          wp.from_torch(self._cam_dev[:16]), float(p.steps), wp.from_torch(self.hdr, dtype=wp.vec4),
+                          self._vel_tex if aux else self._vel_tex0, int(has_vel), wp.from_torch(self._cam_dev[16:]),
+                          float(SIM_DT), float(self.out_w), float(self.out_h), wp.from_torch(aux_hdr, dtype=wp.vec4)])
         self._mark(prof, "march")
+        if aux:
+            wp.launch(K.aux_resolve, dim=(self.out_h, self.out_w),
+                      inputs=[wp.from_torch(self._aux_hdr, dtype=wp.vec4), wp.from_torch(self._aux_out), 1.0e-3])
+            self._mark(prof, "aux")
         x = self.hdr[..., :3].permute(2, 0, 1)[None]
         x = F.relu(x - p.bloom_thresh)
         b1 = self._blur2(F.adaptive_avg_pool2d(x, self.bloom_buf.shape[:2]), self._g2)

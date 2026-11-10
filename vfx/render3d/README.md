@@ -7,6 +7,8 @@ img = r.draw(volume, camera, solid)                         # (h, w, 3) uint8 cu
 img = r.draw(volume, camera2, solid, reuse_volume=True)    # camera-only redraw of the same volume
 r.timings                                                   # {'prep','view','total'} ms of the last
                                                             # finished draw (resolved lazily, no sync)
+img, aux = r.draw(volume, camera, solid, return_aux=True,   # route B aux buffers (see "Aux buffers")
+                  velocity=state.velocity, prev_camera=cam_of_previous_sim_step)
 ```
 `volume`: `fields3d.Volume`, any resolution, fp32 or fp16. `solid`: optional (D,H,W) mask at any
 resolution (the app passes obstacles rasterized at 128³). `RenderParams3D` holds the look
@@ -122,4 +124,49 @@ util before, another engineer's python job present, i.e. possibly shared):
 | 64³ (campfire) | 0.62 / 0.50 | 0.79 / 0.60 | 0.69 |
 | trilinear 256³ (campfire) | 1.10 / 0.49 | 1.41 / 0.58 | 1.00 |
 
-Files: `renderer.py` (pipeline, params, camera), `kernels.py` (Warp kernels), `bench.py`.
+## Aux buffers (`return_aux=True`, route B) — added 2026-11-09
+`draw(..., return_aux=True, velocity=None, prev_camera=None)` returns `(frame, aux)`. The frame is
+**bit-identical** to `return_aux=False` (checked). `aux` = dict of fp16 cuda tensors at **out_size**
+(not march res), internal buffers overwritten by the next aux draw — `.clone()` to keep them:
+
+| key | shape | meaning |
+|---|---|---|
+| `alpha` | (h,w) | 1 − transmittance of the **smoke/fire medium only** along the ray, 0 = empty. Obstacles and the floor do not count (a ray that hits an obstacle has alpha = the smoke in front of it). Early ray termination (T < 0.004) gives alpha = 1. |
+| `depth` | (h,w) | opacity-weighted (weight T·a per sample) mean **distance from the camera position along the ray** (not view-z), meters (domain = 1 m cube). 0 where alpha < 1e-3. |
+| `motion` | (2,h,w) | (x right, y down) in **output pixels per SIM_DT** (1/30 s). Content at pixel p was at **p − motion** one sim step ago (backward-warp: `prev.sample(p - motion)` ≈ current). 0 where alpha < 1e-3. |
+
+How motion is computed (same march, same samples, same jitter as the colour): accumulate Σw, Σw·t,
+Σw·v (v = trilinear `velocity` at the sample, w = T·a), take the mean point on the ray
+q̄ = o + d·depth and mean velocity v̄, then `motion = pixel_centre − project_prev(q̄ − v̄·SIM_DT)`.
+`velocity`: (3,D,H,W) m/s (vel_x, vel_y, vel_z, `FieldState3D.velocity`), any resolution, uploaded to
+a 4-ch fp16 texture. `prev_camera`: the camera one sim step ago; None = same camera. With neither,
+motion = 0. Emission-only samples (hot, density ≈ 0) have no opacity weight. Background/floor pixels
+have motion 0 even if the camera moves (floor is not part of the medium; the sky is screen-fixed).
+Aux is accumulated premultiplied at march res and resolved to output res by a bilinear upsample +
+un-premultiply (`kernels.aux_resolve`), so silhouettes do not bleed depth/motion into empty pixels.
+With `reuse_volume=True` the velocity texture is reused if the same tensor (data_ptr) is passed.
+
+Implementation: `kernels._make_march(AUX)` builds two variants of one kernel source; the aux code is
+inside `wp.static(AUX)` branches, so the colour-only variant compiles to the old march (zero cost).
+
+**Cost** (`python -m vfx.render3d.aux_check --time`; 2560x1440, march_scale 0.5, 192 steps/m,
+campfire 64³ + its velocity, prev camera; trials interleaved, min of 25x30 draws; GPU idle at
+start (2 % util) and end of that run): full frame 0.996 → 1.150 ms (**+0.155 ms**), view-only redraw
+0.805 → 0.946 ms (**+0.142 ms**). A second, contended run (another python job, 98 % util) gave
++0.155 to +0.33 ms.
+
+**Validation** (`python -m vfx.render3d.aux_check`, 1280x720, scale 0.5, textured Gaussian blob,
+floor off): frame t−1 backward-warped by `motion` vs frame t, MSE(no warp)/MSE(warp):
+
+| case | median motion | ratio whole frame | ratio alpha > 0.5 |
+|---|---|---|---|
+| blob translated by v=(1.2, 0.6, −0.9) m/s, fixed camera | 23 px | 26.7 | 40.9 |
+| static blob, camera orbit 4° + pan (0.05, −0.03) m | 34 px | 73.3 | 73.6 |
+| both | 26 px | 49.0 | 32.4 |
+
+Sign check: v = +x, +y gives motion_x > 0, motion_y < 0 (screen y down). The remaining warp error is
+mostly disocclusion (pixels the blob left: alpha_t = 0 so motion = 0) and lighting change as the
+blob moves through the light volume.
+
+Files: `renderer.py` (pipeline, params, camera), `kernels.py` (Warp kernels), `bench.py`,
+`aux_check.py` (aux self-check + cost).

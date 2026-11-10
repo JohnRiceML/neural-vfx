@@ -15,12 +15,49 @@ class Backends3D:
     volume_upscaler: object | None = None      # route A instance (untrained ok) or None
     screen_detail: object | None = None        # route B instance (untrained ok) or None
     reasons: dict = field(default_factory=dict)  # mode -> why unavailable
+    trained: dict = field(default_factory=dict)  # mode -> checkpoint file name (absent = untrained)
     stubs: list = field(default_factory=list)
     notes: list = field(default_factory=list)
 
 
 def _short(e: BaseException) -> str:
     return f"{type(e).__name__}: {str(e).splitlines()[0][:160] if str(e) else ''}"
+
+
+def route_b_checkpoint():
+    """Default route B checkpoint path. Asks vfx.runtime3d first (any of these names, if the runtime
+    engineer adds one: `default_screen_checkpoint()` / `SCREEN_CHECKPOINT` in vfx.runtime3d or its
+    screen_detail module); otherwise the agreed location CHECKPOINTS/screen3d/latest.pt."""
+    for modname in ("vfx.runtime3d", "vfx.runtime3d.screen_detail"):
+        try:
+            mod = __import__(modname, fromlist=["_"])
+        except Exception:
+            continue
+        for name in ("default_screen_checkpoint", "SCREEN_CHECKPOINT", "DEFAULT_CHECKPOINT"):
+            v = getattr(mod, name, None)
+            if v is not None:
+                return v() if callable(v) else v
+    from vfx.core.paths import CHECKPOINTS
+    return CHECKPOINTS / "screen3d" / "latest.pt"
+
+
+def make_screen_detail(checkpoint=None, device: str = "cuda"):
+    """ScreenDetail from `checkpoint`, else the default route B checkpoint if that file exists, else
+    untrained. Returns (instance, checkpoint name or None)."""
+    from pathlib import Path
+    from vfx.runtime3d import ScreenDetail
+    ck = checkpoint
+    if ck is None:
+        d = Path(route_b_checkpoint())
+        ck = d if d.is_file() else None
+    sd = ScreenDetail(str(ck) if ck else None, device=device)
+    trained = ck is not None and not getattr(sd, "untrained", False)
+    if not trained:
+        return sd, None
+    import datetime
+    ck = Path(ck)
+    when = datetime.datetime.fromtimestamp(ck.stat().st_mtime).strftime("%m-%d %H:%M")
+    return sd, f"{ck.parent.name}/{ck.name} ({when})"
 
 
 def _smoke_test(Solver, config, device) -> None:
@@ -60,6 +97,7 @@ def load_backends(device: str = "cuda", force_stub_sim: bool = False, checkpoint
         stubs.append("runtime3d.classical_upscale_3d")
         notes.append(f"classical_upscale_3d: {_short(e)}")
     va = sb = None
+    trained = {}
     try:
         from vfx.runtime3d import VolumeUpscaler
         va = VolumeUpscaler(checkpoint_a, device=device)
@@ -73,10 +111,12 @@ def load_backends(device: str = "cuda", force_stub_sim: bool = False, checkpoint
         if not isinstance(e, (ImportError, FileNotFoundError)):
             traceback.print_exc()
     try:
-        from vfx.runtime3d import ScreenDetail
-        sb = ScreenDetail(checkpoint_b, device=device)
+        sb, name = make_screen_detail(checkpoint_b, device)
+        if name:
+            trained["neural_screen"] = name
+            notes.append(f"route B checkpoint: {name}")
     except Exception as e:
         reasons["neural_screen"] = _short(e)
         if not isinstance(e, (ImportError, FileNotFoundError)):
             traceback.print_exc()
-    return Backends3D(Solver, SolverConfig, runtime_config, cu, va, sb, reasons, stubs, notes)
+    return Backends3D(Solver, SolverConfig, runtime_config, cu, va, sb, reasons, trained, stubs, notes)

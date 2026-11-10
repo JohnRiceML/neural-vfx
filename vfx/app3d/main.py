@@ -129,7 +129,8 @@ class Controls:
 class App:
     def __init__(self, args):
         self.args = args
-        self.b = load_backends(force_stub_sim=args.stub_sim, warmup=args.warmup_neural)
+        self.b = load_backends(force_stub_sim=args.stub_sim, warmup=args.warmup_neural,
+                               checkpoint_b=args.screen_ckpt)
         self.pipe = Pipeline(self.b, march_scale=args.march_scale, steps=args.steps)
         self.ctl = Controls()
         self.orbit = Orbit()
@@ -299,6 +300,9 @@ class App:
             if not self.pipe.available(mode):
                 hud.label(surf, name, (x + 12, y + 12), sub="UNAVAILABLE")
                 hud.center_note(surf, (x, y, w, h), ["UNAVAILABLE", self.pipe.unavailable[mode][:70]])
+            elif mode in UNTRAINED and self.pipe.is_trained(mode):
+                hud.label(surf, name, (x + 12, y + 12), sub=f"trained: {self.pipe.is_trained(mode)}",
+                          sub_color=(140, 220, 140))
             elif mode in UNTRAINED:
                 hud.label(surf, name, (x + 12, y + 12), sub="UNTRAINED - timing only, not a result")
             else:
@@ -342,7 +346,7 @@ class App:
             "preset": self.preset_id, "march_scale": self.pipe.march_scale,
             "render_size": [r.out_w, r.out_h] if r else None, "march_size": [r.mw, r.mh] if r else None,
             "steps_per_m": r.p.steps if r else None,
-            "unavailable": self.pipe.unavailable, "stubs": self.b.stubs, "backend_notes": self.b.notes,
+            "unavailable": self.pipe.unavailable, "stubs": self.b.stubs, "backend_notes": self.b.notes, "trained": self.b.trained,
             "solver": f"{self.b.Solver.__module__}.{self.b.Solver.__name__}",
         }
 
@@ -506,6 +510,8 @@ def parse_args(argv=None):
     ap.add_argument("--march-scale", type=float, default=0.5)
     ap.add_argument("--steps", type=float, default=None, help="ray-march samples per meter (default: renderer's)")
     ap.add_argument("--stub-sim", action="store_true", help="force the app's toy solver")
+    ap.add_argument("--screen-ckpt", default=None,
+                    help="route B checkpoint (default: runtime3d's default path if that file exists, else untrained)")
     ap.add_argument("--warmup-neural", action="store_true",
                     help="pre-capture every VolumeUpscaler graph at start-up (slow: ~70 s on a shared GPU); "
                          "otherwise graphs are captured on first use of each brick count (hitches)")
