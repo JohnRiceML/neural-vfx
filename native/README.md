@@ -106,3 +106,24 @@ and the lead decides; nobody edits a threshold to make a test pass.
   FP16, outputs compared with PyTorch, timed at 2560×1440 on a ~1/3-screen effect against 2.5 ms.
 - Gate 3: windowed demo — solver → half-resolution march (colour + alpha/depth/motion) → detail →
   present; orbit camera, fire/smoke at the cursor, raw/neural toggle, per-stage GPU ms against 6 ms.
+
+### Gate 3a — native ray-marcher (`render/`): what "passes" means
+Reference: `vfx.render3d.VolumeRenderer((1440, 2560), march_scale=0.5)` with default `RenderParams3D`,
+`return_aux=True`, fed the same 64³ state (uploaded to the native solver with `nvfx_solver_upload_state`),
+the same camera and previous camera. Scenes: campfire and plume + sphere after 150 steps; three cameras
+each (default, an orbit of 60°, a close-up where the effect covers ≥ 1/3 of the frame).
+The renderer reads the solver's textures directly (no copy through the CPU, no intermediate download).
+
+| # | Check | Threshold |
+|---|---|---|
+| R1 | Colour vs Python, 8-bit units, whole frame | mean abs ≤ 1.5, 99th percentile ≤ 8, and no structured error visible in a ×8 difference image (the test engineer saves the images) |
+| R2 | `alpha` | mean abs ≤ 0.01, 99th percentile ≤ 0.05 |
+| R3 | `depth` where Python alpha > 0.05 | mean abs ≤ 0.01 m |
+| R4 | `motion` where Python alpha > 0.05, moving camera | mean abs ≤ 0.5 px, sign convention as `vfx/render3d/README.md` |
+| R5 | Aux off vs on: colour output | bit-identical |
+| R6 | Two draws of the same inputs | bit-identical |
+| T2 | GPU ms per frame at 2560×1440, march_scale 0.5, aux on, timestamp queries, median of ≥ 300 frames, new volume every frame, and view-only redraw | ≤ 1.5 ms (budget); Python measured in the same sitting alongside |
+
+Output convention: colour `R8G8B8A8_UNORM` holding the final display-encoded image (what Python returns
+as uint8), row 0 = top of screen; `alpha` R16F, `depth` R16F (metres along the ray), `motion` RG16F (output
+pixels per SIM_DT, x right, y down), all at output resolution.

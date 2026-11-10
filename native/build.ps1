@@ -1,9 +1,11 @@
 # Configure + build the native runtime with MSVC + Ninja. OWNER: lead.
 #   powershell -File native/build.ps1 [-Config Release|RelWithDebInfo|Debug] [-Clean]
-param([string]$Config = "Release", [switch]$Clean)
+#   -BuildDir <name>: build into native/<name> instead of native/build (lets two engineers build at once;
+#                     only names starting with "build" are git-ignored)
+param([string]$Config = "Release", [switch]$Clean, [string]$BuildDir = "build")
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
-$build = Join-Path $root "build"
+$build = Join-Path $root $BuildDir
 if ($Clean -and (Test-Path $build)) { Remove-Item -Recurse -Force $build }
 
 $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
