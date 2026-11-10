@@ -24,6 +24,8 @@ class DetailShade:
     rot: wp.mat33        # rotation applied to the rest coordinate between octaves
     t_disp: float        # fraction of the displacement applied to temperature (1 = same point as density)
     t_hot: float         # temperature (K) above which the temperature is re-read at the t_disp point
+    use_amps: int        # 1: per-octave displacements from `amps` (calibrated), 0: disp * disp_gain^o
+    amps: wp.vec4        # per-octave displacement (m) for octaves 0..3 when use_amps
 
 
 # ---------------------------------------------------------------------- sampling (render side)
@@ -53,7 +55,16 @@ def detail_warp(q: wp.vec3, dc0: wp.Texture3D, dc1: wp.Texture3D, noise: wp.Text
             n = n + wp.texture_sample(noise, wp.vec3(wp.frac(p0[0]), wp.frac(p0[1]), wp.frac(p0[2])), dtype=wp.vec4f) * w0
         if w1 > 0.0:
             n = n + wp.texture_sample(noise, wp.vec3(wp.frac(p1[0]), wp.frac(p1[1]), wp.frac(p1[2])), dtype=wp.vec4f) * w1
-        disp = disp + wp.vec3(n[0], n[1], n[2]) * ad
+        a_o = ad
+        if ds.use_amps != 0:                 # constant-index selects (no dynamic vector indexing)
+            a_o = ds.amps[0]
+            if _o == 1:
+                a_o = ds.amps[1]
+            elif _o == 2:
+                a_o = ds.amps[2]
+            elif _o >= 3:
+                a_o = ds.amps[3]
+        disp = disp + wp.vec3(n[0], n[1], n[2]) * a_o
         m = m + n[3] * am
         p0 = (ds.rot * p0) * ds.lac          # continuous (no wrap here: rot of a wrapped coord has seams)
         p1 = (ds.rot * p1) * ds.lac

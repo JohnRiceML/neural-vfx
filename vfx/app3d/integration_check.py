@@ -77,7 +77,7 @@ def main(argv=None):
         "p2_particles_detail_vs_detail": (["--preset", "2", "--mode", "particles_detail", "--side-by-side", "--mode2", "detail"], None),
         "p1_optin_toggles": (["--preset", "1", "--mode", "detail", "--side-by-side", "--mode2", "raw"], toggles),
         "p3_best": (["--preset", "3", "--best"], None),
-        "p3_best_particles": (["--preset", "3", "--best-particles"], None),
+        "p3_best_light": (["--preset", "3", "--best-light"], None),
         "p1_default_a": (["--preset", "1", "--mode", "raw", "--side-by-side", "--mode2", "trilinear"], None),
         "p1_default_b": (["--preset", "1", "--mode", "raw", "--side-by-side", "--mode2", "trilinear"],
                          lambda app, i: (app.toggle_sim_option("fused"), app.toggle_sim_option("fused")) if i == 0 else None),

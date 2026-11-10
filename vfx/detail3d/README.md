@@ -124,3 +124,49 @@ advection; Niagara Fluids Cine template advecting texture coordinates).
 
 Files: `advected.py` (AdvectedDetail, DetailParams, QUALITY), `kernels.py` (per-tick kernels +
 `detail_sample` used by vfx/render3d), `noise.py` (band-limited curl/scalar noise tile), `bench.py`.
+
+## Band calibration and base-aware stacking (2026-11-09, after bench3d/results/MODES.md)
+The all-modes comparison found `detail` medium best on temporal behaviour (tLP 0.093 vs raw 0.440,
+particles 0.119) but over-fine: 2-4 px band +0.42, 8-16 px +0.25 (log10 power vs the 256³ reference),
+band distance 0.270 (low 0.183, particles 0.116); stacking (hires + detail 0.417, particles + detail 0.438)
+was worse than either alone. Changes (all opt-in parameters; the low/medium/high presets are unchanged):
+* `octave_amps` — explicit per-octave displacement (m), replaces `disp * disp_gain^o`, so each image band can
+  be set independently. Most of the 2-4 px excess is not the top noise octave itself but the sharp folds a
+  large displacement makes, so the overall displacement has to come down too.
+* `base_res` — the detail is defined relative to the base grid: on a 128³ base the noise starts one octave
+  higher with half the displacement (only the bands the base lacks).
+* `cov_damp` / `step(..., coverage=)` — amplitude x (1 - cov_damp * coverage), coverage = particles per 128³
+  cell (`DetailParticles.dep[2]`, an internal of vfx.particles3d read defensively) / `cov_full`.
+* `STACKED` — base-aware defaults used by the sandbox (`hires_detail`, `particles_detail`) and `compare`.
+* quality `calibrated` — PROVISIONAL (0.012, 0.003) m; to be replaced by the measured winner.
+Tuning: `python -m vfx.detail3d.tune_bands --cache` (one GPU session: caches every 64³ state and the steered
+256³ reference frames per preset under DATA_ROOT/runs/detail3d_tune), then `--search` (36 plain-detail
+variants), `--search-stacked AMPS@FREQ0` (base_res x cov_damp for hires / particles), `--grid`, or `--variants
+"name:base=...;key=val"`. It prints the harness's signed per-band ratios (32-64 ... 2-4 px), band distance and
+patch SWD per preset and mean, and ranks the variants. Same camera path, size (2560x1440, march 0.5), mask
+and metric functions as bench3d.compare_modes, so the numbers are comparable to MODES.md.
+
+### Results of the calibration (2026-11-09, `tune_bands`, presets 1-4 vs steered 256³, means)
+The tuner reproduces bench3d MODES.md (raw 0.359 / low 0.183 / medium 0.270 band distance, tLP raw 0.440,
+medium 0.093). Signed log10 band power vs the reference (0 = like it), band distance, patch SWD, tLP:
+
+| setting | 32-64 | 16-32 | 8-16 | 4-8 | 2-4 px | dist | SWD | tLP |
+|---|---|---|---|---|---|---|---|---|
+| raw 64³ | -0.18 | -0.52 | -0.73 | -0.30 | -0.06 | 0.359 | 0.220 | 0.440 |
+| medium (old default) | -0.11 | +0.06 | +0.25 | +0.49 | +0.42 | 0.270 | 0.107 | 0.093 |
+| **calibrated** (1 octave, 9 c/m, 2.5 cm) — new default | -0.09 | -0.02 | +0.06 | +0.18 | +0.17 | 0.119 | 0.080 | 0.167 |
+| particles 1M@128³ | -0.04 | +0.01 | -0.26 | -0.23 | -0.03 | 0.118 | 0.075 | 0.129 |
+| **particles + calibrated, cov_damp 0.7** (`--best`) | -0.07 | +0.02 | +0.03 | +0.04 | +0.06 | **0.051** | **0.041** | **0.050** |
+| hires 128³ | +0.04 | -0.20 | -0.44 | -0.25 | -0.04 | 0.199 | 0.143 | 0.282 |
+| hires + calibrated, amp_scale 0.5 | -0.03 | -0.00 | +0.09 | +0.14 | +0.12 | 0.087 | 0.077 | 0.142 |
+
+Pictures (1:1, all presets, and three consecutive frames): the 2-4 px excess of low/medium is a visible fine
+diagonal crosshatch / moiré in dense smoke; calibrated removes most of it (a faint trace remains at the base
+of the campfire column) and shows larger curls; particles + calibrated is the closest to the reference (soft
+billows, wisps, the reference's fine grain in dense smoke) and changes frame to frame like it. Metric and eye
+agree on the ranking. Remaining flaws: particle variants put a speckle grain into flames (preset 4 torch)
+where the reference flame is smooth; calibrated detail alone is calmer in motion than the reference (tLP
+log ratio -0.18); hires + detail has its own (unmatched) 64³ flow, so its plume shape differs.
+Rejected on evidence: 8 c/m (0.096 / 0.090 / 0.189) failed tests3d `test_detail_moves_with_the_flow[8]`
+(corr 0.20 < 0.3 in a rotating flow); shorter regeneration periods (0.4-0.7 s) raised popping (pop 1.2-1.3);
+a second octave brought the hatching back; base_res 128 for stacking measured worse than amplitude scaling.

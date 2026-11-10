@@ -139,8 +139,9 @@ class ParticlePanels:
         from vfx.particles3d import DetailParticles
         from vfx.render3d import VolumeRenderer
         cfg = backends.runtime_config(**pre.sim) if pre.sim else backends.runtime_config()   # == run_pair's LR config
+        from vfx.detail3d import STACKED
         self.dp = DetailParticles(1_000_000, 128, config=cfg)
-        self.det = AdvectedDetail(64, quality=a.detail_quality)
+        self.det = AdvectedDetail(64, quality=a.detail_quality, **STACKED["particles"])   # base-aware
         self.rend = {k: VolumeRenderer((H, W), march_scale=a.march_scale) for k in ("p", "pd")}
         self.names = ["particles 128³ 1M", f"particles + detail ({a.detail_quality})"]
         self.pre = pre
@@ -150,13 +151,17 @@ class ParticlePanels:
         from vfx.core.fields3d import Forces3D
         return Forces3D(emitters=list(self.pre.emitters), wind=tuple(self.pre.wind))
 
+    def _cov(self):
+        dep = getattr(self.dp, "dep", None)
+        return dep[2] if dep is not None else None          # particles per 128³ cell this tick
+
     def warm(self, lr):
         self.dp.step(lr, self._forces(), SIM_DT)
-        self.det.step(lr, SIM_DT)
+        self.det.step(lr, SIM_DT, coverage=self._cov())
 
     def tick(self, tm, lr, cam, solid):
         tm.run("particles step", lambda: self.dp.step(lr, self._forces(), SIM_DT))
-        tm.run("particles detail step", lambda: self.det.step(lr, SIM_DT))
+        tm.run("particles detail step", lambda: self.det.step(lr, SIM_DT, coverage=self._cov()))
         v = self.dp.volume()
         self.imgs["p"] = tm.run("particles render", lambda: self.rend["p"].draw(v, cam, solid)).clone()
         self.imgs["pd"] = tm.run("particles+detail render",
@@ -196,7 +201,8 @@ class DetailPanels:
                 cfg = backends.runtime_config(**pre.sim) if pre.sim else backends.runtime_config()
                 self.hs = S(64, cfg, device="cuda", scalar_res=128)
                 self.hst = self.hs.reset(pre.obstacles)
-                self.hdet = AdvectedDetail(64, quality=a.detail_quality)
+                from vfx.detail3d import STACKED
+                self.hdet = AdvectedDetail(64, quality=a.detail_quality, **STACKED["hires"])   # base-aware
                 self.rend["hires"] = VolumeRenderer((H, W), march_scale=a.march_scale)
                 self.names.append(f"hires 128³ + detail ({a.detail_quality})")
             else:
@@ -275,7 +281,7 @@ def main(argv=None):
     ap.add_argument("--screen-ckpt", default=None, help="route B checkpoint (default: runtime3d default path if present)")
     ap.add_argument("--no-hr", action="store_true", help="skip the guided 256³ reference panel")
     ap.add_argument("--detail", action="store_true", help="add the advected-detail panels (see module doc)")
-    ap.add_argument("--detail-quality", default="medium", choices=["low", "medium", "high"])
+    ap.add_argument("--detail-quality", default="calibrated", choices=["calibrated", "low", "medium", "high"])
     ap.add_argument("--no-route-b-detail", action="store_true", help="with --detail: skip the detail + route B panel")
     ap.add_argument("--particles", action="store_true", help="add the particle-study panels (see module doc)")
     a = ap.parse_args(argv)

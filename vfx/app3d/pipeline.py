@@ -102,7 +102,7 @@ class Pipeline:
         self.tick_id = 0                  # renderers re-prepare their volume only when this changes
         self.cam_hist: dict = {}          # view slot -> {tick_id: [cameras drawn during that tick]}
         # sim-carried detail phase (all lazy: nothing is created or run unless such a mode is visible)
-        self.detail_quality = "medium"
+        self.detail_quality = "calibrated"
         self.temporal = False             # renderer temporal amortization (shortlist #2), toggled with J
         self.details: dict = {}           # "lr" (64^3 sim) / "hires" (hires solver) -> AdvectedDetail
         self.detail_live: dict = {}
@@ -188,8 +188,10 @@ class Pipeline:
     def detail(self, which: str = "lr"):
         d = self.details.get(which)
         if d is None:
-            from vfx.detail3d import AdvectedDetail
-            d = self.details[which] = AdvectedDetail(LR_RES_3D, device=str(self.device), quality=self.detail_quality)
+            from vfx.detail3d import STACKED, AdvectedDetail
+            # "lr": plain 64³ base; "hires" / "particles": base-aware (only the bands the base field lacks)
+            d = self.details[which] = AdvectedDetail(LR_RES_3D, device=str(self.device), quality=self.detail_quality,
+                                                     **STACKED.get(which, {}))
         return d
 
     def set_detail_quality(self, q: str) -> None:
@@ -197,12 +199,12 @@ class Pipeline:
         for d in self.details.values():
             d.set_quality(q)
 
-    def _step_detail(self, which: str, state) -> None:
+    def _step_detail(self, which: str, state, coverage=None) -> None:
         d = self.detail(which)
         if not self.detail_live.get(which):
             d.reset()                       # coordinates are stale after a gap: restart (weights fade in)
         t = self.timer.start(f"detail_step.{which}")
-        d.step(state, SIM_DT)
+        d.step(state, SIM_DT, coverage=coverage)
         self.timer.stop(t)
         self.detail_live[which] = True
 
@@ -325,7 +327,7 @@ class Pipeline:
         if modes & {"detail", "detail_screen"} and self.available("detail"):
             self._step_detail("lr", st)
             self.vols["detail"] = self.vols["detail_screen"] = raw
-        elif "particles_detail" not in modes:
+        else:
             self.detail_live["lr"] = False
         if modes & HIRES_MODES and self.available("hires"):
             try:
@@ -355,13 +357,15 @@ class Pipeline:
                 self.timer.stop(t)
                 self.particles_live = True
                 self.vols["particles"] = self.vols["particles_detail"] = dp.volume()
-                if "particles_detail" in modes and not modes & {"detail", "detail_screen"}:
-                    self._step_detail("lr", st)          # (else already stepped above this tick)          # advected detail rides on the 64^3 velocity
+                if "particles_detail" in modes:          # own base-aware detail (STACKED["particles"])
+                    self._step_detail("particles", st, coverage=getattr(dp, "dep", None)[2]
+                                      if getattr(dp, "dep", None) is not None else None)          # advected detail rides on the 64^3 velocity
             except Exception as e:
                 for m in PARTICLE_MODES:
                     self.unavailable[m] = f"{type(e).__name__}: {str(e)[:120]}"
         else:
             self.particles_live = False
+            self.detail_live["particles"] = False
         # --- raw_default: the 64^3 sim WITHOUT the sandbox's solver opt-ins (honest baseline next to "best")
         if "raw_default" in modes:
             if self.base_solver is None:
@@ -453,7 +457,7 @@ class Pipeline:
         r.app_key = key
         t = self.timer.start(f"{'render_view' if reuse else 'render'}.{slot}")
         if mode in DETAIL_MODES:            # sim-carried detail sampled in the march (+ light volume)
-            det = self.details.get("hires" if mode == "hires_detail" else "lr")
+            det = self.details.get({"hires_detail": "hires", "particles_detail": "particles"}.get(mode, "lr"))
             if mode == "detail_screen":
                 img, aux = r.draw(vol, camera, self.solid_render, reuse_volume=reuse, return_aux=True,
                                   velocity=self.state.velocity, prev_camera=self.prev_camera(camera, slot), detail=det)

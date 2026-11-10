@@ -35,7 +35,7 @@ SHORT = {"raw": "raw 64³", "trilinear": "trilinear 256³", "neural_vol": "neura
          "detail": "64³ + detail", "detail_screen": "detail + B", "hires": "hires 128³", "hires_detail": "hires + detail",
          "particles": "particles 128³", "particles_detail": "particles + detail", "raw_default": "raw 64³ (default sim)"}
 DETAILED = ("detail", "detail_screen", "hires_detail", "particles_detail")     # render row includes detail sampling
-DETAIL_QUALITIES = ["low", "medium", "high"]
+DETAIL_QUALITIES = ["calibrated", "low", "medium", "high"]
 DETAIL_BENCH_JSON = Path(__file__).resolve().parents[1] / "detail3d" / "bench_latest.json"
 
 
@@ -271,7 +271,7 @@ class App:
             pt = t.last("particles")
             det_tick, det_frame, det_lab = pt, 0.5 * pt, "detail  particles@30"
             if mode == "particles_detail":
-                st_ = t.last("detail_step.lr")
+                st_ = t.last("detail_step.particles")
                 det_tick, det_frame, det_lab = pt + st_, 0.5 * (pt + st_), "detail  part+adv@30"
         elif mode in ("detail", "detail_screen", "hires_detail"):
             # advected-detail step per tick (amortized /2); its march sampling is inside the render row
@@ -287,7 +287,7 @@ class App:
         rn, rv = t.last(f"render.{slot}"), t.last(f"render_view.{slot}")
         res = f"{_pipeline.REF_RES}³" if mode == "ref128" else "64³+128³ρ" if mode in ("hires", "hires_detail") else "64³"
         if mode not in ("ref128", "raw_default") and self.pipe.sim_opts_label() != "default":
-            res += " " + self.pipe.sim_opts_label()
+            res += "*"                      # solver opt-ins on (named in the status column and on the view)
         return {
             "rows": [("sim", f"sim {res}  @30Hz", f"{sim:5.2f}", 0.5 * sim, STAGE_BUDGET["sim"]),
                      ("detail", det_lab, f"{det_tick:5.2f}", det_frame, STAGE_BUDGET["detail"]),
@@ -396,7 +396,8 @@ class App:
             "frame_ms": {"mean": float(ft.mean()), "p99": float(np.percentile(ft, 99))},
             "gpu_ms": {k: agg(k) for k in ("sim", "sim_ref", "upscale", "neural_vol", "detail.0", "render.0",
                                            "render_view.0", "detail.1", "render.1", "render_view.1",
-                                           "detail_step.lr", "detail_step.hires", "sim_hires", "particles", "sim_base")},
+                                           "detail_step.lr", "detail_step.hires", "detail_step.particles", "sim_hires",
+                                           "particles", "sim_base")},
             "sim_opts": dict(self.pipe.sim_opts),
             "detail_quality": self.pipe.detail_quality, "temporal": self.pipe.temporal,
             "budget_main_view": {k: self.stage_ms(self.mode, 0)[k] for k in ("tick_total", "frame_ms")},
@@ -597,25 +598,43 @@ def parse_args(argv=None):
     ap.add_argument("--sim-confref", action="store_true",
                     help="solver opt-in: confinement_ref_res=128 (resolution-consistent swirl); K toggles")
     ap.add_argument("--best", action="store_true",
-                    help="what the evidence favours so far: advected detail (medium) + conf@128 + fused pressure, "
-                         "side by side with raw 64³ from the default solver (raw_default); --best-particles uses "
-                         "particles_detail instead of detail")
-    ap.add_argument("--best-particles", action="store_true")
+                    help="the best measured combination (see BEST in main.py: particles + calibrated advected detail, "
+                         "fused pressure), side by side with raw 64³ from the default solver (raw_default)")
+    ap.add_argument("--best-particles", action="store_true", help="alias of --best (kept for old scripts)")
+    ap.add_argument("--best-light", action="store_true", help="like --best without particles: calibrated advected "
+                    "detail only (cheapest)")
     ap.add_argument("--temporal", action="store_true",
                     help="temporally amortized ray-march (jittered starts + camera-reprojected history); J toggles")
-    ap.add_argument("--detail-quality", default="medium", choices=DETAIL_QUALITIES,
+    ap.add_argument("--detail-quality", default="calibrated", choices=DETAIL_QUALITIES,
                     help="advected-detail quality (noise octaves 1/2/4) for the detail modes; Q cycles it")
     return ap.parse_args(argv)
 
 
+# --best / --best-light, chosen from measurements (presets 1-4 vs the steered 256³; bench3d/results/MODES.md and
+# `python -m vfx.detail3d.tune_bands`, which reproduces MODES.md's numbers), NOT by assumption:
+#                                band dist  patch SWD   tLP    (0 = like the reference; lower is better)
+#   raw 64³                        0.359      0.220     0.440
+#   detail medium (old default)    0.270      0.107     0.093   visible 2-4 px crosshatch at 1:1
+#   detail calibrated              0.119      0.080     0.167   no crosshatch; calmer in motion than the reference
+#   particles 1M@128³              0.118      0.075     0.129
+#   particles + calibrated detail  0.051      0.041     0.050   cov_damp 0.7 (STACKED); best on all three
+#   (route B adversarial net:      0.051      0.068     0.194 — for scale)
+#  * fused pressure: same quality as the default PCG (raw + fused: band 0.355 vs 0.359), ~half the solve -> ON.
+#  * confinement_ref_res=128: worse vs the reference in every measured row (hires + conf@128: band 0.226 vs 0.199,
+#    tLP 0.384 vs 0.282) -> OFF (K / --sim-confref still toggles it).
+#  Cost (quiet card, per sim tick): particles 1.41 ms + detail step ~0.1 ms; render with detail ~1.1 ms per frame.
+BEST = {"mode": "particles_detail", "detail_quality": "calibrated", "sim_fused": True, "sim_confref": False}
+BEST_LIGHT = {"mode": "detail", "detail_quality": "calibrated", "sim_fused": True, "sim_confref": False}
+
+
 def apply_best(args) -> None:
-    """--best: one launch for the current state of the art next to the honest baseline."""
-    if args.best or args.best_particles:
-        args.mode = "particles_detail" if args.best_particles else "detail"
+    """--best: one launch for the current best measured combination next to the honest baseline."""
+    if args.best or args.best_particles or args.best_light:
+        b = BEST_LIGHT if args.best_light else BEST          # --best-particles: old name, same as --best
+        args.mode, args.detail_quality = b["mode"], b["detail_quality"]
+        args.sim_fused, args.sim_confref = b["sim_fused"], b["sim_confref"]
         args.mode2 = "raw_default"
         args.side_by_side = True
-        args.sim_fused = args.sim_confref = True
-        args.detail_quality = "medium"
 
 
 def main(argv=None):

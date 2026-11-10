@@ -65,6 +65,38 @@ corrector is trained and evaluated ON TOP of it (residual over the best classica
 gain over the baseline. Its job: remove the k5-8 excess without draining k1-4, i.e. a scale-selective
 forcing, which a single global parameter cannot do.
 
+Update (after the hold): the solver engineer added the opt-in `SolverConfig3D.confinement_ref_res`
+(eps_used = eps * res / ref). The baseline is now `confinement_ref_res=128` (= eps 3 at 64^3; checked:
+same rollout as `vorticity_eps=3` up to float rounding / chaos, max diag diff 0.016 after 120 steps).
+
+## E1b - noise floor (`tune_classical --noise_floor`, same 8 train scenes)
+128^3 vs the same 128^3 run nudged by 1 mm/s at step 5: score 0.45 (centroid err 0.004 m, h95 0.013 m,
+KE 1.00, spectrum err 0.026, mean-density err 0.080, mean-velocity err 0.246). So of the tuned baseline's
+1.84, about 1.4 is reducible in principle; 0.45 is chaos over a 10 s window (probably an
+underestimate: one perturbation may not fully decorrelate the run).
+
+## E2 - one-step supervised ("pre-computed") corrector  [training run 1 of 4]
+Hypothesis: a local net can learn R f_{t+1} - step64(P R f_t) (low-passed at 10 cycles/domain,
+projected) and, applied before each step on top of the tuned baseline, removes the k5-8 excess.
+Data `corr3d_r0` (D:): 24 train scenes, 240 steps, every 4th step, 1103 pairs, 0.6 GB. Target rms only
+0.0006 m/s/step (domain rms; |u| ~ 0.1-1 m/s). CorrNet width 16 (37k params), 10 min, 134k iters:
+**train R^2 0.41, val R^2 0.37** (unseen train-split scenes; 0 = identity).
+Held-out compare (6 named + 4 test + 3 OOD scenes, 300 steps, vs restricted 128^3):
+
+| | score | centroid err | h95 err | KE ratio | spec err k1-8 | mean-D err | mean-U err | bands k1-2..17-31 |
+|---|---|---|---|---|---|---|---|---|
+| raw 64^3 | 4.61 | 0.056 | 0.098 | 1.83 | 0.735 | 0.247 | 0.909 | 0.73, 1.30, 2.61, 3.70, 2.66 |
+| tuned classical (confref 128) | **1.727** | 0.020 | 0.038 | 0.99 | **0.327** | **0.155** | **0.499** | 0.91, 1.19, 1.56, 1.39, 1.00 |
+| learned E2 on top | 1.731 | **0.018** | **0.034** | 1.15 | 0.397 | 0.157 | 0.598 | 1.15, 1.36, 1.70, 1.81, 1.26 |
+
+Result: no net benefit. The learned run has the lower score on 8/13 scenes (fire 1.57 vs 1.91,
+smoke_sphere 1.90 vs 2.59) but loses clearly on 5 (smoke_push, test_100000, ood_200002 2.71 -> 3.29), and on average puts ENERGY BACK
+(KE 0.99 -> 1.15, k9-16 1.39 -> 1.81, mean-velocity error worse), with a marginal plume-height gain.
+Diagnosis = the textbook distribution shift: the one-step target from a restricted fine state is mostly
+"the coarse step blurs the sharp restricted fine structure, put it back" (an energising correction),
+while at runtime the coarse state is already over-stirred at k5-16. Decision: E3 DAgger (targets on the
+corrector's own trajectory, tendency difference vs a 128^3 sim nudged to follow it).
+
 ## Planned (on hold: lead paused GPU work at this point)
 * E1b noise floor: two 128^3 runs of the same scene with a 1e-4 perturbation -> how much of the remaining
   mean-density / velocity error is irreducible chaos (the 256 vs 128 numbers above suggest 0.14-0.20).

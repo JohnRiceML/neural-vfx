@@ -1,4 +1,4 @@
-"""CorrNet: a tiny 3D net that maps the local 64^3 state to a large-scale velocity correction.
+﻿"""CorrNet: a tiny 3D net that maps the local 64^3 state to a large-scale velocity correction.
 
 Input  (B,6,64,64,64) raw state [density, vx, vy, vz, T, fuel] + solid (B,1,64,64,64)
        -> features at 32^3 (2x box average): u/U, density/D, (T-amb)/TS, solid fraction    6 channels
@@ -19,7 +19,7 @@ from vfx.core.fields3d import AMBIENT_TEMP
 U_SCALE = 1.0       # m/s
 D_SCALE = 1.0       # density units
 T_SCALE = 400.0     # K above ambient
-OUT_SCALE = 0.02    # m/s per step: the network predicts correction / OUT_SCALE
+OUT_SCALE = 0.002   # m/s per step: the network predicts correction / OUT_SCALE
 
 
 def features(data: torch.Tensor, solid: torch.Tensor) -> torch.Tensor:

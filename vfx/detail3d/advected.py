@@ -58,17 +58,45 @@ class DetailParams:
     t_hot: float = 700.0           # K: above this the temperature is re-read at the t_disp point
     light_octaves: int = 1         # octaves the light/shadow volume samples (finer ones are below its res)
     seed: int = 1
+    # --- spectrum calibration and base awareness (2026-11-09, after bench3d MODES.md)
+    octave_amps: tuple = ()        # per-octave displacement (m), overrides disp * disp_gain^o when given (<= 4)
+    base_res: int = 64             # effective resolution of the base volume the detail is drawn on. 128 (hires
+                                   # scalars, particles) shifts the noise up one octave and halves the
+                                   # displacement: only the bands the base field lacks are added
+    amp_scale: float = 1.0         # multiplies every octave's displacement (stacked modes: base already detailed)
+    cov_damp: float = 0.0          # amplitude x (1 - cov_damp * coverage) where step() gets a coverage field
+    cov_full: float = 4.0          # coverage count per fine cell that counts as fully covered
 
 
 QUALITY = {
-    "low": dict(octaves=1, disp_gain=0.5),
-    "medium": dict(octaves=2, disp_gain=0.5),
-    "high": dict(octaves=4, disp_gain=0.45),      # octave centres 12, 24, 48, 96 cycles/m: up to the 256^3 Nyquist (128)
+    "low": dict(octaves=1, freq0=12.0, disp_gain=0.5, octave_amps=()),
+    "medium": dict(octaves=2, freq0=12.0, disp_gain=0.5, octave_amps=()),
+    "high": dict(octaves=4, freq0=12.0, disp_gain=0.45, octave_amps=()),
+    # band-calibrated (tune_bands --search, 2026-11-09): ONE octave centred at 9 cycles/m with 2.5 cm displacement.
+    # Mean over presets 1-4 vs the steered 256³: band distance 0.119 (medium 0.270, low 0.183), patch SWD 0.080
+    # (0.107 / 0.078), tLP 0.167 (0.093 / 0.133). 8 cycles/m scored 0.096 / 0.090 / 0.189 but failed
+    # tests3d test_detail_moves_with_the_flow[8] (corr 0.20 < 0.3: decorrelates faster in a rotating flow);
+    # 9 passes. A second, finer octave measured no better at any amplitude (it only adds 2-4 px hatching).
+    "calibrated": dict(octaves=1, freq0=9.0, octave_amps=(0.025,)),      # octave centres 12, 24, 48, 96 cycles/m: up to the 256^3 Nyquist (128)
+}
+
+
+# Detail drawn on a base volume that already has sub-grid structure (bench3d MODES.md: stacking medium detail on
+# hires / particles overshoots the reference's fine bands). Only the bands the base lacks are added.
+# Measured with `python -m vfx.detail3d.tune_bands` (calibrated amps, presets 1-4 vs steered 256³):
+#   particles + calibrated detail: cov_damp 0.7 -> band distance 0.051, patch SWD 0.041, tLP 0.050 (particles alone
+#     0.118 / 0.075 / 0.129; un-damped stacking 0.255 / 0.108; base_res 128 measured slightly worse -> not used).
+#   hires + calibrated detail: amp_scale 0.5 -> 0.087 / 0.077 / tLP 0.142 (hires alone 0.199 / 0.143 / 0.282; full
+#     amplitude 0.222; base_res 128 (noise one octave up) 0.216 -> not used: the 128³ field lacks power at 8-16 px,
+#     not only above its Nyquist).
+STACKED = {
+    "hires": dict(amp_scale=0.5),
+    "particles": dict(cov_damp=0.7),
 }
 
 
 class AdvectedDetail:
-    def __init__(self, res: int = 64, device="cuda", quality: str = "medium", cuda_graph: bool = True, **params):
+    def __init__(self, res: int = 64, device="cuda", quality: str = "calibrated", cuda_graph: bool = True, **params):
         wp.init()
         self.res = int(res)
         self.device = torch.device(device)
@@ -130,9 +158,16 @@ class AdvectedDetail:
 
     def shade(self, light: bool = False) -> K.DetailShade:
         p, s = self.p, K.DetailShade()
-        s.disp, s.disp_gain, s.mult, s.mult_gain = float(p.disp), float(p.disp_gain), float(p.mult), float(p.mult_gain)
+        k = float(p.base_res) / 64.0 / float(p.amp_scale)   # base-aware: same detail relative to the base grid
+        s.disp, s.disp_gain, s.mult, s.mult_gain = float(p.disp) / k, float(p.disp_gain), float(p.mult), float(p.mult_gain)
         s.octaves = int(min(p.octaves, p.light_octaves)) if light else int(p.octaves)
-        s.freq0 = float(p.freq0) / TILE_KC          # tiles per meter
+        s.freq0 = float(p.freq0) * float(p.base_res) / 64.0 / TILE_KC      # tiles per meter
+        oa = p.octave_amps if isinstance(p.octave_amps, (tuple, list)) else (p.octave_amps,)   # a number = 1 octave
+        amps = [float(a) / k for a in oa][:4]
+        s.use_amps = 1 if amps else 0
+        s.amps = wp.vec4(*(amps + [0.0] * (4 - len(amps))))
+        if amps:
+            s.octaves = min(s.octaves, len(amps))
         s.lac = float(p.lac)
         s.amp_eps = float(p.amp_eps)
         s.rot = wp.mat33(*[v for row in rotation() for v in row])
@@ -177,8 +212,10 @@ class AdvectedDetail:
 
     # ------------------------------------------------------------------ per tick
     @torch.no_grad()
-    def step(self, state, dt: float) -> None:
-        """Advect the detail coordinates by state's velocity and refresh the amplitude. No host sync."""
+    def step(self, state, dt: float, coverage: torch.Tensor | None = None) -> None:
+        """Advect the detail coordinates by state's velocity and refresh the amplitude. No host sync.
+        coverage (optional, any res, e.g. particle count per 128^3 cell): with cov_damp > 0 the amplitude
+        is reduced where the base volume already carries sub-grid structure."""
         self._resolve()
         ev = [torch.cuda.Event(enable_timing=True) for _ in range(2)]
         ev[0].record()
@@ -190,8 +227,10 @@ class AdvectedDetail:
         with wp.ScopedStream(self._stream(), sync_enter=False, sync_exit=False):
             self._write_dyn(resets)
             data = state.data
-            key = (data.data_ptr(), tuple(data.shape), state.solid.data_ptr(), float(dt), self.version)
-            fn = lambda: self._tick_work(data, state.solid, float(dt))   # noqa: E731
+            cov = coverage if (coverage is not None and self.p.cov_damp > 0) else None
+            key = (data.data_ptr(), tuple(data.shape), state.solid.data_ptr(), float(dt), self.version,
+                   None if cov is None else (cov.data_ptr(), tuple(cov.shape)))
+            fn = lambda: self._tick_work(data, state.solid, float(dt), cov)   # noqa: E731
             if self.cuda_graph:
                 g = self._graphs.get(key)
                 if g is None:
@@ -203,7 +242,7 @@ class AdvectedDetail:
         ev[1].record()
         self._events = ev
 
-    def _tick_work(self, data, solid, dt) -> None:
+    def _tick_work(self, data, solid, dt, cov=None) -> None:
         p = self.p
         D = data.shape[1]
         amp_raw = self.amp_raw if D == self.res else torch.zeros(D, D, D, device=self.device)
@@ -219,6 +258,9 @@ class AdvectedDetail:
         if p.amp_floor > 0:
             pres = (a > 1e-4).float()
             a = torch.maximum(a, p.amp_floor * pres)
+        if cov is not None:
+            c = F.adaptive_avg_pool3d(cov.float()[None, None], self.res) if cov.shape[-1] != self.res else cov.float()[None, None]
+            a = a * (1.0 - p.cov_damp * (c / p.cov_full).clamp(0.0, 1.0))
         self.amp.copy_(a[0, 0])
         n = self.res
         wp.launch(K.advect_coords, dim=(n, n, n),

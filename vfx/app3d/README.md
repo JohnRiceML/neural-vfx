@@ -181,8 +181,12 @@ the status column ("solver opt-ins: fused-p+conf@128"), in the sim row label and
 each affected view. `scalar_res=128` is the `hires` / `hires_detail` modes (separate solver instance).
 Switching `fused` on recaptures the solver's graph once (one hitch).
 
-**`--best`** = `--mode detail --detail-quality medium --sim-fused --sim-confref --side-by-side --mode2
-raw_default`: the current best guess (advected detail + resolution-consistent confinement + fused
-pressure) next to raw 64³ from the default solver. `--best-particles` uses `particles_detail` instead.
+**`--best`** opens `particles_detail` (1M particles at 128³ + calibrated advected detail, `cov_damp` 0.7) with
+fused pressure, next to `raw_default` (raw 64³, default solver). Chosen by measurement (`BEST` in `main.py`;
+`vfx/detail3d/README.md` "Results of the calibration"): band distance 0.051, patch SWD 0.041, tLP 0.050 vs the
+steered 256³ — best on all three of every approach measured. Fused pressure: same quality, ~half the solve.
+Confinement@128 is off (worse against the reference in every measured row). `--best-light` = calibrated detail
+without particles (0.119 / 0.080 / 0.167, cheaper); `--best-particles` is kept as an alias of `--best`.
+The default detail quality is now `calibrated` (Q cycles calibrated / low / medium / high).
 `compare --particles` adds `particles 128³ 1M | particles + detail` panels before the reference (its 64³
 run comes from `vfx.datagen3d.sim.run_pair`, so the solver opt-ins do not apply there).
