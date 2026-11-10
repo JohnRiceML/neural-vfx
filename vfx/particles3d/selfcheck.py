@@ -8,6 +8,9 @@
    solid, everything finite
 3. campfire (preset 1): fire temperature carried (max of the volume temperature vs the grid's), smoke from fuel
 4. determinism: particle state bit-identical on rerun; the deposited volume only differs at float-atomic rounding
+5. the captured CUDA graph gives the same particle state as direct launches
+6. staging regression: 12 ticks queued behind a GPU sleep with the emitter moving every tick give the same particles
+   as 12 synchronized ticks (the old fixed ring of 4 pinned buffers would have uploaded wrong emitter data)
 """
 from __future__ import annotations
 
@@ -98,6 +101,40 @@ def main():
     dd = ((da - b.dens).abs().max() / da.abs().max()).item()
     check("particle state bit-identical on rerun", same, "positions + payload")
     check("deposit equal up to atomic order", dd < 1e-4, f"max rel diff {dd:.2e}")
+
+    # 5. CUDA graph vs direct launches: same particle state
+    _, g = _run(2, 30, count=200_000, graph=True)
+    _, e = _run(2, 30, count=200_000, graph=False)
+    same = torch.equal(wp.to_torch(g.pos), wp.to_torch(e.pos)) and torch.equal(wp.to_torch(g.q), wp.to_torch(e.q))
+    check("graph == direct launches", same, "positions + payload after 30 ticks")
+
+    # 6. staging regression: many ticks queued without a host sync, emitter moving every tick. A fixed ring of 4
+    #    pinned buffers would be overwritten before its copy ran (wrong emitter data); PinnedRing must not be.
+    def moving(queued: bool):
+        from vfx.sim3d import Solver3D, runtime_config
+        cfg = runtime_config(density_dissipation=1.2)
+        s = Solver3D(64, cfg)
+        st = s.reset([])
+        for _ in range(5):                              # warm up (kernel loads, graph capture)
+            st = s.step(st, Forces3D(), SIM_DT)
+        dp = DetailParticles(100_000, 128, config=cfg)
+        dp.step(st, Forces3D(), SIM_DT)
+        torch.cuda.synchronize()
+        if queued:
+            torch.cuda._sleep(200_000_000)              # hold the GPU so the next 12 ticks all queue behind it
+        for i in range(12):
+            f = Forces3D(emitters=[Emitter3D((0.2 + 0.05 * i, 0.15, 0.5), 0.05, density_rate=2.0, temperature=500.0)])
+            dp.step(st, f, SIM_DT)
+            if not queued:
+                torch.cuda.synchronize()
+        torch.cuda.synchronize()
+        return wp.to_torch(dp.pos).clone(), wp.to_torch(dp.q).clone(), dp._ring.waits, len(dp._ring.bufs)
+
+    pq, qq, waits, slots = moving(True)
+    ps, qs, _, _ = moving(False)
+    same = torch.equal(pq, ps) and torch.equal(qq, qs)
+    check("staging safe with 12 queued ticks", same, f"queued == synced particle state; ring grew to {slots} slots, "
+          f"{waits} forced waits")
     print("ALL PASS" if ok else "SOME FAILED")
     return ok
 

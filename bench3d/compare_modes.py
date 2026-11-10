@@ -107,7 +107,7 @@ def discover(extra_ckpts=()) -> list[dict]:
         rows.append({"key": key, "label": label, "available": bool(ok), "reason": None if ok else reason,
                      "sim": sim_, "vol": vol, "detail_q": detail_q, "post": post,
                      "base": "own" if own else ("hr" if sim_ == "hr" else "raw64"),
-                     "matched": not own or not (sim_.get("cfg") != "runtime" or sim_.get("extra")), **kw})
+                     "matched": not own, **kw})       # own sim (any solver option) = not the reference's twin
 
     add("reference", "steered 256^3 (reference)", base_ok and rp is not None, base_reason or e_rp, sim_="hr")
     add("raw", "raw 64^3", base_ok, base_reason)

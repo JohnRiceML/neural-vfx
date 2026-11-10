@@ -5,7 +5,7 @@ from vfx.particles3d import DetailParticles
 dp = DetailParticles(count=1_000_000, out_res=128, config=runtime_config(**preset.sim))   # same SolverConfig3D as the sim
 dp.step(state, forces, SIM_DT)       # after solver.step: seed at emitters, advect, age, cull, deposit
 renderer.draw(dp.volume(), cam, solid)   # Volume(density, temperature) at out_res^3, existing renderer unchanged
-dp.timings                           # {'advect+deposit', 'deposit', 'compose', 'total'} ms (CUDA events, resolved lazily)
+dp.timings                           # {'total'} ms with graph=True; graph=False adds stages + 'k:<kernel>' (CUDA events, lazy)
 ```
 Scripts: `python -m vfx.particles3d.compare --preset K --frames N --out DIR` (side-by-side vs the steered 256³
 reference), `python -m vfx.particles3d.bench --out DIR` (cost table), `python -m vfx.particles3d.selfcheck`.
@@ -66,6 +66,8 @@ alive). The threshold is now relative to the seed mass, and the whole ring stays
 | heat_strength, heat_mod_max | 0.5, 2 | temperature modulation weight (× strength) / cap. Emission is very nonlinear in T |
 | blur | 0 | [1,2,1]³ passes on the deposit (tested: removes the detail along with the grain; not useful) |
 | fused | True | deposit inside the advect kernel; False = separate kernels (stage timing) |
+| sg_every | 4 | noise keyframe interval in ticks (1 = evaluate the noise every tick, the v1 path) |
+| graph | True | whole tick as one CUDA-graph replay; False = direct launches with per-kernel CUDA events |
 
 Recommended: **128³, 1M particles, defaults**. For a sharper look: **192³, 4M particles, strength 0.6**.
 
@@ -139,10 +141,40 @@ plume sizes; 0.25M is visibly coarser) and **≥ 4M at 192³** (with strength 0.
   should work as is, since the detail samples any volume, but it is untested.
 
 ### Cost
-Not measured yet: the lead will provide a quiet GPU window. Run `python -m vfx.particles3d.bench --out DIR`
-(0.25M / 1M / 4M × 128³ / 192³: advect, deposit, compose, total per tick, render of the volume at 1440p,
-VRAM). Per-panel ms printed in the frames were taken at 85-98 % foreign GPU load and are not budget numbers.
-Memory: 28 B per particle (112 MB at 4M), plus about 6 grids of out_res³ float32 (50 MB at 128³, 170 MB at 192³).
+**v1** (the version evaluated above, curl noise evaluated on the whole 128³ velocity grid every tick, direct
+Warp launches). Measured by the lead on an idle GPU with `bench`:
+
+| out_res | 0.25M | 1M | 4M | render 1440p | VRAM |
+|---|---|---|---|---|---|
+| 128³ | 2.52 | 3.20 | 5.92 ms/tick | 0.8-1.15 ms | 48 MiB (1M) |
+| 192³ | 2.74 | 3.78 | 6.36 ms/tick | | 166 MiB |
+
+Advect alone was about 2.2-2.4 ms even at 0.25M, so most of the tick was a fixed cost that does not depend on the
+particle count. Suspects: the 4D curl noise (3 octaves) evaluated for all 2.1M cells of the velocity grid every
+tick, plus about 9 direct launches from Python, whose gaps count in event timing.
+
+**v2** (current code, cost not yet measured):
+* **Noise keyframes** (`sg_every`, default 4). The unit curl-noise field is stored as keyframes at times
+  m · sg_every · dt, in 3 rotating slots of a 128³ × 3 grid (75 MB). The velocity lerps keyframes c → c+1, while
+  1/sg_every of keyframe c+2 (a z slab) is built each tick. The noise cost per tick drops by sg_every, with even
+  load (no spikes). At tfreq 1.5/s, 4 ticks are 0.2 of the noise time period, so the lerp should not show.
+  `sg_every=1` is the v1 path (the same noise values, up to float rounding).
+* **CUDA graph** (`graph=True`). The whole tick is captured once per (state buffers, settings) and replayed.
+  Per-tick values (ring head, RNG stream, cull threshold, emitter count, keyframe phase/slots/slab) moved from
+  kernel arguments into a 16-float device array that is uploaded with the emitters in one pinned copy. The seed
+  launch size is now the constant per-tick recycle count, so the graph shape never changes: threads without an
+  emitter clear their ring slot (v1 left them stale when there were no emitters).
+* **Staging fix**. v1 staged the emitter upload in a fixed ring of 4 pinned buffers indexed by tick. The bug was
+  real: with more than 4 ticks queued without a host sync (a sandbox running ahead of the GPU), buffer `tick % 4`
+  was rewritten before its async copy ran, so a tick could seed with another tick's emitters. Now it uses
+  `vfx.render3d.pinned.PinnedRing`: a slot is reused only after its copy's event has completed, and the ring grows
+  if all slots are in flight. Regression check: `selfcheck` step 6 (12 ticks queued behind `torch.cuda._sleep`,
+  emitter moving every tick, must equal 12 synced ticks bit for bit).
+* Further knobs if more is needed: `sg_oct=2` (octave 3 is at 128 cycles/m, one cell of the 128³ velocity grid,
+  so it is mostly aliased already), `sg_every=8`.
+
+Memory: 28 B per particle (112 MB at 4M), plus about 6 grids of out_res³ float32 (50 MB at 128³, 170 MB at 192³),
+plus 25 MB velocity grid and 75 MB noise keyframes at vel_res 128.
 
 ### Integration into the sandbox (after review)
 `app3d` would add a mode `particles`: construct `DetailParticles(1_000_000, 128, config=solver.config)`, call
