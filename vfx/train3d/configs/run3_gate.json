@@ -1,0 +1,5 @@
+{"name": "run3_gate",
+ "init": "C:/Users/ricej/AppData/Local/neural-vfx/checkpoints/screen3d/run2_holdout_gate05_init.pt",
+ "hypothesis": "Run 3 (8 min fine-tune of run 2, lr 1e-4): the alpha gate |delta| <= 0.5 x alpha is now part of the model (ScreenNetConfig.alpha_gate), so training sees what the runtime does. Run 2 passes every dataset gate but live 1440p frames show dark/purple halos on thin smoke edges; the post-hoc gate removed them. Same losses, hold-out selection (12 train scenarios), wd 0.05. Expect test still beating both baselines (maybe slightly smaller l1/ms_dssim gain), OOD-relative gate <= 1.2, no edge halos live.",
+ "train": {"minutes": 8.0, "frames": 3, "holdout_sequences": 24, "weight_decay": 0.05, "val_every": 300, "lr": 1e-4, "warmup_steps": 50},
+ "loss": {"ssim": 0.3, "speckle": 1.0, "spec_max_frac": 0.3}}

@@ -1,0 +1,5 @@
+{"name": "main_ssim",
+ "hypothesis": "Run 1 (20 min): the probe-A single-frame recipe (64x8, 3x3 HR head, L1 + 0.5 grad + 0.02 low-band log spectrum + 0.5 unwarped temporal change matching, 3-frame windows) plus a 0.3 x MS-SSIM luminance surrogate, 5x longer. Probe A beat both baselines on l1 and spectrum but was 0.4% worse than lr on ms_dssim and failed the OOD-relative L1 gate. Expect ms_dssim below lr (<0.175) at a small spectrum cost (<0.13) and a better OOD l1.",
+ "model": {"use_prev": false},
+ "train": {"minutes": 20.0, "frames": 3},
+ "loss": {"ssim": 0.3}}

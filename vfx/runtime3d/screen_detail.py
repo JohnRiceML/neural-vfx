@@ -4,16 +4,23 @@ Per frame:
   1. pick the processed region: aux["bbox"] = (x0, y0, x1, y1) screen pixels of the effect (or the whole
      frame), grown per axis to the next of a few fixed sizes (`crop_fracs` of the frame side, rounded up to
      `quantum` px) and shifted to stay inside the frame. So at most len(crop_fracs)^2 CUDA graphs exist per
-     frame size (36 by default, ~25 ms each), captured lazily or all at once by `warmup(H, W)`; an orbiting camera
+     frame size (36 by default), all captured on the first frame of a new frame size; an orbiting camera
      never triggers a capture after that.
   2. copy the region of frame / aux / previous output into static buffers (plain slicing, no sync).
-  3. graph: uint8 -> fp16, warp the previous output by the screen velocity (aux, px/frame), optional
-     downscale to `process_scale`, ScreenNet -> Δrgb, bilinear upsample of Δ, add, clamp, -> uint8.
+  3. graph: uint8 -> fp16, pool to `process_scale` exactly like vfx.datagen3d pooled the training data
+     (rgb mean; alpha mean; depth and motion alpha-weighted means, motion x process_scale), ScreenNet -> Δrgb,
+     bilinear upsample of Δ, add, clamp, -> uint8.
   4. output = input frame with the processed region pasted in; it is the "previous output" next frame
-     (two alternating output buffers, so no extra copy).
-aux (all optional, (h,w) or (h,w,2) cuda tensors): "transmittance", "depth" (0..1), "velocity" (px/frame).
+     (two alternating output buffers, so no extra copy). Only used if the net was trained with use_prev.
+aux (CLAUDE.md "Route B training phase", renderer output resolution, all optional):
+  "alpha" (h,w) 0..1, "depth" (h,w) metres, "motion" (2,h,w) output px per SIM_DT (x right, y down), "bbox".
+Checkpoint: ScreenDetail() loads default_screen_checkpoint() when that file exists (identity net otherwise);
+pass checkpoint_path=False (or any arch kwargs) for an untrained net.
 """
 from __future__ import annotations
+
+import math
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
@@ -21,10 +28,15 @@ import torch.nn.functional as F
 from vfx.model3d import AUX_CHANNELS, ScreenNet, ScreenNetConfig, load_screen_net, param_count
 from vfx.runtime3d.volume_upscaler import capture_graph, cudnn_tuned
 
-# the config we would train next (see README)
-DEFAULT_ARCH = dict(width=64, n_blocks=4, trunk_stride=4, hr_feats=4, hr_hidden=8, hr_kernel=1,
-                    use_aux=True, use_prev=True)
-VEL_NORM = 16.0     # px/frame -> network units
+# the trained architecture (vfx/train3d EXPERIMENTS.md); used for untrained instances too
+DEFAULT_ARCH = dict(width=64, n_blocks=8, trunk_stride=4, hr_feats=8, hr_hidden=16, hr_kernel=3,
+                    use_aux=True, use_prev=False, grey_lowfreq=8, alpha_gate=0.5)
+
+
+def default_screen_checkpoint() -> Path:
+    """Where the promoted route B checkpoint lives (written by vfx.train3d; the sandbox looks here)."""
+    from vfx.core.paths import CHECKPOINTS
+    return CHECKPOINTS / "screen3d" / "latest.pt"
 
 
 class ScreenDetail:
@@ -35,8 +47,12 @@ class ScreenDetail:
         self.tune = tune          # cudnn autotune per crop shape: ~1 s per capture and no faster, see README
         self.prewarm = prewarm    # capture every crop size on the first frame of a new frame size
         self.device = torch.device(device)
-        if checkpoint_path:
-            self.model, self.untrained = load_screen_net(checkpoint_path, device), False
+        if checkpoint_path is None and not arch:
+            d = default_screen_checkpoint()
+            checkpoint_path = str(d) if d.is_file() else None
+        self.checkpoint = str(checkpoint_path) if checkpoint_path else None
+        if self.checkpoint:
+            self.model, self.untrained = load_screen_net(self.checkpoint, device), False
         else:
             self.model = ScreenNet(ScreenNetConfig(**{**DEFAULT_ARCH, **arch})).to(self.device)
             self.untrained = True
@@ -47,7 +63,7 @@ class ScreenDetail:
             p.requires_grad_(False)
         self.params = param_count(self.model)
         self.scale = process_scale
-        r = self.model.cfg.trunk_stride
+        r = math.lcm(self.model.cfg.trunk_stride, getattr(self.model.cfg, "grey_lowfreq", 0) or 1)
         self.quantum = max(quantum, int(round(r / process_scale)))
         while (self.quantum * process_scale) % r:
             self.quantum *= 2
@@ -69,24 +85,36 @@ class ScreenDetail:
     def _body(self, key):
         rgb_u8, aux, prev_u8, out_u8 = self._bufs[key]
         ch, cw = key
+        cfg = self.model.cfg
         fmt = torch.channels_last if self.cl else torch.contiguous_format
         rgb = rgb_u8.permute(2, 0, 1).unsqueeze(0).half() * (1.0 / 255.0)
         k = int(round(1.0 / self.scale))
         pool = (lambda t: t) if k == 1 else (lambda t: F.avg_pool2d(t, k))     # downsample first
-        x, xa = pool(rgb), pool(aux.unsqueeze(0))
-        xp = None
-        if self.model.cfg.use_prev:          # warp the previous output at the processed resolution
+        x = pool(rgb)
+        xa = xp = None
+        if cfg.use_aux or (cfg.use_prev and cfg.prev_warp):
+            a = aux.unsqueeze(0)
+            if k == 1:
+                xa = a
+            else:                      # dataset pooling: alpha mean, depth/motion alpha-weighted, motion x scale
+                al = a[:, 0:1].float().clamp(0.0, 1.0)
+                w = pool(al)
+                rest = pool(a[:, 1:4].float() * al) / w.clamp_min(1e-4)
+                rest = rest * (w > 1e-4).float()
+                xa = torch.cat([w, rest[:, 0:1], rest[:, 1:3] * self.scale], 1).half()
+        if cfg.use_prev:
             xp = pool(prev_u8.permute(2, 0, 1).unsqueeze(0).half() * (1.0 / 255.0))
-            h2, w2 = xp.shape[-2:]
-            ys = (torch.arange(h2, device=self.device, dtype=torch.float32) * 2 + 1) / h2 - 1
-            xs = (torch.arange(w2, device=self.device, dtype=torch.float32) * 2 + 1) / w2 - 1
-            yy, xx = torch.meshgrid(ys, xs, indexing="ij")
-            vel = xa[0, 2:4].float() * (VEL_NORM / k)                 # px/frame at this res (x right, y down)
-            grid = torch.stack([xx - vel[0] * (2.0 / w2), yy - vel[1] * (2.0 / h2)], -1)
-            xp = F.grid_sample(xp, grid.unsqueeze(0).half(), mode="bilinear", padding_mode="border",
-                               align_corners=False)
+            if cfg.prev_warp:          # partial alignment by a fraction of the (material + camera) motion
+                h2, w2 = xp.shape[-2:]
+                ys = (torch.arange(h2, device=self.device, dtype=torch.float32) * 2 + 1) / h2 - 1
+                xs = (torch.arange(w2, device=self.device, dtype=torch.float32) * 2 + 1) / w2 - 1
+                yy, xx = torch.meshgrid(ys, xs, indexing="ij")
+                m = xa[0, 2:4].float() * cfg.prev_warp
+                grid = torch.stack([xx - m[0] * (2.0 / w2), yy - m[1] * (2.0 / h2)], -1)
+                xp = F.grid_sample(xp, grid.unsqueeze(0).half(), mode="bilinear", padding_mode="border",
+                                   align_corners=False)
         cvt = (lambda t: None if t is None else t.contiguous(memory_format=fmt))
-        delta = self.model(cvt(x), cvt(xa) if self.model.cfg.use_aux else None, cvt(xp))
+        delta = self.model(cvt(x), cvt(xa) if cfg.use_aux else None, cvt(xp))
         if self.scale != 1.0:
             delta = F.interpolate(delta, size=(ch, cw), mode="bilinear", align_corners=False)
         y = ((rgb + delta).clamp(0.0, 1.0) * 255.0 + 0.5)
@@ -177,13 +205,17 @@ class ScreenDetail:
             aux_b[:, vh:].zero_()
             aux_b[:, :, vw:].zero_()
         rgb_b[:vh, :vw].copy_(frame[y0:y0 + vh, x0:x0 + vw])
-        prev_b[:vh, :vw].copy_(prev_full[y0:y0 + vh, x0:x0 + vw])
-        for i, name in enumerate(("transmittance", "depth")):
+        if self.model.cfg.use_prev:
+            prev_b[:vh, :vw].copy_(prev_full[y0:y0 + vh, x0:x0 + vw])
+        for i, name in ((0, "alpha"), (1, "depth")):
             if name in aux:
                 aux_b[i, :vh, :vw].copy_(aux[name][y0:y0 + vh, x0:x0 + vw])
-        if "velocity" in aux:
-            v = aux["velocity"][y0:y0 + vh, x0:x0 + vw]
-            aux_b[2:4, :vh, :vw].copy_(v.permute(2, 0, 1) * (1.0 / VEL_NORM))
+            else:
+                aux_b[i].zero_()
+        if "motion" in aux:
+            aux_b[2:4, :vh, :vw].copy_(aux["motion"][:, y0:y0 + vh, x0:x0 + vw])
+        else:
+            aux_b[2:4].zero_()
         res = self._run(key)
         ev["net"].record()
         out[y0:y0 + vh, x0:x0 + vw].copy_(res[:vh, :vw])

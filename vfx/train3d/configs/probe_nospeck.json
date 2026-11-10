@@ -1,0 +1,5 @@
+{"name": "probe_nospeck",
+ "hypothesis": "Speckle-fix probe (4 min). Probe A's output carries isolated magenta/dark dots (|delta| up to 0.42, ~145 px per 256^2 frame) at plume edges: the luminance spectrum term is cheapest to satisfy with dots, and the eval spectrum_error rewards them (0.094). Fix: spectrum restricted to the lowest 30% of bins (wavelengths >= ~7 px), a speckle term matching (x - median3x3 x) to the reference (weight 1), MS-SSIM surrogate 0.3. Expect no dots, ms_dssim below lr, spectrum somewhat worse than 0.094 but still below unsharp (0.262).",
+ "model": {"use_prev": false},
+ "train": {"minutes": 4.0, "frames": 3},
+ "loss": {"ssim": 0.3, "speckle": 1.0, "spec_max_frac": 0.3}}
