@@ -196,3 +196,27 @@ def load_sequences(version, split, length) -> torch Dataset
 # vfx/runtime3d — ScreenDetail.infer(frame, aux) keeps its signature; aux is the dict above.
 # vfx/eval3d/metrics.py — image-space metrics (owned by the test engineer; training code calls these).
 ```
+
+## Native runtime (D3D12 + HLSL) — added 2026-11-09, branch `native-runtime`
+Goal: the 64^3 solver, the half-resolution ray-marcher and route B detail running natively (C++ library,
+C API, HLSL compute shaders, DirectML inference), hosted the way Unreal 5 would host them. The Python code
+is the reference: this workstream does not edit `vfx/`, `tests3d/`, `bench3d/`.
+Contract: `native/include/nvfx.h` + `native/README.md` (lead-owned; gate thresholds are listed there).
+Same conventions as `vfx/core/fields3d.py`: layout (C,D,H,W), index [c,z,y,x], y up, world units;
+GPU side Texture3D with texel (x,y,z) = cell (x,y,z).
+
+| Path | Owner |
+|---|---|
+| `native/include/`, `native/README.md`, `native/CMakeLists.txt`, `native/build.ps1` | lead |
+| `native/core/`, `native/sim/` | native solver engineer |
+| `native/tools/`, `native/tests/` | native test engineer |
+| `native/infer/` | native inference engineer |
+| `native/render/` | native render engineer |
+| `native/app/` | native app engineer |
+
+- Build: `powershell -File native/build.ps1` -> `native/build/bin/nvfx.dll` (build dir is git-ignored).
+- Python for reference runs: the MAIN checkout's venv by absolute path
+  (`C:\Users\ricej\OneDrive\Documents\RustGames\neural-vfx\.venv\Scripts\python`), run from this worktree
+  so `import vfx` resolves here. Never edit or install into the main checkout or its venv.
+- Reference dumps and other large files go under `%LOCALAPPDATA%/neural-vfx/native_ref`, never in the repo.
+- No Vulkan SDK, CUDA toolkit or TensorRT SDK on this machine: do not depend on them, do not install them.
