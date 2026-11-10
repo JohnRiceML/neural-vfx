@@ -229,3 +229,25 @@ solver.hires_volume() -> Volume | None      # the finer density + temperature, f
 SolverConfig3D.pressure_mode: "pcg" (default, existing) | "fused"   # fused-kernel fixed V-cycle solve
 ```
 Sandbox modes are additive: keep `raw`, `trilinear`, `neural_vol`, `neural_screen`, `ref128`; add new ones.
+
+### Sim-carried detail phase — additional workstreams (2026-11-09)
+| Path | Owner |
+|---|---|
+| `vfx/correct3d/` (new) | solver-correction engineer — shortlist #5: learned correction so the 64^3 sim's large-scale motion tracks a finer sim |
+| `vfx/particles3d/` (new) | particle-detail engineer — sub-grid detail carried on particles advected by the 64^3 velocity, deposited into a `Volume` |
+Both are feasibility studies delivered as self-contained modules with their own scripts and reports; they do not
+edit `vfx/sim3d`, `vfx/render3d` or `vfx/app3d`. Integration into the sandbox happens after the lead reviews results.
+```python
+# vfx/correct3d/__init__.py
+class VelocityCorrector:                      # opt-in; identity when no checkpoint
+    def __init__(self, checkpoint_path=None, device="cuda"): ...
+    def apply(self, state: FieldState3D, dt: float) -> None      # in-place velocity correction, before/after step (documented)
+    timings: dict[str, float]
+# vfx/particles3d/__init__.py
+class DetailParticles:
+    def __init__(self, count: int, out_res: int = 128, device="cuda", **params): ...
+    def reset(self) -> None
+    def step(self, state: FieldState3D, forces: Forces3D, dt: float) -> None   # seed at emitters, advect, age, cull
+    def volume(self) -> Volume               # density + temperature at out_res^3 for the existing renderer
+    timings: dict[str, float]
+```
