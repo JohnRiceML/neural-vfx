@@ -1,0 +1,4 @@
+{"name": "probe_prev0",
+ "hypothesis": "Temporal-scheme probe B (4 min): previous output as an UNWARPED input, 4-frame self-feedback unrolls from a cold start (prev_0 = lr_0, as the runtime). The net can copy quasi-steady plume detail from its own past (smoother) but risks trailing ghosts on moving cameras: compare flicker/jerk/swim (moving) with probe A.",
+ "model": {"use_prev": true, "prev_warp": 0.0},
+ "train": {"minutes": 4.0, "frames": 4}}

@@ -17,9 +17,19 @@ trilinear upscale, `ScreenDetail` returns the input frame (the last conv is zero
   `warmup(dt=SIM_DT)` is kept for callers; it is now a quick re-run. Load weights after construction only with
   `load_state_dict(sd)` (or call `refresh_weights()` after in-place edits): the fused head keeps an fp32 copy that the
   captured graphs read.
-- `ScreenDetail(checkpoint_path=None, device="cuda", process_scale=0.5, **arch)` — route B.
-  `infer(frame (h,w,3) uint8, aux=None) -> (h,w,3) uint8`. Optional `aux` keys: `bbox` (x0,y0,x1,y1 px of the
-  effect), `transmittance`, `depth` (h,w), `velocity` (h,w,2) px/frame. `timings`, `warmup(H, W)`.
+- `ScreenDetail(checkpoint_path=None, device="cuda", process_scale=0.5, **arch)` — route B, **trained**
+  (vfx/train3d). With no path and no arch kwargs it loads `default_screen_checkpoint()` =
+  `CHECKPOINTS/screen3d/latest.pt` when that file exists (`.untrained` is False), else an identity net;
+  `checkpoint_path=False` forces the untrained net. `infer(frame (h,w,3) uint8, aux=None) -> (h,w,3) uint8`.
+  aux keys (renderer contract, output resolution): `bbox` (x0,y0,x1,y1 px), `alpha` (h,w), `depth` (h,w) metres,
+  `motion` (2,h,w) output px / SIM_DT. Inside the graph they are pooled to `process_scale` exactly as the dataset
+  was built (alpha mean, alpha-weighted depth/motion, motion × process_scale); missing keys are zeros.
+  The trained net is single-frame (`use_prev=False`): no previous-output warp (see train3d EXPERIMENTS.md for why).
+  Shipped checkpoint (2026-11-09): 64×8, stride 4, HR head 3×3, 731k params, `grey_lowfreq` 8 (no large-scale colour
+  shift), `alpha_gate` 0.5 (|Δ| ≤ 0.5·alpha: no halos on background/floor/obstacles). Measured with bench_selfcheck
+  `--only check,recommended` on a SHARED GPU (a game + another python job, 13→74% util): 1/3-screen bbox 1.31 ms p10
+  (1.39 median), whole 1440p frame 2.95 ms; in `vfx.app3d.compare` (domain bbox at orbit distance 1.9, larger crop,
+  guided 256³ sim on the same GPU) 2.2–2.3 ms median.
   Pass the raw bbox: ScreenDetail buckets it itself (callers need no size bucketing).
 - `bench_selfcheck.py` — `.venv/Scripts/python -m vfx.runtime3d.bench_selfcheck [--quick] [--only ...]`.
   Runs correctness checks, then regenerates every table below. Writes `bench_results.json` (small) and prints markdown.

@@ -1,0 +1,4 @@
+{"name": "probe_prev25",
+ "hypothesis": "Temporal-scheme probe C (4 min): as probe B but the previous output is warped by 0.25 x motion (best measured alignment scale on moving cameras, data probe 0). Expect equal or better swim on moving cameras than B, similar on static.",
+ "model": {"use_prev": true, "prev_warp": 0.25},
+ "train": {"minutes": 4.0, "frames": 4}}

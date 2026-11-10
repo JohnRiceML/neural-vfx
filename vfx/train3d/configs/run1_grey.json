@@ -1,0 +1,5 @@
+{"name": "run1_grey",
+ "hypothesis": "Run 1 (20 min): speckle-fix recipe (single frame 64x8, 3x3 HR head; L1 + 0.5 grad + 0.02 spectrum on the lowest 30% of bins + 1.0 luminance speckle term + 0.3 MS-SSIM + 0.5 temporal change) with grey_lowfreq 8: delta structures coarser than 8 px can only change brightness, not colour. The 4-min probe beat both baselines on test but graded OOD fire yellow-green (OOD l1 ratio gate 1.30). Expect OOD fire l1 near lr and the OOD gate <= 1.2, test still beating both baselines, 5x the steps reducing the shuffle lattice.",
+ "model": {"use_prev": false, "grey_lowfreq": 8},
+ "train": {"minutes": 20.0, "frames": 3},
+ "loss": {"ssim": 0.3, "speckle": 1.0, "spec_max_frac": 0.3}}

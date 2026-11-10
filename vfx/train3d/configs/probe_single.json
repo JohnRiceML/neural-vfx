@@ -1,0 +1,4 @@
+{"name": "probe_single",
+ "hypothesis": "Temporal-scheme probe A (4 min): single-frame net (no recurrence), 64x8 + 3x3 HR head, 3-frame windows only for the unwarped temporal change term. Stability should come from being a deterministic function of the smooth lr input: expect jerk/flicker ratios between lr's and hr's and swim well under 1.2.",
+ "model": {"use_prev": false},
+ "train": {"minutes": 4.0, "frames": 3}}

@@ -1,0 +1,5 @@
+{"name": "run2_holdout",
+ "hypothesis": "Run 2 (12 min): run-1 recipe (single frame 64x8, grey_lowfreq 8, L1 + grad + 0.02 spectrum on 30% of bins + speckle + 0.3 MS-SSIM + temporal) with early stopping: 12 of the 96 train scenarios (24 seqs) are held out and the EMA weights with the best hold-out score (l1, MS-SSIM surrogate, spectrum, each relative to lr) are kept; weight decay 1e-4 -> 0.05; 12-min cosine so the LR is already decaying near the 3-5 min optimum run 1 showed. Expect test to beat both baselines on l1, spectrum and ms_dssim (run 1 lost ms_dssim to overfitting) with the OOD-relative gate <= 1.2.",
+ "model": {"use_prev": false, "grey_lowfreq": 8},
+ "train": {"minutes": 12.0, "frames": 3, "holdout_sequences": 24, "weight_decay": 0.05, "val_every": 300},
+ "loss": {"ssim": 0.3, "speckle": 1.0, "spec_max_frac": 0.3}}

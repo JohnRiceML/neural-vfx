@@ -254,9 +254,9 @@ def screen_inputs():
     H, W = SCREEN
     g = torch.Generator(device=DEV).manual_seed(0)
     fr = torch.randint(0, 256, (H, W, 3), device=DEV, dtype=torch.uint8, generator=g)
-    aux = {"velocity": torch.randn(H, W, 2, device=DEV, generator=g),
-           "depth": torch.rand(H, W, device=DEV, generator=g),
-           "transmittance": torch.rand(H, W, device=DEV, generator=g)}
+    aux = {"alpha": torch.rand(H, W, device=DEV, generator=g).half(),                    # renderer aux contract
+           "depth": (0.5 + 3 * torch.rand(H, W, device=DEV, generator=g)).half(),        # metres
+           "motion": (4 * torch.randn(2, H, W, device=DEV, generator=g)).half()}          # output px / step
     return fr, aux
 
 
@@ -359,7 +359,7 @@ def selfcheck() -> dict:
     ref = classical_upscale_3d(st)
     res["untrained_volume_vs_trilinear_density_maxerr"] = (v.density.float() - ref.density.float()).abs().max().item()
     fr, aux = screen_inputs()
-    sd = ScreenDetail(process_scale=0.5)
+    sd = ScreenDetail(False, process_scale=0.5)          # untrained (identity) net, not the default checkpoint
     for _ in range(3):
         o = sd.infer(fr, dict(aux, bbox=BBOX))
     res["untrained_screen_vs_input_maxerr"] = (o.int() - fr.int()).abs().max().item()
