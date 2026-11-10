@@ -1,9 +1,51 @@
-# Neural VFX Engine — v0 2D demo
+# Neural VFX — real-time smoke and fire experiments
 
-Real-time smoke and fire: a 128² Warp solver plus a learned 4× detail network (to 512²), rendered with blackbody fire.
+A research prototype that asked one question: can a cheap 64³ fluid sim be made to look like an expensive 256³ one
+in real time, with a learned detail stage, inside a 6 ms GPU budget on an RTX 5080?
 Design: [SPEC.md](SPEC.md). Conventions and module contracts: [CLAUDE.md](CLAUDE.md).
 
-## Run the demo
+**Status (2026-11-10): wrapped up as a tech demo. It is not game ready** — it runs in Python, in one 1 m box,
+with one fixed light, and has never been integrated into an engine.
+
+![best mode vs raw 64³, smoke plume past a sphere](reports/images/modes/p2_best_vs_raw.png)
+
+## Findings
+| Question | Answer | Evidence |
+|---|---|---|
+| Does a learned 4× detail network work in 2D? | **Yes.** 79% lower spectrum error than bicubic at 60.7 fps, ~1.8 ms GPU per frame. | section "2D demo" below, vfx/train/EXPERIMENTS.md |
+| Does a learned detail network work in 3D? | **No, not in budget.** A volumetric 64³→256³ upscaler is too slow unless the volume is sparse; a screen-space network fits the budget but only sharpens edges and adds no wisps. A teacher with 5× the compute, a sharper 320³ target and adversarial training did not change that. | vfx/train3d/EXPERIMENTS.md |
+| What does produce fine detail in 3D? | **Detail carried by the sim, no network:** a 128³ smoke field, 1M particles and advected noise, all moved by the 64³ velocity. 5–9× closer to the 256³ reference than the raw sim on our metrics. | bench3d/results/MODES.md |
+| What does it cost? | **About 2 ms GPU per frame** for the best mode (softer 128³-smoke mode: about 1 ms) in the sandbox; a direct 256³ sim step is 43 ms. | cost table below |
+| Is a learned solver correction worth it? | **No.** One classical parameter (`confinement_ref_res`) fixes most of the 64³ over-stirring; the learned correction adds 11% with no visible difference. | vfx/correct3d/README.md |
+| How does it compare with Unreal's Niagara Fluids? | **Unmeasured.** From published sources only: likely ahead on live cost and pressure solve, far behind on lighting, collision, caching and artist tools. No like-for-like test was run. | reports/Niagara Fluids versus our pipeline.md |
+
+Method lessons that cost us time: fluid velocity is not image motion (use camera-only reprojection); flicker metrics
+reward blur; pixel-aligned losses and gates reject real detail that is shifted by two pixels, so quality is scored with
+shift-tolerant metrics (`vfx/eval3d`).
+
+### Pictures (left | right, 64³ sim unless stated; the HUD shows GPU cost)
+| | Campfire | Smoke past a sphere |
+|---|---|---|
+| best mode \| raw | ![](reports/images/modes/p1_best_vs_raw.png) | ![](reports/images/modes/p2_best_vs_raw.png) |
+| soft 128³ smoke \| real 128³ sim | ![](reports/images/modes/p1_soft_vs_ref128.png) | ![](reports/images/modes/p2_soft_vs_ref128.png) |
+| particles \| screen-space network | ![](reports/images/modes/p1_particles_vs_neural.png) | ![](reports/images/modes/p2_particles_vs_neural.png) |
+
+All four scenes: reports/images/modes/. Close-up crops against the 256³ reference: reports/images/best_vs_reference_crops.png.
+
+### What is not done
+- Fire is the weak spot: particle modes put a speckled grain into flames, and they sit shorter than the reference.
+- No engine integration, scene lighting, collision with game geometry, level of detail, caching or artist tools.
+- Tested with one effect, on one GPU (RTX 5080). Nothing on weaker cards or consoles.
+- A native D3D12 + DirectML runtime (no Python) is on branch `native-runtime`. It has only the screen-space network
+  path, and its numbers have not been independently verified.
+- Datasets and checkpoints are not in the repo; the pipeline commands below rebuild them.
+
+### Setup
+Windows 11, RTX-class GPU, Python venv with PyTorch (CUDA) and NVIDIA Warp 1.19. Big artifacts live in
+`%LOCALAPPDATA%/neural-vfx` (override with `VFX_DATA`).
+
+## 2D demo
+### Run it
 ```
 .venv/Scripts/python -m vfx.app.main
 ```
@@ -29,7 +71,7 @@ Design: [SPEC.md](SPEC.md). Conventions and module contracts: [CLAUDE.md](CLAUDE
 ```
 .venv/Scripts/python -m vfx.datagen.build --version v3 --guided --n-train 200 --n-test 32 --n-ood 32 --frames 16   # ~2 min, 5.9 GB in %LOCALAPPDATA%/neural-vfx
 .venv/Scripts/python -m vfx.train.train_seq --config vfx/train/configs/v3_seq_ft.json  # 15 min per run
-.venv/Scripts/python -m pytest tests -q
+.venv/Scripts/python -m pytest tests -q          # set VFX_DATASET=v3 first; the default v1 dataset predates the current solver
 .venv/Scripts/python -m bench.run
 ```
 
