@@ -481,3 +481,280 @@ def test_stress_1000_steps_fire_and_impulses(sim):
             assert dmax < 1e3, f"density blow-up {dmax:.1f} at step {i + 1}"
             assert tmax < 1e4, f"temperature blow-up {tmax:.0f} K at step {i + 1}"
     print(f"after 1000 steps: umax {umax:.2f} m/s, dmax {dmax:.2f}, Tmax {tmax:.0f} K")
+
+
+# ============================================================================= sim-carried detail phase
+# CLAUDE.md "Sim-carried detail phase": opt-in solver paths, defaults unchanged and BIT-IDENTICAL.
+#   Solver3D(res, config, device, scalar_res=None|128); solver.hires_volume() -> Volume | None
+#   SolverConfig3D.pressure_mode: "pcg" (default) | "fused"
+#
+# Default-path hashes: sha256 of state.data (float32 bytes) after 1 / 30 / 120 steps of `_scripted_run`
+# (64^3, sphere obstacle, fire emitter, impulses every 17 steps, wind). Recorded by the test engineer on
+# 2026-11-09 BEFORE any sim-carried-detail solver change (vfx/sim3d files last modified 16:10, version
+# "sim3d-warp-0.1.0"), on the environment below. Bit-exact hashes are only meaningful on the same GPU /
+# torch / warp build, so the test skips (with the reason) on a different environment.
+DEFAULT_PATH_HASHES = {
+    1: "06d785b40a77148a783adcda59510246c6874cc5c5adb906103888e02f4df1fc",
+    30: "99e634ff247cd9b468875d85822dee02c9ee740ad1ebe1686d8cba5a0d51999a",
+    120: "940e2b56268e8ff3a83eb1643731afd4207741726397eb20d757fef3a9d64e77",
+}
+# Same run with vfx.sim3d.runtime_config() (the sandbox's / run_pair's 64^3 setting), recorded at the same time.
+RUNTIME_PATH_HASHES = {
+    1: "79b3e8a646ab1a568a0fbb34c84ecfa1aa613ee3ac6a7d4918ccbec6c67acab6",
+    30: "f25a1f5ae0217a56907d438398ee8fdd1fcb68453e7f371482c8928c06a021d1",
+    120: "8a4e6e9796563d518dea3bb864eb3de1221ac885198b815e78d94ab991caf85d",
+}
+HASH_ENV = {"gpu":"NVIDIA GeForce RTX 5080", "torch": "2.11.0+cu128", "warp": "1.19.0"}
+FINE_MASS_TOL = 1e-3            # contract: fine-field mass within 0.1% over 1000 steps
+RESTRICT_TOL = 0.05             # this file: rel L1 of avgpool(fine) vs the 64^3 density (stated, no spec number)
+
+
+def _hash_env_or_skip():
+    import warp as wp
+    env = {"gpu": torch.cuda.get_device_name(), "torch": torch.__version__, "warp": wp.config.version}
+    if env != HASH_ENV:
+        pytest.skip(f"stored default-path hash was recorded on {HASH_ENV}; this machine is {env}")
+
+
+def _hashes_of_run(make_solver, steps=120, at=(1, 30, 120)):
+    import hashlib
+    s = make_solver()
+    st = s.reset(sphere_obstacle())
+    out = {}
+    for i in range(steps):
+        f = Forces3D(emitters=[Emitter3D(pos=(0.5, 0.12, 0.5), radius=0.06, density_rate=2.0, temperature=1300.0,
+                                         fuel_rate=1.5, velocity=(0.0, 1.0, 0.0))],
+                     impulses=[Impulse3D(pos=(0.3, 0.5, 0.4), radius=0.1, velocity=(2.0, 0.5, -1.0))]
+                     if i % 17 == 0 else [],
+                     wind=(0.2, 0.0, 0.1))
+        st = s.step(st, f, SIM_DT)
+        if i + 1 in at:
+            out[i + 1] = hashlib.sha256(st.data.contiguous().cpu().numpy().tobytes()).hexdigest()
+    return out
+
+
+def test_default_path_bit_identical_to_recorded_hash(sim):
+    """The default Solver3D(64) must reproduce the hashes recorded before the opt-in paths were added."""
+    _hash_env_or_skip()
+    got = _hashes_of_run(lambda: sim.Solver3D(RES))
+    bad = {k: got[k][:12] for k in DEFAULT_PATH_HASHES if got[k] != DEFAULT_PATH_HASHES[k]}
+    assert not bad, f"default solver path changed: steps {sorted(bad)} differ from the recorded hashes ({bad})"
+
+
+def test_runtime_config_path_bit_identical_to_recorded_hash(sim):
+    _hash_env_or_skip()
+    if not hasattr(sim, "runtime_config"):
+        pytest.skip("vfx.sim3d.runtime_config not exported")
+    got = _hashes_of_run(lambda: sim.Solver3D(RES, sim.runtime_config()))
+    bad = {k: got[k][:12] for k in RUNTIME_PATH_HASHES if got[k] != RUNTIME_PATH_HASHES[k]}
+    assert not bad, f"runtime_config() solver path changed: steps {sorted(bad)} differ from the recorded hashes"
+
+
+def _accepts_kw(fn, name):
+    import inspect
+    try:
+        return name in inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def test_explicit_defaults_bit_identical(sim):
+    """Passing the documented defaults explicitly (scalar_res=None, pressure_mode='pcg') == the default path."""
+    _hash_env_or_skip()
+    kw = {}
+    if _accepts_kw(sim.Solver3D.__init__, "scalar_res"):
+        kw["scalar_res"] = None
+    has_mode = hasattr(sim.SolverConfig3D(), "pressure_mode")
+    if not kw and not has_mode:
+        pytest.skip("neither scalar_res nor pressure_mode exists yet")
+    cfg = make_config(sim, pressure_mode="pcg") if has_mode else None
+    got = _hashes_of_run(lambda: sim.Solver3D(RES, cfg, **kw))
+    assert got == DEFAULT_PATH_HASHES, "explicit default options do not reproduce the recorded default path"
+    if _accepts_kw(sim.Solver3D.__init__, "scalar_res"):
+        assert sim.Solver3D(RES).hires_volume() is None, "hires_volume() must be None without scalar_res"
+
+
+# ----------------------------------------------------------------------------- pressure_mode="fused"
+def _fused_or_skip(sim):
+    if not hasattr(sim.SolverConfig3D(), "pressure_mode"):
+        pytest.skip("SolverConfig3D.pressure_mode not implemented yet (sim-carried detail phase)")
+    return make_config(sim, pressure_mode="fused")
+
+
+def _fused_label():
+    """Contract: fused either meets div < 1e-4 or is REPORTED as a labelled lower-quality level with its
+    number. The label is looked for in vfx/sim3d/README.md (the solver owner's documentation)."""
+    import pathlib
+    p = pathlib.Path(__file__).resolve().parents[1] / "vfx" / "sim3d" / "README.md"
+    txt = p.read_text(encoding="utf-8").lower() if p.exists() else ""
+    return "fused" in txt and ("lower-quality" in txt or "lower quality" in txt or "quality level" in txt)
+
+
+def _check_fused_div(m, what):
+    print(f"pressure_mode='fused' {what}: max normalized div {m:.3e} (spec {DIV_TOL})")
+    if m < DIV_TOL:
+        return
+    if _fused_label():
+        pytest.xfail(f"fused {what}: div {m:.3e} >= {DIV_TOL}; documented as a lower-quality level in sim3d README")
+    pytest.fail(f"fused {what}: max normalized div {m:.3e} >= {DIV_TOL} and vfx/sim3d/README.md does not label "
+                f"fused as a lower-quality level")
+
+
+@pytest.mark.parametrize("obstacles", [no_obstacles, sphere_obstacle], ids=["open", "sphere"])
+def test_fused_divergence_after_projection(sim, obstacles):
+    cfg = _fused_or_skip(sim)
+    s = sim.Solver3D(RES, cfg)
+    st = s.reset(obstacles())
+    v = smooth_noise(RES, 3, seed=1, amp=2.0) + torch.tensor([0.8, -0.3, 0.4], device=DEV)[:, None, None, None]
+    st.velocity.copy_(v * fluid_mask(st))
+    st = s.project(st)
+    check_finite(st, "fused project")
+    div = s.divergence(st)
+    assert torch.all(div[st.solid > 0.5] == 0)
+    _check_fused_div(div.max().item(), f"project ({obstacles.__name__})")
+
+
+@pytest.mark.parametrize("obstacles", [no_obstacles, sphere_obstacle], ids=["open", "sphere"])
+def test_fused_divergence_after_full_steps(sim, obstacles):
+    cfg = _fused_or_skip(sim)
+    s = sim.Solver3D(RES, cfg)
+    st = s.reset(obstacles())
+    f = Forces3D(emitters=[Emitter3D(pos=(0.5, 0.15, 0.5), radius=0.07, density_rate=2.0,
+                                     temperature=900.0, velocity=(0.0, 1.0, 0.0))])
+    for _ in range(60):
+        st = s.step(st, f, SIM_DT)
+    check_finite(st, "fused 60 steps")
+    _check_fused_div(s.divergence(st).max().item(), f"60 steps ({obstacles.__name__})")
+
+
+def test_fused_deterministic_and_finite(sim):
+    cfg = _fused_or_skip(sim)
+    a = _hashes_of_run(lambda: sim.Solver3D(RES, cfg), steps=120, at=(120,))
+    b = _hashes_of_run(lambda: sim.Solver3D(RES, cfg), steps=120, at=(120,))
+    assert a == b, "fused pressure path is not bit-identical between identical runs"
+
+
+# ----------------------------------------------------------------------------- scalar_res=128
+FINE = 128
+
+
+def _fine_or_skip(sim):
+    if not _accepts_kw(sim.Solver3D.__init__, "scalar_res") or not hasattr(sim.Solver3D, "hires_volume"):
+        pytest.skip("Solver3D(scalar_res=...) / hires_volume() not implemented yet (sim-carried detail phase)")
+
+
+def _fine_mass(vol, solid_fine=None):
+    d = vol.density.float()
+    if solid_fine is not None:
+        d = d * (solid_fine < 0.5)
+    return float(d.double().sum().item()) * (DOMAIN_SIZE / d.shape[0]) ** 3
+
+
+def _fine_closed_box_run(sim, obstacles, steps):
+    """Fill the fine field through the public interface (an emitter), stop the sources, then run `steps`
+    sourceless steps with dissipation 0. Returns (fine mass before, fine mass after, solver, state)."""
+    s = sim.Solver3D(RES, make_config(sim, density_dissipation=0.0), scalar_res=FINE)
+    st = s.reset(obstacles)
+    fill = Forces3D(emitters=[Emitter3D(pos=(0.5, 0.2, 0.5), radius=0.08, density_rate=2.0, temperature=700.0,
+                                        velocity=(0.0, 0.6, 0.0))])
+    for _ in range(30):
+        st = s.step(st, fill, SIM_DT)
+    vol = s.hires_volume()
+    assert vol is not None, "hires_volume() returned None with scalar_res set"
+    assert tuple(vol.density.shape) == (FINE,) * 3 and tuple(vol.temperature.shape) == (FINE,) * 3
+    solid_f = rasterize_obstacles_3d(obstacles, FINE, DEV)
+    m0 = _fine_mass(vol, solid_f)
+    assert m0 > 0, "emitter put no smoke in the fine field"
+    for _ in range(steps):
+        st = s.step(st, Forces3D(), SIM_DT)
+    m1 = _fine_mass(s.hires_volume(), solid_f)
+    return m0, m1, s, st
+
+
+@pytest.mark.parametrize("obstacles", [no_obstacles, sphere_obstacle], ids=["open", "sphere"])
+def test_scalar_res_fine_mass_conserved(sim, obstacles):
+    _fine_or_skip(sim)
+    m0, m1, s, st = _fine_closed_box_run(sim, obstacles(), 1000)
+    vol = s.hires_volume()
+    assert torch.isfinite(vol.density).all() and torch.isfinite(vol.temperature).all()
+    check_finite(st)
+    rel = abs(m1 - m0) / m0
+    print(f"scalar_res={FINE} {obstacles.__name__}: fine mass {m0:.5f} -> {m1:.5f} (rel {rel:.3e})")
+    assert rel < FINE_MASS_TOL, f"fine-field mass changed {rel * 100:.3f}% over 1000 steps (> 0.1%)"
+
+
+def test_scalar_res_restriction_consistent(sim):
+    """The 64^3 density/temperature the solver keeps (and uses for buoyancy) must be consistent with the
+    fine field: avgpool2(fine) vs coarse, rel L1 < RESTRICT_TOL, and mass equal within 0.1%."""
+    _fine_or_skip(sim)
+    s = sim.Solver3D(RES, scalar_res=FINE)
+    st = s.reset(sphere_obstacle())
+    f = Forces3D(emitters=[Emitter3D(pos=(0.5, 0.12, 0.5), radius=0.07, density_rate=2.0, temperature=1000.0,
+                                     velocity=(0.0, 1.0, 0.0))])
+    for _ in range(90):
+        st = s.step(st, f, SIM_DT)
+    vol = s.hires_volume()
+    fluid = fluid_mask(st)
+    rd = F.avg_pool3d(vol.density.float()[None, None], 2)[0, 0] * fluid
+    rt = F.avg_pool3d(vol.temperature.float()[None, None], 2)[0, 0]
+    cd = st.ch("density") * fluid
+    l1d = ((rd - cd).abs().sum() / cd.abs().sum().clamp(min=1e-12)).item()
+    ex_c = (st.ch("temperature") - AMBIENT_TEMP) * fluid
+    l1t = (((rt - AMBIENT_TEMP) * fluid - ex_c).abs().sum() / ex_c.abs().sum().clamp(min=1e-12)).item()
+    mrel = abs(rd.double().sum().item() - cd.double().sum().item()) / max(cd.double().sum().item(), 1e-12)
+    print(f"restriction vs 64^3: density rel L1 {l1d:.4f}, excess-T rel L1 {l1t:.4f}, mass rel {mrel:.3e}")
+    assert l1d < RESTRICT_TOL, f"avgpool(fine density) differs from 64^3 density by rel L1 {l1d:.3f}"
+    assert l1t < RESTRICT_TOL, f"avgpool(fine temperature) differs from 64^3 temperature by rel L1 {l1t:.3f}"
+    assert mrel < MASS_TOL, f"fine and coarse smoke mass differ by {mrel * 100:.3f}%"
+
+
+def test_scalar_res_no_smoke_inside_obstacles(sim):
+    _fine_or_skip(sim)
+    s = sim.Solver3D(RES, scalar_res=FINE)
+    obs = [Obstacle3D("box", (0.5, 0.55, 0.5), (0.18, 0.06, 0.18))]
+    st = s.reset(obs)
+    f = Forces3D(emitters=[Emitter3D(pos=(0.5, 0.2, 0.5), radius=0.07, density_rate=3.0, temperature=1200.0,
+                                     velocity=(0.0, 2.0, 0.0))])
+    for _ in range(120):
+        st = s.step(st, f, SIM_DT)
+    sf = rasterize_obstacles_3d(obs, FINE, DEV)
+    deep = (-F.max_pool3d(-sf[None, None], 5, 1, 2)[0, 0]) > 0.5
+    d_in = s.hires_volume().density.float()[deep].abs().max().item()
+    print(f"fine density inside obstacle (2+ fine cells deep): {d_in:.2e}")
+    assert d_in < 1e-3
+
+
+def test_scalar_res_deterministic(sim):
+    _fine_or_skip(sim)
+    import hashlib
+
+    def run():
+        s = sim.Solver3D(RES, scalar_res=FINE)
+        _hashes_of_run(lambda: s, steps=60, at=(60,))
+        v = s.hires_volume()
+        return hashlib.sha256(torch.cat([v.density.float().flatten(), v.temperature.float().flatten()])
+                              .cpu().numpy().tobytes()).hexdigest()
+    assert run() == run(), "scalar_res fine field differs between identical runs"
+
+
+def test_scalar_res_stress_1000_steps_finite(sim):
+    _fine_or_skip(sim)
+    s = sim.Solver3D(RES, scalar_res=FINE)
+    st = s.reset([Obstacle3D("sphere", (0.35, 0.6, 0.5), (0.09, 0.09, 0.09))])
+    g = torch.Generator().manual_seed(0)
+    for i in range(1000):
+        imp = []
+        if i % 5 == 0:
+            p = torch.rand(3, generator=g).tolist()
+            v = ((torch.rand(3, generator=g) * 2 - 1) * 8.0).tolist()
+            imp = [Impulse3D(pos=tuple(p), radius=0.12, velocity=tuple(v))]
+        f = Forces3D(emitters=[Emitter3D(pos=(0.5, 0.1, 0.5), radius=0.09, density_rate=5.0, temperature=2000.0,
+                                         fuel_rate=5.0, velocity=(0.0, 3.0, 0.0))], impulses=imp)
+        st = s.step(st, f, SIM_DT)
+        if i % 100 == 99:
+            check_finite(st, f"at step {i + 1}")
+            v = s.hires_volume()
+            nb = (~torch.isfinite(v.density)).sum().item() + (~torch.isfinite(v.temperature)).sum().item()
+            assert nb == 0, f"{nb} non-finite fine values at step {i + 1}"
+            assert v.density.float().min().item() >= -1e-4, "negative fine density"
+            assert v.density.float().max().item() < 1e3

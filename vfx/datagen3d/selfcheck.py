@@ -25,7 +25,7 @@ from vfx.core import paths
 from . import render as R
 from .build import SEED_BASE, SEED_SPAN
 from .dataset import load_sequences
-from .runner import is_complete, scenario_dir
+from .runner import is_complete, load_arrays, scenario_dir
 
 FAIL: list[str] = []
 
@@ -137,7 +137,19 @@ def check_version(version: str, png_dir: str | None, max_scn: int | None):
     card_p = root / "card.json"
     if card_p.exists():
         card = json.loads(card_p.read_text())
-        check(card["bytes"] <= 4e9, f"size {card['bytes'] / 1e9:.2f} GB <= 4 GB")
+        lim = card.get("size_limit_gb", 4.0)
+        check(card["bytes"] <= lim * 1e9, f"size {card['bytes'] / 1e9:.2f} GB <= {lim} GB"
+              + (f" (lossless x{card['compression_ratio']:.2f})" if card.get("compression_ratio") else ""))
+        if card.get("tag_counts"):
+            for sp, tc in card["tag_counts"].items():
+                n = tc["_scenarios"]
+                cc = card["camera_tag_counts"][sp]
+                print(f"  info {sp}: {n} scenarios, {cc['_sequences']} sequences; large_fire {tc.get('large_fire', 0) / n:.0%}, "
+                      f"scenario closeup {tc.get('closeup', 0) / n:.0%}, large_fire_closeup {tc.get('large_fire_closeup', 0) / n:.0%}, "
+                      f"smoke_only {tc.get('smoke_only', 0) / n:.0%}; camera closeup {cc.get('closeup', 0) / cc['_sequences']:.0%}, "
+                      f"fill {cc.get('fill', 0) / cc['_sequences']:.0%}, flame_dominated {cc.get('flame_dominated', 0) / cc['_sequences']:.0%}")
+        if card.get("flagged"):
+            print(f"  info flagged sequences (out of the validity ranges, kept): {card['flagged']}")
     shifts, err0s, absd, tracks = [], [], [], []
     scans = {False: [], True: []}
     n_done = n_missing = 0
@@ -151,10 +163,8 @@ def check_version(version: str, png_dir: str | None, max_scn: int | None):
             n_done += 1
             meta = json.loads((d / "meta.json").read_text())
             K, T = meta["n_cams"], meta["frames"]
-            lr = np.load(d / "lr.npy")
-            hr = np.load(d / "hr.npy")
-            aux = np.load(d / "aux.npy")
-            ha = np.load(d / "hr_alpha.npy")
+            A = load_arrays(d)
+            lr, hr, aux, ha = A["lr"], A["hr"], A["aux"], A["hr_alpha"]
             s = R.CROP
             ok = (lr.shape == (K, T, 3, s, s) and hr.shape == lr.shape and aux.shape == (K, T, 4, s, s)
                   and ha.shape == (K, T, s, s) and lr.dtype == np.uint8 and hr.dtype == np.uint8
@@ -211,7 +221,7 @@ def check_version(version: str, png_dir: str | None, max_scn: int | None):
               f"{tr[:, 1].max():.3f}; velocity median {np.median(tr[:, 2]):.3f} max {tr[:, 2].max():.3f}")
     ds = load_sequences(version, "train", 8)
     if len(ds):
-        it = ds[0]
+        it = ds[len(ds) // 2]
         check(tuple(it["lr"].shape) == (8, 3, R.CROP, R.CROP) and it["lr"].dtype == torch.uint8
               and tuple(it["aux"].shape) == (8, 4, R.CROP, R.CROP) and it["aux"].dtype == torch.float16
               and it["hr"].shape == it["lr"].shape, f"loader item shapes ({len(ds)} train windows of 8)")

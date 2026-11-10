@@ -10,17 +10,20 @@ cameras. Output: versioned uint8 image sequences + LR aux buffers under `DATA_RO
 .venv/Scripts/python -m vfx.datagen3d.selfcheck --version s3d_v1 [--png-dir DIR]
 .venv/Scripts/python -m vfx.datagen3d.selfcheck --mini                    # tiny build (s3d_selfcheck) + checks
 .venv/Scripts/python -m vfx.datagen3d.tune_guide --out DIR                # guidance sweep (evidence below)
+.venv/Scripts/python -m vfx.datagen3d.build --version s3d_v2              # v2 (see "s3d_v2" below), resumable
+.venv/Scripts/python -m vfx.datagen3d.tune_guide --out DIR --sampler v2 --configs unguided,c16 --scenes train:17,...
 ```
 
 | Module | Content |
 |---|---|
-| `scenarios.py` | `Scenario3D`, `sample_scenario(seed, split, frames=16)`; all ranges |
+| `scenarios.py` | `Scenario3D`, `sample_scenario(seed, split, frames=16, sampler="v1"\|"v2")`, `scene_tags`; all ranges |
 | `guide3d.py` | `GuideConfig3D`, `Guide3D` (velocity + multiplicative scalar relaxation), `tracking_error` |
 | `sim.py` | `run_pair`: LR 64³ (runtime config) + HR 256³ (full quality, guided), solver/buffer cache |
-| `render.py` | runtime constants, orbit cameras, crop policy, `PairRenderer` (render, crop, pool) |
-| `runner.py` | `run(scenario, out_dir)` writes one scenario dir (meta.json last) |
-| `build.py` | CLI, seed splits, size / free-disk guards, card.json |
-| `dataset.py` | `load_sequences(version, split, length, stride=1)` |
+| `render.py` | runtime constants, orbit cameras (`sample_cameras` v1, `sample_cameras_v2`), crop policy, `PairRenderer` |
+| `runner.py` | `run(scenario, out_dir, cam_policy, n_spare, storage)` writes one scenario dir (meta.json last); camera validity + tags; `load_arrays` |
+| `pack.py` | lossless per-frame compressed scenario container `data.pack` (stdlib zlib + numpy) |
+| `build.py` | CLI, seed splits, v1-scenario import, size / free-disk guards, card.json |
+| `dataset.py` | `load_sequences(version, split, length, stride=1)` (npy or pack), `ds.tags(i)`, `ds.meta(i)` |
 | `selfcheck.py`, `tune_guide.py`, `png.py` | checks, guidance sweep, tiny PNG writer (no PIL in the venv) |
 
 ## Guidance (`guide3d.py`, port of `vfx/datagen/guide.py`)
@@ -82,6 +85,9 @@ splits.json    {"train": [seeds], "test": [...], "ood": [...]}    train 0.., tes
   meta.json     scenario, tags, solver version, guidance, tracking_16 (per step), per camera: orbit params,
                 moving flag, crop_xy_out, per-frame camera (index 0 = one step BEFORE frame 0),
                 domain_bbox_out (what the sandbox passes ScreenDetail), alpha / motion stats
+                (v2 adds: per-camera "stats", "tags", "flagged"; scenario "rejected_cams", "storage",
+                "cam_policy", "imported_from" for scenarios copied from v1)
+  data.pack     (s3d_v2: REPLACES the four .npy) the same four arrays, lossless, see "s3d_v2 storage"
 ```
 K = 2 cameras, T = 16 consecutive sim steps (frame t−1 → t is one SIM_DT; frame i = state after solver
 step `start_step + i`). aux is pooled from the renderer's output-res aux: alpha = mean, depth and motion =

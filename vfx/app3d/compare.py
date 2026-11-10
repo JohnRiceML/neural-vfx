@@ -10,6 +10,13 @@ Panels (left to right), all rendered by the same VolumeRenderer settings and cam
                           exactly what the sandbox feeds it; runs every sim step (temporal state)
   4. guided 256³ (ref)    render of vfx.datagen3d's 256³ sim guided to follow the 64³ run (the route B
                           training target); skipped cleanly if vfx.datagen3d.sim.run_pair is unavailable
+With --detail (sim-carried detail phase; off by default, so the default output is unchanged) the
+reference moves to the right and these panels are inserted before it:
+  4. 64³ + detail          the raw 64³ state rendered with vfx.detail3d.AdvectedDetail (stepped with the
+                           64³ velocity every sim step, including warm-up)
+  5. detail + route B      ScreenDetail (own instance, own temporal state) on panel 4's render + its aux
+  6. hires + detail        Solver3D(64, scalar_res=128).hires_volume() + its own AdvectedDetail; only if
+                           vfx.sim3d supports it (else skipped with a note)
 One frame = one sim step (SIM_DT). Writes frame_XXXX.png (labelled strip, per-panel GPU ms),
 contact_sheet.png (up to 8 frames x panels) and timings.json. ms are CUDA-event GPU times of the panel's
 own work (render [+ upscale or + detail]); the guided 256³ sim cost is reported but is an offline reference.
@@ -120,6 +127,88 @@ class Timer:
         return last
 
 
+class DetailPanels:
+    """--detail: advected-detail panels (sim-carried detail phase). Stepped every sim step (warm-up
+    included) so the detail coordinates are as old as in the sandbox."""
+
+    def __init__(self, a, pre, backends, W, H, rb_label):
+        from vfx.detail3d import AdvectedDetail
+        from vfx.render3d import VolumeRenderer
+        self.notes = []
+        self.det = AdvectedDetail(64, quality=a.detail_quality)
+        self.names = [f"64³ + detail ({a.detail_quality})"]
+        self.rend = {"det": VolumeRenderer((H, W), march_scale=a.march_scale)}
+        self.sd = None
+        if not a.no_route_b_detail:
+            from vfx.app3d.backends import make_screen_detail
+            self.sd, _ = make_screen_detail(a.screen_ckpt)
+            self.names.append("detail + " + rb_label)
+        self.hs = self.hst = self.hdet = None
+        try:
+            import inspect
+            S = backends.Solver
+            if "scalar_res" in inspect.signature(S.__init__).parameters and hasattr(S, "hires_volume"):
+                cfg = backends.runtime_config(**pre.sim) if pre.sim else backends.runtime_config()
+                self.hs = S(64, cfg, device="cuda", scalar_res=128)
+                self.hst = self.hs.reset(pre.obstacles)
+                self.hdet = AdvectedDetail(64, quality=a.detail_quality)
+                self.rend["hires"] = VolumeRenderer((H, W), march_scale=a.march_scale)
+                self.names.append(f"hires 128³ + detail ({a.detail_quality})")
+            else:
+                self.notes.append("hires + detail panel skipped: sim3d has no scalar_res / hires_volume()")
+        except Exception as e:
+            self.hs = None
+            self.notes.append(f"hires + detail panel skipped: {type(e).__name__}: {str(e)[:100]}")
+        self.pre = pre
+        self.W, self.H = W, H
+        self.imgs = {}
+
+    def warm(self, lr):
+        from vfx.core.fields3d import Forces3D
+        self.det.step(lr, SIM_DT)
+        if self.hs is not None:
+            self.hst = self.hs.step(self.hst, Forces3D(emitters=list(self.pre.emitters), wind=tuple(self.pre.wind)), SIM_DT)
+            self.hdet.step(self.hst, SIM_DT)
+
+    def tick(self, tm, lr, cam, prev_cam, solid, step):
+        from vfx.core.fields3d import Forces3D
+        tm.run("detail step", lambda: self.det.step(lr, SIM_DT))
+        vol = Volume(lr.data[CH3["density"]], lr.data[CH3["temperature"]])
+        r = self.rend["det"]
+        if self.sd is not None:
+            img, aux = tm.run("detail render", lambda: r.draw(vol, cam, solid, return_aux=True, velocity=lr.velocity,
+                                                              prev_camera=prev_cam, detail=self.det))
+            img = img.clone()
+            trans = r.hdr[..., 3]
+            if trans.shape != (self.H, self.W):
+                trans = F.interpolate(trans[None, None], size=(self.H, self.W), mode="bilinear", align_corners=False)[0, 0]
+            aux = {"bbox": screen_bbox(cam, self.W, self.H), "transmittance": trans, **aux}
+            self.imgs["det"] = img
+            self.imgs["detB"] = tm.run("detail route B", lambda: self.sd.infer(img, aux)).clone()
+        else:
+            self.imgs["det"] = tm.run("detail render", lambda: r.draw(vol, cam, solid, detail=self.det)).clone()
+        if self.hs is not None:
+            f = Forces3D(emitters=list(self.pre.emitters), wind=tuple(self.pre.wind))
+            self.hst = tm.run("hires sim", lambda: self.hs.step(self.hst, f, SIM_DT))
+            tm.run("hires detail step", lambda: self.hdet.step(self.hst, SIM_DT))
+            hv = self.hs.hires_volume()
+            if hv is not None:
+                self.imgs["hires"] = tm.run("hires render", lambda: self.rend["hires"].draw(hv, cam, solid, detail=self.hdet)).clone()
+
+    def panels(self, ms):
+        p, m, s = [self.imgs.get("det")], [ms.get("detail step", 0) + ms.get("detail render", 0)], \
+            [f"step {ms.get('detail step', 0):.2f} + render {ms.get('detail render', 0):.2f} ms"]
+        if self.sd is not None:
+            p.append(self.imgs.get("detB"))
+            m.append(m[0] + ms.get("detail route B", 0))
+            s.append(f"detail panel + net {ms.get('detail route B', 0):.2f} ms")
+        if self.hs is not None:
+            p.append(self.imgs.get("hires"))
+            m.append(ms.get("hires detail step", 0) + ms.get("hires render", 0))
+            s.append(f"sim {ms.get('hires sim', 0):.2f} | step {ms.get('hires detail step', 0):.2f} + render {ms.get('hires render', 0):.2f}")
+        return p, m, s
+
+
 def to_surface(img: torch.Tensor):
     import pygame
     h, w = img.shape[:2]
@@ -140,6 +229,9 @@ def main(argv=None):
     ap.add_argument("--march-scale", type=float, default=0.5)
     ap.add_argument("--screen-ckpt", default=None, help="route B checkpoint (default: runtime3d default path if present)")
     ap.add_argument("--no-hr", action="store_true", help="skip the guided 256³ reference panel")
+    ap.add_argument("--detail", action="store_true", help="add the advected-detail panels (see module doc)")
+    ap.add_argument("--detail-quality", default="medium", choices=["low", "medium", "high"])
+    ap.add_argument("--no-route-b-detail", action="store_true", help="with --detail: skip the detail + route B panel")
     a = ap.parse_args(argv)
 
     os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
@@ -168,6 +260,10 @@ def main(argv=None):
     rend = {k: VolumeRenderer((H, W), march_scale=a.march_scale) for k in ("raw", "tri", "hr")}
     tm = Timer()
     names = ["raw 64³", "trilinear 256³", rb_label, "guided 256³ (reference)"]
+    dx = None
+    if a.detail:
+        dx = DetailPanels(a, pre, b, W, H, rb_label)
+        names = names[:3] + dx.names + names[3:]
     sheet_frames: list = []
     prev_cam = None
     has_hr = False
@@ -175,6 +271,8 @@ def main(argv=None):
     for step, lr, hr in stream:
         k = step - a.warmup
         if k < 0:
+            if dx is not None:
+                dx.warm(lr)
             continue
         cam = orbit_cam(a.start_deg + a.orbit_deg * k, a.dist)
         save = k % a.every == 0 or k in pick
@@ -187,6 +285,8 @@ def main(argv=None):
             trans = F.interpolate(trans[None, None], size=(H, W), mode="bilinear", align_corners=False)[0, 0]
         aux = {"bbox": screen_bbox(cam, W, H), "transmittance": trans, **aux}
         img_rb = tm.run("route B detail", lambda: sd.infer(img_raw, aux))
+        if dx is not None:
+            dx.tick(tm, lr, cam, prev_cam, solid, step)
         prev_cam = cam
         if not save:
             tm.resolve()
@@ -206,7 +306,12 @@ def main(argv=None):
                 f"upscale {ms.get('trilinear upscale', 0):.2f} + render {ms.get('trilinear render', 0):.2f} ms",
                 f"raw render {ms.get('raw', 0):.2f} + detail {ms.get('route B detail', 0):.2f} ms",
                 f"render {ms.get('hr render', 0):.2f} ms (offline sim)"]
-        n = 4 if has_hr else 3
+        if dx is not None:
+            p_, m_, s_ = dx.panels(ms)
+            panels = panels[:3] + p_ + panels[3:]
+            pms = pms[:3] + m_ + pms[3:]
+            subs = subs[:3] + s_ + subs[3:]
+        n = len(names) if has_hr else len(names) - 1
         strip = pygame.Surface((n * W, H))
         for i in range(n):
             if panels[i] is None:
@@ -239,6 +344,8 @@ def main(argv=None):
                for n_, v in tm.acc.items()}
     meta = {"preset": a.preset, "frames": a.frames, "warmup": a.warmup, "size": [W, H], "march_scale": a.march_scale,
             "route_b": ck_name or "untrained", "hr": hr_note, "stubs": b.stubs, "ms": summary}
+    if dx is not None:
+        meta["detail"] = {"quality": a.detail_quality, "panels": dx.names, "notes": dx.notes}
     (out / "timings.json").write_text(json.dumps(meta, indent=2))
     from vfx.render3d.bench import gpu_note
     meta["gpu"] = gpu_note()

@@ -63,29 +63,31 @@ def save_png(path, arr):
     write_png(path, arr)
 
 
-def run_scene(split, seed, steps, spec_steps, configs, out: Path, renderer):
-    sc = sample_scenario(seed, split)
+def run_scene(split, seed, steps, spec_steps, configs, out: Path, renderer, sampler="v1"):
+    sc = sample_scenario(seed, split, sampler=sampler)
     res = {}
     renders, slices = {}, {}
     solid_r = rasterize_obstacles_3d(sc.obstacles, 128) if sc.obstacles else None
     cam = default_camera()
     for name in configs:
         cfg = CONFIGS[name]
-        tr, spec = [], []
+        tr, spec, spec_t = [], [], []
         t0 = time.perf_counter()
         vmax = None
         for s, lr, hr, t in sim.run_pair(sc, cfg, steps=steps):
             tr.append(t)
             if s >= steps - spec_steps:
                 spec.append(radial_power(hr.data[CH3["density"]]))
+                spec_t.append(radial_power(hr.data[CH3["temperature"]]))
         torch.cuda.synchronize()
         dt = time.perf_counter() - t0
         tr = torch.stack(tr).cpu().numpy()
         spec = torch.stack(spec).mean(0).cpu().numpy()
+        spec_t = torch.stack(spec_t).mean(0).cpu().numpy()
         umax = float(hr.velocity.abs().max())
         finite = bool(torch.isfinite(hr.data).all())
         res[name] = {"track_max": tr[10:].max(0).round(4).tolist(), "track_mean": tr[10:].mean(0).round(4).tolist(),
-                     "track_last": tr[-1].round(4).tolist(), "spec": spec.tolist(), "umax": round(umax, 3),
+                     "track_last": tr[-1].round(4).tolist(), "spec": spec.tolist(), "spec_t": spec_t.tolist(), "umax": round(umax, 3),
                      "finite": finite, "sec": round(dt, 1), "ms_per_step": round(1000 * dt / steps, 1)}
         dmax = float(lr.data[CH3["density"]].max()) + 1e-6
         slices["lr"] = slice_img(torch.nn.functional.interpolate(lr.data[None, :1], scale_factor=4)[0, 0], dmax)
@@ -93,10 +95,12 @@ def run_scene(split, seed, steps, spec_steps, configs, out: Path, renderer):
         renders["lr"] = renderer.draw(Volume(lr.data[0], lr.data[4]), cam, solid_r).cpu().numpy()
         renders[name] = renderer.draw(Volume(hr.data[0], hr.data[4]), cam, solid_r).cpu().numpy()
     base = np.asarray(res["unguided"]["spec"]) if "unguided" in res else None
+    base_t = np.asarray(res["unguided"]["spec_t"]) if "unguided" in res else None
     for name in res:
         if base is not None:
             res[name]["spec_ratio"] = (np.asarray(res[name]["spec"]) / (base + 1e-12)).round(3).tolist()
-        del res[name]["spec"]
+            res[name]["spec_ratio_T"] = (np.asarray(res[name]["spec_t"]) / (base_t + 1e-12)).round(3).tolist()
+        del res[name]["spec"], res[name]["spec_t"]
     tag = f"{split}_{seed}_{sc.kind}"
     names = ["lr"] + list(configs)
     save_png(out / f"slices_{tag}.png", np.concatenate([slices[n] for n in names], 1))
@@ -111,6 +115,7 @@ def main(argv=None):
     ap.add_argument("--spec-steps", type=int, default=30)
     ap.add_argument("--configs", default="unguided,base,vel_only,weak,c8,c16,strong_s")
     ap.add_argument("--scenes", default=None, help="split:seed,...")
+    ap.add_argument("--sampler", default="v1", help="scenario distribution: v1 | v2")
     a = ap.parse_args(argv)
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -120,12 +125,12 @@ def main(argv=None):
     scenes = SCENES if a.scenes is None else [(x.split(":")[0], int(x.split(":")[1])) for x in a.scenes.split(",")]
     allres = {}
     for split, seed in scenes:
-        tag, tags, res = run_scene(split, seed, a.steps, a.spec_steps, configs, out, r)
+        tag, tags, res = run_scene(split, seed, a.steps, a.spec_steps, configs, out, r, a.sampler)
         allres[tag] = {"tags": tags, **res}
         print(tag, tags)
         for n, v in res.items():
             print(f"  {n:9s} track max d/T/u {v['track_max']} mean {v['track_mean']} "
-                  f"spec {v.get('spec_ratio')} umax {v['umax']} {v['ms_per_step']} ms/step")
+                  f"spec d {v.get('spec_ratio')} T {v.get('spec_ratio_T')} umax {v['umax']} {v['ms_per_step']} ms/step")
         (out / "results.json").write_text(json.dumps(allres, indent=1))
 
 

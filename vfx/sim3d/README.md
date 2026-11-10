@@ -5,7 +5,8 @@ Interface as in `CLAUDE.md` (3D phase): `Solver3D`, `SolverConfig3D`, `SOLVER3D_
 and `Solver3D.step_profiled()` (the same step, run as three graphs with CUDA events between them; returns
 ms per stage). `FieldState3D.data` stays a torch cuda tensor that Warp reads and writes in place (`wp.from_torch`, no copy).
 Files: `config.py`, `kernels.py` (advection, sources, diffusion, forces), `pressure.py`
-(projection), `solver.py` (driver), `selfcheck.py`.
+(projection), `solver.py` (driver), `selfcheck.py`; opt-in: `pressure_fused.py` (fused / stationary MG
+projection), `hires.py` (finer scalar grid). See "Opt-in options" below.
 
 ## Scheme (a 3D port of vfx/sim 0.2.0, same physics, same fixes)
 1. **Advect** all 6 channels by uⁿ: MacCormack, RK2 traces, clamped to the 8 source values
@@ -97,6 +98,86 @@ At step 150 (5 s), 64³ and 128³ agree on the budgets: smoke mass within 6 %, h
 and the heat centroid within 0.02 m. But 64³ plumes rise more slowly: smoke centroid 0.40 vs 0.58 m for the plume and 0.68 vs
 0.76 m for the campfire. A 0.06 m emitter is only about 4 cells at 64³, so numerical
 diffusion of momentum is large there.
+
+## Opt-in options (revision 0.2.0; the default path is unchanged and bit-identical)
+`SOLVER3D_VERSION` stays `sim3d-warp-0.1.0`: it names the default path, which datasets compare. Code revision
+is `SOLVER3D_REVISION = "0.2.0"`. Opt-in options are recorded as suffixes in `state.meta.solver_version`
+(`solver.version`, `solver_version_tag()`), e.g. `sim3d-warp-0.1.0+fused-c2s4cheb-adaptive+scalars128`.
+**Bit-identity check**: 14 SHA-256 hashes of the state and divergence after 200 steps (campfire,
+plume + sphere; 64³ and 128³ full, 64³ `runtime_config`; impulses every 13 steps), plus `project()`
+and `advect()` outputs. All 14 were identical before and after the change.
+
+### Fused pressure solve: `pressure_mode="fused"` (`pressure_fused.py`)
+It solves the same system (K φ = −d(u*)) with the same Hadamard-basis multigrid, but as a **stationary
+iteration, without CG**. It runs `pressure_smooth` exact-K sweeps, then `pressure_cycles` × (V-cycle +
+`pressure_smooth` sweeps). The sweeps use Chebyshev weights on [0.5, 2] by default (λmax(D⁻¹K) measured
+1.976). With `pressure_tol > 0`, it runs further cycles while 0.5·max|r| ≥ tol·max|u*| (GPU-side test,
+`capture_while`), up to `pressure_max_iters` cycles in total. There are no dot products. Levels:
+* `fused_config()`: adaptive, tol 5e-5, ≤ 12 cycles. **Not yet measured** (the GPU was handed back
+  to training first).
+* `fused_fixed_config()` (`pressure_tol=0`): a fixed cost. This is a **LOWER-QUALITY LEVEL**: it misses the
+  1e-4 gate on a cold `project()` (about 1.1e-2, test engineer's run) and on impulse steps.
+
+Measured with the fixed 2/3/4 cycles (64³, warm start, max normalized div over 150-300 steps, every
+10th step; GPU SHARED at 97-100 % by a training job):
+
+| setting | campfire div max / med | plume + sphere div max / med | 1000-step stress div max (impulse-step med) |
+|---|---|---|---|
+| default PCG | 2.0e-5 / 5.9e-6 | 1.9e-5 / 1.2e-5 | 3.0e-5 (1.4e-5) |
+| runtime PCG (4 its) | 4.3e-5 / 3.0e-5 | 4.6e-4 / 2.0e-4 | — |
+| fused c1 (any smooth) | unstable: grows to 0.1 (campfire), 7e-2 with speckle (plume) | | |
+| fused c2 s3 cheb | 2.2e-4 / 1.4e-4 | 2.5e-4 / 1.0e-4 | — |
+| fused c2 s4 jacobi(0.8) | 2.4e-4 / 1.5e-4 | 4.0e-4 / 1.7e-4 | — |
+| **fused c2 s4 cheb** | 1.5e-4 / 8.7e-5 | 1.5e-4 / 4.7e-5 | 7.6e-3 (2.0e-3) |
+| fused c2 s6 cheb | 7.1e-5 / 4.3e-5 | 7.3e-5 / 2.5e-5 | 4.9e-3 (1.2e-3) |
+| fused c3 s4 cheb | 2.5e-5 / 1.4e-5 | 3.0e-5 / 1.8e-5 | 2.4e-3 (3.9e-4) |
+| fused c4 s4 cheb | | | 9.2e-4 (8.5e-5) |
+
+* **Smoother.** Chebyshev beats Jacobi(0.8) at equal sweep count. The plume needs ≥ 3 sweeps between
+  coarse corrections. The Hadamard MG drops the component coupling at obstacle faces, and only exact-K
+  sweeps remove that error: with 1 sweep the stationary iteration contracts by only 0.7 per cycle next to the sphere.
+  PCG hides this, but a stationary iteration does not.
+* **Smearing and volume gain** (EmberGen's warning). At t = 300, every setting with div ≲ 5e-4 matches the default
+  within run-to-run chaos. Smoke volume above 0.02 was 0.139-0.154 vs 0.146, and the gradient-energy
+  sharpness was 0.57-0.62 vs 0.62 (campfire). Only the unstable c1 level visibly degrades: plume speckle,
+  and the smoke centroid stuck at 0.25 m vs 0.39 m. Images: `look_*_t300.png` in the scratch dir.
+* **What kernel fusion bought: nothing; it was slower.** Recomputing halos lets one kernel per level do
+  black sweep + residual + restriction (and prolongation + black + red, residual + transform + red, up +
+  inverse transform). That cut launches from 53 to 33 for c2s4, but the projection went from 0.41 to
+  0.66 ms (min of 400 interleaved replays, shared GPU). At the small levels each thread's serial chain
+  of 300-400 dependent loads costs more than the 2-3 µs launch it saves. The kernels are kept
+  (`FusedPressure3D.FUSE_TOP`, `FUSE_MIN_M`) and off by default. So "fused" is in name only: the
+  gain comes from dropping CG, its reductions and its conditional, plus Chebyshev sweeps.
+* Timing so far (GPU SHARED, min of many): projection c2s4 ≈ 0.41 ms with plain kernels, vs PCG
+  0.77-0.89 ms (README table above, idle). The research estimate of 0.2-0.35 ms was **not reached**. A
+  clean idle-GPU table is pending.
+
+### Finer scalar grid: `Solver3D(res, cfg, scalar_res=S)` (`hires.py`)
+Density, temperature and fuel are also carried on an S³ grid. Each step they are MacCormack-advected by
+the res³ velocity (trilinear; RK2 traces in coarse index space, so both grids trace the same world
+curve), then get a global mass rescale (fine), emitters / combustion / cooling / dissipation at fine
+cell centres, and heat + fuel diffusion. They are then **box-restricted** (exact fractional overlaps, so
+96/64 works) into `state.data` after the coarse sources and before the forces. Buoyancy, confinement and
+wind therefore read the restricted fine scalars, and velocity, forces and pressure stay at res³.
+Obstacles are rasterised at S on `reset()`. If you edit `state.solid` by hand, call `set_hires_obstacles()`.
+The fine field belongs to the solver (one state per solver): `hires_volume()` gives views,
+`hires_fields()` gives all 3 channels, `init_hires_from_state()` fills it from a hand-made coarse state.
+Mass: the rescale acts on the fine field and the coarse field follows by restriction. Fine smoke in
+the fine-fluid sliver of coarse-solid cells is not in the coarse total.
+
+Measured at S = 128 (GPU shared, so correctness only): fine mass +0.00019 % over 1000 closed-box steps (fused:
++0.00042 %). Emitter footprint matches the analytic falloff at fine centres to 2e-7 rel. The fine solid
+equals the 128³ raster, and fine solids hold exactly 0 / ambient. Reruns are bit-identical (PCG and fused).
+The 1000-step stress run is finite (fine Tmax 2649 K).
+The restriction was first a fluid-weighted average, and the test engineer measured coarse vs fine mass
+off by 0.83 %. It is now the plain box average, so coarse = avgpool(fine) exactly on coarse fluid cells.
+**Re-measure pending.** Cost at 96/128/192 and peak VRAM: **pending idle GPU.**
+
+### Resolution-consistent confinement (opt-in): `confinement_ref_res`
+`vorticity_eps` is used as `vorticity_eps · res / confinement_ref_res`. This keeps ε·dx, the
+confinement per unit vorticity, equal to that of a `confinement_ref_res`³ run. 64³ with ref 128 gives ε = 3,
+the value the solver-correction study found cuts the error against 128³ by 63 %. `0` = off (default,
+bit-identical). Not yet measured here.
 
 ## Caveats
 - Collocated wide-stencil projection: odd-even velocity modes are invisible to the gated divergence, as in 2D.

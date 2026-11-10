@@ -1,0 +1,38 @@
+{
+ "name": "gan_p4_fm",
+ "hypothesis": "Probe 4 (3 min, s3d_v1): feature matching only (fm 0.2 on the conditional spatial D's features, hinge adversarial weight 0). FM is PAIRED (fake and real share the condition), so it should reward detail registered with hr, which the ms_dssim gate requires (detail oracle: hr's own detail shifted 2 px fails ms_dssim). Compare with the no-adversarial control (hold ms 0.994x lr, midband -0.16) and p3 adv 0.001 (1.00, -0.15).",
+ "init": "C:/Users/ricej/AppData/Local/neural-vfx/checkpoints/screen3d/v1_reg_backup.pt",
+ "init_override": {
+  "chroma_proj": true
+ },
+ "train": {
+  "minutes": 3,
+  "frames": 3,
+  "holdout_sequences": 24,
+  "weight_decay": 0.05,
+  "val_every": 100000,
+  "lr": 0.0001,
+  "warmup_steps": 50
+ },
+ "loss": {
+  "ssim": 0.3,
+  "speckle": 1.0,
+  "spec_max_frac": 0.3
+ },
+ "adv": {
+  "weight": 0.0,
+  "fm": 0.2,
+  "temporal": 0.0,
+  "d_width": 32
+ },
+ "select": {
+  "rule": "constrained_spec",
+  "every": 300
+ },
+ "eval": {
+  "splits": [
+   "test"
+  ],
+  "max_sequences": 2
+ }
+}

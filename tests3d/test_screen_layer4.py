@@ -9,7 +9,11 @@ Gates (SPEC Layer 4 + "Route B training phase"; numbers are never relaxed):
   the identity L1 within 400 Adam steps.
 * the runtime reads the CLAUDE.md aux dict {"alpha", "depth", "motion"}: same frames, aux zeroed -> output differs.
 * on the test split, the model beats BOTH baselines (the unmodified lr frame and the unsharp mask tuned on train)
-  on l1, spectrum_error and ms_dssim (vfx/eval3d/metrics.py).
+  on the shift-tolerant detail metrics metrics.DETAIL_GATE_METRICS = spectrum_error_bl, band_distance, grad_hist,
+  patch_swd, tlp. CHANGED 2026-11-09 (lead request, evidence in tests3d/README.md "Detail-oracle controls"): until
+  then the gate was l1, spectrum_error, ms_dssim; those are still computed and printed under their old names
+  (test_pixel_metrics_report) but no longer pass/fail, because they cannot distinguish plausible detail displaced
+  by 2 px from no detail. OOD (below) uses the same gate metrics.
 * OOD reported separately; spec: quality within 20% of in-distribution. Gated on the score RELATIVE TO THE lr
   BASELINE of the same split, (model/lr)_ood <= 1.2 x (model/lr)_test per metric: the absolute ood/test ratio is
   dominated by how hard the OOD scenes are for any method (on s3d_evalcheck the unmodified lr frame alone has an
@@ -227,8 +231,26 @@ def test_runtime_reads_contract_aux(baselines_eval):
 
 
 @pytest.mark.parametrize("metric", METRICS)
-def test_beats_lr_and_sharpen_on_test(model_eval, metric):
+def test_pixel_metrics_report(model_eval, metric):
+    """REPORTED, no longer a gate (changed 2026-11-09, lead request + measured evidence, tests3d/README.md
+    "Detail-oracle controls"): l1 / ms_dssim / full-band spectrum_error cannot tell plausible detail 2 px away from
+    no detail (the reference's own detail shifted 2 px: ms_dssim 0.195 vs lr 0.198, l1 0.0389 vs 0.0393; 4 px is worse
+    than lr on both; lr + the exactly registered detail scores 0.366 vs lr 0.266 on spectrum_error). The old gate
+    'model < lr and < sharpen' is still evaluated and printed under the old names so history stays comparable."""
     m = model_eval["test"]["methods"]
+    ok = m["model"][metric] < m["lr"][metric] and m["model"][metric] < m["sharpen"][metric]
+    print(f"\n[layer4] (reported) test {metric}: model {m['model'][metric]:.5g}  lr {m['lr'][metric]:.5g}  "
+          f"sharpen {m['sharpen'][metric]:.5g}  -> legacy gate would {'PASS' if ok else 'FAIL'}")
+
+
+@pytest.mark.parametrize("metric", M.DETAIL_GATE_METRICS)
+def test_beats_lr_and_sharpen_on_test(model_eval, metric):
+    """Detail-quality gate (replaces the l1 / ms_dssim / spectrum_error gate): beat BOTH baselines on the
+    shift-tolerant metrics, validated by the oracle controls (test_eval3d_oracle.py: the reference's own detail
+    shifted 0-4 px passes all of them; lr, blur and the tuned unsharp do not beat it)."""
+    m = model_eval["test"]["methods"]
+    if metric not in m["model"]:
+        pytest.skip(f"{metric} not in this evaluation (old report?)")
     print(f"\n[layer4] test {metric}: model {m['model'][metric]:.5g}  lr {m['lr'][metric]:.5g}  "
           f"sharpen {m['sharpen'][metric]:.5g}")
     assert m["model"][metric] < m["lr"][metric], f"{metric}: model {m['model'][metric]:.5g} >= lr {m['lr'][metric]:.5g}"
@@ -236,11 +258,13 @@ def test_beats_lr_and_sharpen_on_test(model_eval, metric):
         f"{metric}: model {m['model'][metric]:.5g} >= sharpen {m['sharpen'][metric]:.5g}"
 
 
-@pytest.mark.parametrize("metric", METRICS)
+@pytest.mark.parametrize("metric", M.DETAIL_GATE_METRICS)
 def test_ood_within_20pct(model_eval, metric):
     if not model_eval.get("ood"):
         pytest.skip("no OOD split")
     t, o = model_eval["test"]["methods"], model_eval["ood"]["methods"]
+    if metric not in t["model"] or metric not in o["model"]:
+        pytest.skip(f"{metric} not in this evaluation")
     ra = o["model"][metric] / max(t["model"][metric], 1e-12)
     rl = o["lr"][metric] / max(t["lr"][metric], 1e-12)
     qt = t["model"][metric] / max(t["lr"][metric], 1e-12)

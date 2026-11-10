@@ -7,6 +7,9 @@ split by stage), divergence, PCG iterations, budgets, and the gates: divergence 
 sphere, mass drift over 1000 steps (closed box, no sources, dissipation 0), hot fluid rises,
 nothing inside walls / obstacles, bit-identical reruns, 1000-step NaN stress run (strong fire +
 impulses). --bench adds the 64/96/128/256 timing table (full and runtime quality) + VRAM.
+--fused: the opt-in fused pressure solve (adaptive and fixed-cost levels) at 64^3: timings, cold
+project(), stress divergence. --hires: the opt-in finer scalar grid (scalar_res 96/128/192):
+fine-mass drift, restriction consistency, rasterisation, determinism, stress, cost + VRAM.
 PNGs (one per scene): rows = snapshots; columns per resolution =
   [density mid-z slice | density max-projection along z | temperature slice | temperature MIP]
 """
@@ -23,7 +26,7 @@ import warp as wp
 
 from vfx.core.fields import AMBIENT_TEMP
 from vfx.core.fields3d import CH3, SIM_DT, Emitter3D, Forces3D, Impulse3D, Obstacle3D
-from vfx.sim3d import Solver3D, SolverConfig3D, runtime_config
+from vfx.sim3d import Solver3D, SolverConfig3D, fused_config, fused_fixed_config, runtime_config
 
 DEFAULT_OUT = os.path.join(os.environ.get("LOCALAPPDATA", "."), "Temp", "neural-vfx-sim3d-selfcheck")
 
@@ -118,8 +121,8 @@ def budgets(f, dx):
     return float(m), float(h), float(yc), float(yh)
 
 
-def profile(res, fn, obs, cfg, warm=60, n=60):
-    s = Solver3D(res, cfg)
+def profile(res, fn, obs, cfg, warm=60, n=60, scalar_res=None):
+    s = Solver3D(res, cfg, scalar_res=scalar_res)
     st = s.reset(obs)
     for i in range(warm):
         s.step(st, fn(i * SIM_DT), SIM_DT)
@@ -136,7 +139,7 @@ def profile(res, fn, obs, cfg, warm=60, n=60):
     pr = [s.step_profiled(st, fn(i * SIM_DT), SIM_DT) for i in range(warm + n, warm + n + 30)]
     p = {k: float(np.median([q[k] for q in pr])) for k in pr[0]}
     p["step"] = float(t)
-    p["iters"] = int(s.pressure.it.numpy()[0])
+    p["iters"] = s.pressure_iters()
     p["div"] = float(s.divergence(st).max())
     p["vram_mb"] = solver_vram_mb(s, st)
     return p
@@ -146,8 +149,10 @@ def solver_vram_mb(s, st):
     """Bytes held by the solver's own buffers + the state tensors (deterministic, excludes the CUDA
     context and other processes)."""
     tot = st.data.numel() * 4 + st.solid.numel() * 4
+    if s.scalar_res is not None:
+        tot += (s.hi.numel() + s.hi_solid.numel()) * 4
     seen = set()
-    for obj in (s, s.pressure):
+    for obj in [o for o in (s, s.pressure, s.pressure_fused) if o is not None]:
         for v in vars(obj).values():
             arrs = [v] if isinstance(v, wp.array) else (
                 [a for lv in v for a in lv.values() if isinstance(a, wp.array)] if isinstance(v, list) and v and isinstance(v[0], dict) else [])
@@ -167,14 +172,14 @@ def gpu_status():
         return f"nvidia-smi failed: {e}"
 
 
-def project_gate(res, with_sphere):
+def project_gate(res, with_sphere, cfg=None):
     torch.manual_seed(1)
-    s = Solver3D(res)
+    s = Solver3D(res, cfg)
     st = s.reset([SPHERE] if with_sphere else [])
     v = F.avg_pool3d(torch.randn(1, 3, res, res, res, device="cuda"), 3, 1, 1)[0]
     st.data[1:4] = v * (st.solid < 0.5)
     s.project(st)
-    return float(s.divergence(st).max()), int(s.pressure.it.numpy()[0])
+    return float(s.divergence(st).max()), s.pressure_iters()
 
 
 def mass_drift(res, steps=1000):
@@ -231,8 +236,8 @@ def determinism(res, steps=40):
     return bool(torch.equal(outs[0], outs[1]))
 
 
-def stress(res, steps=1000, cfg=None):
-    s = Solver3D(res, cfg)
+def stress(res, steps=1000, cfg=None, scalar_res=None):
+    s = Solver3D(res, cfg, scalar_res=scalar_res)
     st = s.reset([SPHERE, Obstacle3D("box", (0.25, 0.7, 0.3), (0.1, 0.02, 0.15))])
     rng = np.random.default_rng(0)
     vmax = 0.0
@@ -250,8 +255,72 @@ def stress(res, steps=1000, cfg=None):
         s.step(st, f, SIM_DT)
         if i % 100 == 99:
             vmax = max(vmax, float(st.velocity.abs().max()))
-    ok = bool(torch.isfinite(st.data).all())
+    ok = bool(torch.isfinite(st.data).all()) and (s.scalar_res is None or bool(torch.isfinite(s.hi).all()))
     return ok, vmax, float(st.data[CH3["temperature"]].max()), float(s.divergence(st).max()), walls_clean(st)
+
+
+# ------------------------------------------------------------------ finer scalar grid (opt-in)
+def hires_mass(S, steps=1000):
+    """Closed box, no sources, dissipation 0: fine-field density total drift."""
+    s = Solver3D(64, SolverConfig3D(density_dissipation=0.0), scalar_res=S)
+    st = s.reset([Obstacle3D("sphere", (0.6, 0.6, 0.55), (0.1, 0.1, 0.1))])
+    c = (torch.arange(S, device="cuda", dtype=torch.float32) + 0.5) / S
+    zz, yy, xx = torch.meshgrid(c, c, c, indexing="ij")
+    blob = torch.exp(-((xx - 0.35) ** 2 + (yy - 0.3) ** 2 + (zz - 0.45) ** 2) / 0.01) * (s.hi_solid < 0.5)
+    s.hi[0] = blob
+    s.hi[1] = AMBIENT_TEMP + 400.0 * blob
+    c = (torch.arange(64, device="cuda", dtype=torch.float32) + 0.5) / 64
+    zz, yy, xx = torch.meshgrid(c, c, c, indexing="ij")
+    st.data[CH3["vel_x"]] = 0.5 * torch.sin(3.1 * yy)
+    st.data[CH3["vel_z"]] = 0.3 * torch.cos(2.7 * xx)
+    s.project(st)
+    m0 = float(s.hi[0].double().sum())
+    for _ in range(steps):
+        s.step(st, Forces3D(), SIM_DT)
+    return float(s.hi[0].double().sum()) / m0 - 1.0, bool(torch.isfinite(s.hi).all())
+
+
+def hires_restriction(S, steps=90):
+    """Coarse density vs box-average of the fine field over coarse fluid cells: rel L1, mass rel."""
+    s = Solver3D(64, scalar_res=S)
+    st = s.reset([SPHERE])
+    for i in range(steps):
+        s.step(st, plume(i * SIM_DT), SIM_DT)
+    fl = st.solid < 0.5
+    rd = F.interpolate(s.hi[0][None, None], size=(64,) * 3, mode="area")[0, 0] * fl
+    cd = st.data[0] * fl
+    l1 = float((rd - cd).abs().sum() / cd.abs().sum())
+    return l1, float(abs(rd.double().sum() - cd.double().sum()) / cd.double().sum())
+
+
+def hires_determinism(S, cfg=None, steps=60):
+    outs = []
+    for _ in range(2):
+        s = Solver3D(64, cfg, scalar_res=S)
+        st = s.reset([SPHERE])
+        for i in range(steps):
+            s.step(st, campfire(i * SIM_DT), SIM_DT)
+        outs.append((st.data.clone(), s.hi.clone()))
+    return bool(torch.equal(outs[0][0], outs[1][0]) and torch.equal(outs[0][1], outs[1][1]))
+
+
+def hires_raster(S):
+    """One step from rest: fine emitter footprint vs the analytic (1-r^2/R^2)^2 at fine centers;
+    fine solid == rasterize_obstacles_3d at S; fine solids hold exactly 0 / ambient."""
+    from vfx.core.fields3d import rasterize_obstacles_3d
+    s = Solver3D(64, SolverConfig3D(density_dissipation=0.0), scalar_res=S)
+    st = s.reset([SPHERE])
+    e = Emitter3D(pos=(0.31, 0.2, 0.47), radius=0.06, density_rate=3.0)
+    s.step(st, Forces3D(emitters=[e]), SIM_DT)
+    c = (torch.arange(S, device="cuda", dtype=torch.float64) + 0.5) / S
+    zz, yy, xx = torch.meshgrid(c, c, c, indexing="ij")
+    r2 = ((xx - e.pos[0]) ** 2 + (yy - e.pos[1]) ** 2 + (zz - e.pos[2]) ** 2) / e.radius ** 2
+    want = torch.where(r2 < 1, (1 - r2) ** 2, torch.zeros_like(r2)) * e.density_rate * SIM_DT
+    err = float((s.hi[0].double() - want).abs().max() / want.max())
+    same = bool(torch.equal(s.hi_solid, rasterize_obstacles_3d([SPHERE], S)))
+    m = s.hi_solid > 0.5
+    clean = float(max(s.hi[0][m].abs().max(), (s.hi[1][m] - AMBIENT_TEMP).abs().max()))
+    return err, same, clean
 
 
 # ------------------------------------------------------------------ main
@@ -261,6 +330,8 @@ def main():
     ap.add_argument("--steps", type=int, default=150)
     ap.add_argument("--quick", action="store_true", help="scenes + images only")
     ap.add_argument("--bench", action="store_true", help="timing table 64/96/128/256")
+    ap.add_argument("--fused", action="store_true", help="opt-in fused pressure solve checks + timings")
+    ap.add_argument("--hires", action="store_true", help="opt-in finer scalar grid checks + timings")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
     wp.config.quiet = True
@@ -300,6 +371,40 @@ def main():
                 ok, vmax, Tm, dv, wc = stress(res, cfg=cfg)
                 print(f"gate stress {res}^3 {label} 1000 steps: finite {ok}  max|u| {vmax:.2f} m/s  Tmax {Tm:.0f} K  "
                       f"div {dv:.2e}  solid clean {wc:.1e}")
+    if args.fused:
+        print("GPU before fused:", gpu_status())
+        levels = (("fused adaptive", fused_config()), ("fused fixed (lower quality)", fused_fixed_config()))
+        for label, cfg in levels:
+            for sph in (False, True):
+                d, it = project_gate(64, sph, cfg)
+                print(f"fused cold project 64^3 sphere={sph} {label}: div {d:.2e} (V-cycles {it})  [< 1e-4]")
+            ok, vmax, Tm, dv, wc = stress(64, cfg=cfg)
+            print(f"fused stress 64^3 {label}: finite {ok} max|u| {vmax:.2f} div(end) {dv:.2e} solid clean {wc:.1e}")
+        for label, cfg in (("default pcg", SolverConfig3D()),) + levels:
+            for name, (fn, obs) in SCENES.items():
+                p = profile(64, fn, obs, cfg)
+                print(f"fused-bench 64^3 {label:28s} {name:8s} step {p['step']:.3f} ms | adv {p['advection']:.3f} "
+                      f"forces {p['forces']:.3f} proj {p['projection']:.3f} | iters {p['iters']} div {p['div']:.1e}")
+        print("GPU after fused:", gpu_status())
+    if args.hires:
+        print("GPU before hires:", gpu_status())
+        for S in (128,):
+            drift, ok = hires_mass(S)
+            print(f"hires {S}^3 fine mass 1000 steps closed box: {100 * drift:+.5f} %  finite {ok}  [|.| < 0.1 %]")
+            l1, mrel = hires_restriction(S)
+            print(f"hires {S}^3 restriction vs 64^3 density: rel L1 {l1:.2e}, mass rel {mrel:.2e}")
+            print(f"hires {S}^3 emitter rel err, solid == raster, solid clean: {hires_raster(S)}")
+            print(f"hires {S}^3 determinism: {hires_determinism(S)} (fused: {hires_determinism(S, fused_config())})")
+            ok, vmax, Tm, dv, wc = stress(64, cfg=None, scalar_res=S)
+            print(f"hires {S}^3 stress 1000 steps: finite {ok} max|u| {vmax:.2f} Tmax {Tm:.0f} div {dv:.2e} "
+                  f"solid clean {wc:.1e}")
+        for S in (None, 96, 128, 192):
+            for label, cfg in (("pcg", SolverConfig3D()), ("fused", fused_config())):
+                p = profile(64, plume, [SPHERE], cfg, scalar_res=S)
+                stages = " ".join(f"{k} {p[k]:.3f}" for k in ("advection", "scalars", "forces", "projection") if k in p)
+                print(f"hires-bench 64^3 + scalars {S} {label:5s} plume step {p['step']:.3f} ms | {stages} "
+                      f"| solver VRAM {p['vram_mb']:.0f} MiB")
+        print("GPU after hires:", gpu_status())
     if args.bench:
         print("GPU before bench:", gpu_status())
         for res in (64, 96, 128, 256):

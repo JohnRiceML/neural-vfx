@@ -1,0 +1,43 @@
+{
+ "dataset": "s3d_v2",
+ "model": {
+  "width": 96,
+  "n_blocks": 12,
+  "trunk_stride": 2,
+  "hr_feats": 16,
+  "hr_hidden": 32,
+  "hr_kernel": 3,
+  "use_prev": false,
+  "grey_lowfreq": 8,
+  "alpha_gate": 0.5,
+  "chroma_proj": true
+ },
+ "train": {
+  "minutes": 30,
+  "frames": 3,
+  "holdout_scenarios": 12,
+  "chunk_sequences": 80,
+  "chunk_minutes": 2.0,
+  "weight_decay": 0.05,
+  "val_every": 100000,
+  "lr": 0.0003,
+  "val_test_sequences": 16
+ },
+ "loss": {
+  "ssim": 0.3,
+  "speckle": 1.0,
+  "spec_max_frac": 0.3
+ },
+ "select": {
+  "rule": "constrained_spec",
+  "every": 1000
+ },
+ "eval": {
+  "splits": [
+   "test",
+   "ood"
+  ]
+ },
+ "name": "teacherA_v2",
+ "hypothesis": "Lead item A, TEACHER (30 min, s3d_v2 same scenarios / hold-out as final 1, from scratch, same objective as final 1): unconstrained net, trunk stride 2 (vs 4), 96 wide x 12 blocks, HR head 3x3 16->32->3, 2.08M params (2.8x), ~5x the compute per pixel; chroma_proj, grey_lowfreq 8, alpha_gate 0.5 kept so outputs are comparable. Question: does capacity get the reference's thin filaments where the budget model does not? If yes -> distill."
+}

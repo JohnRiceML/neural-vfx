@@ -87,6 +87,83 @@ def sample_cameras(rng: np.random.Generator, centroid, n: int) -> list[OrbitCam]
     return cams
 
 
+CAM_RANGES_V2 = {
+    **CAM_RANGES,
+    "closeup_prob": 0.55,               # share of candidate cameras drawn from the close-up band
+    "dist_close": (0.8, 1.35),          # log-uniform, m: the 512-px window spans 0.21-0.35 m -> a large fire fills it
+    "dist_far": (1.35, 4.0),            # log-uniform, m
+    "pitch_close": (-0.1, 0.9),
+    "focus_prob": 0.5,                  # aim at an emitter (fires x3 weight) at a height in the flame instead of
+    "focus_prob_fire": 0.65,            #   the effect centroid; higher when the scene has fire
+    "focus_height": (0.02, 0.1),        #   + 2.5 x emitter radius x U(0, 1) above the emitter centre
+    "focus_jitter": 0.03,
+    "occluded_view_prob": 0.5,          # scenes with floor occluders: look past an occluder at its fire
+    "closeup_tag_dist": 1.35,           # per-camera tag "closeup": mean orbit distance <= this (m)
+}
+
+
+def _outside_domain(cam: "OrbitCam", frames: int, dt: float, margin: float = 0.03) -> bool:
+    for i in (-1, 0, frames - 1):
+        p = np.asarray(cam.at(i * dt).position)
+        if np.all(p > -margin) and np.all(p < 1 + margin):
+            return False
+    return True
+
+
+def sample_cameras_v2(rng: np.random.Generator, centroid, n: int, sc, frames: int, dt: float) -> list[OrbitCam]:
+    """s3d_v2 cameras: close-up band (55 %), emitter-focused aims (flame-dominated views), looks past floor
+    occluders at their fire, orbit positions kept outside the 1 m domain. Same OrbitCam / motion model as v1.
+    Each camera gets `info` = {"aim", "band", "occluded_view"} (stored in meta)."""
+    R = CAM_RANGES_V2
+    ems = list(sc.emitters)
+    has_fire = any(e.fuel_rate > 0 for e in ems)
+    occl = [o for o in sc.obstacles if o.kind == "box" and o.pos[1] - o.size[1] < 1e-3 and o.size[1] >= 0.05]
+    yaw0 = rng.uniform(0, 2 * math.pi)
+    cams = []
+    for k in range(n):
+        close = rng.random() < R["closeup_prob"]
+        focus = rng.random() < (R["focus_prob_fire"] if has_fire else R["focus_prob"])
+        if focus and ems:
+            w = np.asarray([3.0 if e.fuel_rate > 0 else 1.0 for e in ems])
+            e = ems[int(rng.choice(len(ems), p=w / w.sum()))]
+            h = _u_rng(rng, R["focus_height"]) + 2.5 * e.radius * rng.random()
+            tg = np.asarray(e.pos) + np.array([0.0, h, 0.0]) + rng.normal(0, R["focus_jitter"], 3)
+        else:
+            tg = np.asarray(centroid) + rng.normal(0, R["target_jitter"], 3)
+        tg = np.clip(tg, [0.1, 0.05, 0.1], [0.9, 0.85, 0.9])
+        yaw = float(yaw0 + 2 * math.pi * k / n + rng.uniform(-0.6, 0.6))
+        occluded = bool(occl) and rng.random() < R["occluded_view_prob"]
+        if occluded:      # camera on the far side of an occluder, looking at it and the fire behind
+            o = occl[int(rng.integers(0, len(occl)))]
+            v = np.array([o.pos[0] - tg[0], o.pos[2] - tg[2]])
+            yaw = float(math.atan2(v[0], -v[1]) + rng.uniform(-0.25, 0.25))
+        dr = R["dist_close"] if close else R["dist_far"]
+        pr = R["pitch_close"] if close else R["pitch"]
+        if occluded:
+            pr = (-0.1, 0.45)
+        c = None
+        for _try in range(20):
+            c = OrbitCam(target=tuple(float(v) for v in tg), yaw=yaw, pitch=float(rng.uniform(*pr)),
+                         dist=float(math.exp(rng.uniform(math.log(dr[0]), math.log(dr[1])))))
+            if rng.random() < R["moving_prob"]:
+                c.yaw_rate = float(rng.choice([-1, 1]) * rng.uniform(*R["yaw_rate"]))
+                c.pitch_rate = float(rng.uniform(*R["pitch_rate"]))
+                c.dolly_rate = float(rng.uniform(*R["dolly_rate"]))
+            if _outside_domain(c, frames, dt):
+                break
+            yaw += rng.uniform(-0.8, 0.8) if not occluded else 0.0
+            if _try > 10:
+                dr = (dr[0] * 1.1, dr[1] * 1.1)
+        c.info = {"aim": "emitter" if focus and ems else "centroid", "band": "close" if close else "far",
+                  "occluded_view": occluded}
+        cams.append(c)
+    return cams
+
+
+def _u_rng(rng, lo_hi) -> float:
+    return float(rng.uniform(*lo_hi))
+
+
 def project(cam: Camera, p, out_size=OUT_SIZE) -> tuple[float, float, float]:
     """World point -> (px, py, view_z) in output pixels (row 0 = top), same basis as the renderer."""
     from vfx.render3d import camera_basis
@@ -181,11 +258,20 @@ class PairRenderer:
         rest[1:] *= PROCESS_SCALE
         return torch.cat([wsum, rest]).half()
 
+    @staticmethod
+    def _fence():
+        """VolumeRenderer.draw() writes the camera into one of 4 pinned host buffers and copies it to the GPU
+        with non_blocking=True. With more than ~4 draws queued ahead of the GPU (e.g. 6 candidate cameras x
+        LR + HR) the CPU overwrites a pinned slot before its copy has run and a draw renders ANOTHER camera
+        (found in the s3d_v2 pilot: hr of camera 0 showed camera 3's view). Sync before every draw."""
+        torch.cuda.current_stream().synchronize()
+
     @torch.no_grad()
     def frame(self, i: int, lr_state, hr_state, dt: float):
         lr_vol = Volume(lr_state.data[CH3["density"]], lr_state.data[CH3["temperature"]])
         vel = lr_state.velocity
         for k, c in enumerate(self.cams):
+            self._fence()
             img, aux = self.r.draw(lr_vol, c.at(i * dt), self.solid, reuse_volume=k > 0, return_aux=True,
                                    velocity=vel, prev_camera=c.at((i - 1) * dt))
             y0, x0 = self.crops[k][1], self.crops[k][0]
@@ -195,6 +281,7 @@ class PairRenderer:
         if hr_state is not None:
             hr_vol = Volume(hr_state.data[CH3["density"]], hr_state.data[CH3["temperature"]])
             for k, c in enumerate(self.cams):
+                self._fence()
                 img, aux = self.r.draw(hr_vol, c.at(i * dt), self.solid, reuse_volume=k > 0, return_aux=True)
                 y0, x0 = self.crops[k][1], self.crops[k][0]
                 self.hr[k, i] = self._pool_rgb(img[y0:y0 + CROP_OUT, x0:x0 + CROP_OUT])
@@ -204,5 +291,6 @@ class PairRenderer:
     def full_frame(self, state, cam: Camera, velocity=None, prev=None):
         """Uncropped (1440,2560,3) uint8 frame (cpu numpy) + aux, for previews."""
         vol = Volume(state.data[CH3["density"]], state.data[CH3["temperature"]])
+        self._fence()
         img, aux = self.r.draw(vol, cam, self.solid, return_aux=True, velocity=velocity, prev_camera=prev)
         return img.cpu().numpy(), {k: v.float().cpu().numpy() for k, v in aux.items()}

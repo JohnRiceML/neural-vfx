@@ -16,6 +16,10 @@ Both nets zero-initialise their last conv, so an untrained net returns exactly i
   (`depth_scale`, `motion_scale`, clip `input_clip`). Trunk at 1/`trunk_stride` resolution via PixelUnshuffle,
   PixelShuffle back, HR head (k×k). Output constraints in the forward (config, saved with the checkpoint):
   `grey_lowfreq` k = the part of Δrgb coarser than k px is made grey; `alpha_gate` g = |Δrgb| ≤ g·alpha.
+  `chroma_proj` = Δrgb projected per pixel onto span{rgb, grey} (detail can scale the input colour or add grey, never
+  a new hue: removes the colour fringes / purple dots); `gate_dilate` k = the alpha gate uses alpha max-pooled over
+  (2k+1)² px; `mid_width`/`mid_blocks` = optional stride-2 path (zero-initialised output, so older checkpoints load into it
+  unchanged via `load_screen_net_extended`).
   Trained config: 64 wide × 8 blocks, stride 4, HR head 3×3 8→16→3, no prev, grey_lowfreq 8, alpha_gate 0.5 (vfx/train3d).
 - `save_*/load_*` store `{"config", "state_dict"}` like the 2D checkpoints.
 - Untrained-output check (2026-11-09): on the live campfire preset the sandbox's `neural_vol` output equals

@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import warp as wp
 
+from vfx.detail3d.kernels import DetailShade, detail_sample, dilate_occ  # noqa: F401 (re-exported)
+
 wp.config.quiet = True
 
 BRICKS = 32            # empty-space skipping grid: 32^3 bricks over the unit cube
@@ -192,44 +194,63 @@ def pack_solid(solid: wp.array3d(dtype=wp.float32), out: wp.array3d(dtype=wp.uin
                     occ[bz, by, bx] = wp.uint8(1)
 
 
-@wp.kernel
-def light_volume(vol: wp.Texture3D, solid: wp.Texture3D, has_solid: int, lut: wp.array(dtype=wp.vec3),
-                 p: Shade3D, light: wp.array3d(dtype=wp.vec2h), glow_src: wp.array3d(dtype=wp.vec4h)):
-    """Per light-grid voxel: transmittance toward the key light (march to the cube exit),
-    sky-ambient occlusion (short march up), and the local blackbody emission (glow source)."""
-    z, y, x = wp.tid()
-    L = light.shape[0]
-    inv = 1.0 / float(L)
-    pos = wp.vec3((float(x) + 0.5) * inv, (float(y) + 0.5) * inv, (float(z) + 0.5) * inv)
-    here = wp.texture_sample(vol, pos, dtype=wp.vec2f)
-    ld = p.light_dir
-    tb = box_hit(pos, safe_inv(ld), wp.vec3(0.0, 0.0, 0.0), wp.vec3(1.0, 1.0, 1.0))
-    t_exit = tb[1]
-    ds = 1.5 * inv                      # 1.5 light voxels per step, jittered start (no shadow banding)
-    od = float(0.0)
-    t = (0.25 + 0.75 * ign(float(x) + 7.0 * float(z), float(y) + 13.0 * float(z))) * ds
-    while t < t_exit:
-        q = pos + ld * t
-        s = wp.texture_sample(vol, q, dtype=wp.vec2f)
-        od += p.k_shadow * s[0] * ds
-        if has_solid != 0:
-            od += p.k_solid * wp.texture_sample(solid, q, dtype=float) * ds
-        if od > 12.0:
-            break
-        t += ds
-    # sky ambient: 6 coarse steps straight up
-    oda = float(0.0)
-    da = 3.0 * inv
-    for i in range(6):
-        qy = pos[1] + (float(i) + 0.5) * da
-        if qy < 1.0:
-            s = wp.texture_sample(vol, wp.vec3(pos[0], qy, pos[2]), dtype=wp.vec2f)
-            oda += p.k_amb * s[0] * da
-    light[z, y, x] = wp.vec2h(wp.float16(wp.exp(-od)), wp.float16(wp.exp(-oda)))
-    e = wp.vec3(0.0, 0.0, 0.0)
-    if here[1] > p.t_lo:
-        e = emission(lut, p, here[0], here[1])
-    glow_src[z, y, x] = wp.vec4h(wp.float16(e[0]), wp.float16(e[1]), wp.float16(e[2]), wp.float16(0.0))
+def _make_light_volume(DETAIL: bool):
+    """DETAIL=False is the original light volume (unchanged code). DETAIL=True reads the density along
+    the light and sky rays through vfx.detail3d's displaced/modulated sampling, so shadows see the wisps
+    (at the light volume's own resolution)."""
+
+    @wp.kernel(module="unique")
+    def light_volume(vol: wp.Texture3D, solid: wp.Texture3D, has_solid: int, lut: wp.array(dtype=wp.vec3),
+                     p: Shade3D, light: wp.array3d(dtype=wp.vec2h), glow_src: wp.array3d(dtype=wp.vec4h),
+                     dc0: wp.Texture3D, dc1: wp.Texture3D, dnoise: wp.Texture3D, dsh: DetailShade,
+                     dyn: wp.array(dtype=float)):
+        """Per light-grid voxel: transmittance toward the key light (march to the cube exit),
+        sky-ambient occlusion (short march up), and the local blackbody emission (glow source)."""
+        z, y, x = wp.tid()
+        L = light.shape[0]
+        inv = 1.0 / float(L)
+        pos = wp.vec3((float(x) + 0.5) * inv, (float(y) + 0.5) * inv, (float(z) + 0.5) * inv)
+        here = wp.texture_sample(vol, pos, dtype=wp.vec2f)
+        ld = p.light_dir
+        tb = box_hit(pos, safe_inv(ld), wp.vec3(0.0, 0.0, 0.0), wp.vec3(1.0, 1.0, 1.0))
+        t_exit = tb[1]
+        ds = 1.5 * inv                      # 1.5 light voxels per step, jittered start (no shadow banding)
+        od = float(0.0)
+        t = (0.25 + 0.75 * ign(float(x) + 7.0 * float(z), float(y) + 13.0 * float(z))) * ds
+        while t < t_exit:
+            q = pos + ld * t
+            if wp.static(DETAIL):
+                s = detail_sample(vol, q, dc0, dc1, dnoise, dsh, dyn)
+            else:
+                s = wp.texture_sample(vol, q, dtype=wp.vec2f)
+            od += p.k_shadow * s[0] * ds
+            if has_solid != 0:
+                od += p.k_solid * wp.texture_sample(solid, q, dtype=float) * ds
+            if od > 12.0:
+                break
+            t += ds
+        # sky ambient: 6 coarse steps straight up
+        oda = float(0.0)
+        da = 3.0 * inv
+        for i in range(6):
+            qy = pos[1] + (float(i) + 0.5) * da
+            if qy < 1.0:
+                if wp.static(DETAIL):
+                    s = detail_sample(vol, wp.vec3(pos[0], qy, pos[2]), dc0, dc1, dnoise, dsh, dyn)
+                else:
+                    s = wp.texture_sample(vol, wp.vec3(pos[0], qy, pos[2]), dtype=wp.vec2f)
+                oda += p.k_amb * s[0] * da
+        light[z, y, x] = wp.vec2h(wp.float16(wp.exp(-od)), wp.float16(wp.exp(-oda)))
+        e = wp.vec3(0.0, 0.0, 0.0)
+        if here[1] > p.t_lo:
+            e = emission(lut, p, here[0], here[1])
+        glow_src[z, y, x] = wp.vec4h(wp.float16(e[0]), wp.float16(e[1]), wp.float16(e[2]), wp.float16(0.0))
+
+    return light_volume
+
+
+light_volume = _make_light_volume(False)
+light_volume_detail = _make_light_volume(True)
 
 
 # ---------------------------------------------------------------------- main march
@@ -264,7 +285,7 @@ def project_px(q: wp.vec3, cam: wp.array(dtype=float), out_w: float, out_h: floa
     return wp.vec2((sx + 1.0) * 0.5 * out_w, (1.0 - sy) * 0.5 * out_h)
 
 
-def _make_march(AUX: bool):
+def _make_march(AUX: bool, DETAIL: bool = False):
     """Two compiled variants of one source. AUX=False is the plain colour march: the aux code is
     removed at codegen by wp.static, so it costs nothing and the colour code is unchanged. AUX=True
     additionally accumulates, in the same loop from the same samples, the opacity-weighted (T*a)
@@ -278,7 +299,9 @@ def _make_march(AUX: bool):
               solid_res: float, lut: wp.array(dtype=wp.vec3), p: Shade3D, cam: wp.array(dtype=float),
               steps: float, out: wp.array2d(dtype=wp.vec4),
               vel: wp.Texture3D, has_vel: int, cam_prev: wp.array(dtype=float), vel_dt: float,
-              out_w: float, out_h: float, aux: wp.array2d(dtype=wp.vec4)):
+              out_w: float, out_h: float, aux: wp.array2d(dtype=wp.vec4),
+              dc0: wp.Texture3D, dc1: wp.Texture3D, dnoise: wp.Texture3D, dsh: DetailShade,
+              dyn: wp.array(dtype=float)):
         """One ray per pixel: front-to-back compositing of smoke/fire inside [0,1]^3, opaque obstacles
         (solid iso 0.5), then the floor plane y=0. Writes (premultiplied radiance rgb, transmittance)
         and, in the AUX variant, the aux sums (see _make_march)."""
@@ -319,7 +342,7 @@ def _make_march(AUX: bool):
             ad = float(0.0)                     # sum w * distance
             av = wp.vec3(0.0, 0.0, 0.0)         # sum w * velocity
         if t_near < t_far:
-            jit = ign(float(c), float(r))
+            jit = wp.frac(ign(float(c), float(r)) + cam[14])   # cam[14]: per-frame offset (temporal), else 0
             t0 = t_near + jit * ds
             t = t0
             t_prev = t_near
@@ -375,7 +398,10 @@ def _make_march(AUX: bool):
                         T = 0.0
                         break
                 if o_d != wp.uint8(0):
-                    s = wp.texture_sample(vol, q, dtype=wp.vec2f)
+                    if wp.static(DETAIL):
+                        s = detail_sample(vol, q, dc0, dc1, dnoise, dsh, dyn)
+                    else:
+                        s = wp.texture_sample(vol, q, dtype=wp.vec2f)
                     dn = s[0]
                     Tk = s[1]
                     hot = Tk > p.t_lo
@@ -459,6 +485,8 @@ def _make_march(AUX: bool):
 
 march = _make_march(False)
 march_aux = _make_march(True)
+march_detail = _make_march(False, True)          # vfx.detail3d sampling (VolumeRenderer.draw(detail=...))
+march_aux_detail = _make_march(True, True)
 
 
 # ---------------------------------------------------------------------- composite

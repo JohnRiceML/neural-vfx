@@ -133,3 +133,29 @@ so it still reaches the lid and spreads there before it fades.
 Window `--quit-after 10 --orbit`, campfire, trilinear 256³: 60.5 fps (capped), 1% low 55, 2.4 ms
 GPU per frame. Headless uncapped (lighter contention): trilinear 405 fps, route B 421 fps; route A
 110 fps (neural_vol 2.4 ms/tick); ref128 85 fps (128³ full-quality sim 14.7 ms/tick).
+
+## Sim-carried detail modes (2026-11-09; additive — every earlier mode is unchanged)
+| mode | what is rendered |
+|---|---|
+| `detail` — 64³ + advected detail | raw 64³ volume drawn with `detail=AdvectedDetail` (vfx/detail3d), stepped with the 64³ velocity every tick |
+| `detail_screen` — detail + route B | the `detail` render (+ aux) fed to a second ScreenDetail instance (same checkpoint, own temporal history) |
+| `hires` — 64³ velocity + 128³ density | `Solver3D(64, scalar_res=128).hires_volume()` (sim3d opt-in; a separate solver instance, seeded from the current 64³ state when the mode becomes visible) |
+| `hires_detail` — hires + detail | the 128³ density drawn with its own AdvectedDetail stepped by that solver's velocity |
+
+```
+.venv/Scripts/python -m vfx.app3d.main --mode detail --side-by-side --mode2 raw [--detail-quality high]
+.venv/Scripts/python -m vfx.app3d.main --headless --frames 240 --mode hires_detail --side-by-side --mode2 detail --screenshot out.png
+.venv/Scripts/python -m vfx.app3d.compare --preset 1 --frames 24 --every 8 --detail --out DIR
+```
+`Q` cycles the detail quality (low / medium / high = 1 / 2 / 4 noise octaves). Nothing is created or
+stepped unless one of these modes is visible. HUD for these modes: the **detail** row is the
+`AdvectedDetail.step` GPU ms per tick (amortized /2 per 60 Hz frame; for `detail_screen` plus the
+network), the **render** row ("render+det") includes the detail sampling in the march and in the
+light volume, and an extra green line gives the bench-measured 1440p march delta for the current
+quality (from `vfx/detail3d/bench_latest.json`, written by `python -m vfx.detail3d.bench --out ...`).
+In `hires*` modes the sim row is the scalar_res solver's step. If sim3d lacked `scalar_res` /
+`hires_volume()` the hires modes would show UNAVAILABLE with that reason.
+
+`compare --detail` (off by default, so the default panels and contact sheet are unchanged) inserts
+`64³ + detail | detail + route B | hires 128³ + detail` between route B and the guided 256³ reference
+(the hires panel only if sim3d supports scalar_res); `--detail-quality`, `--no-route-b-detail`.

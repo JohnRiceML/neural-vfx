@@ -74,6 +74,11 @@ sequence with ANOTHER sequence's motion measures how the two differ, not flicker
 Baselines every score is compared to: the unmodified lr frame (`identity`) and a classical unsharp mask
 (`unsharp`, sigma and amount tuned on train by `tune_unsharp`). A learned net must beat both.
 
+Fair-to-unaligned-detail metrics (added for the sim-carried detail phase; last section of this file): band_spectrum,
+gradient_hist_distance, local_contrast_hist_distance, patch_swd (distribution-level, placement-free) and tlp / tof
+(TecoGAN-style: the output's frame-to-frame change vs the REFERENCE's change, so blur and boiling both score worse).
+Everything above is unchanged so old results stay comparable.
+
 Evaluation-time code: .item() / host syncs are fine here (not the frame loop).
 """
 from __future__ import annotations
@@ -96,6 +101,10 @@ __all__ = [
     "warp_backward", "estimate_flow", "sequence_flow", "warp_error", "flicker", "temporal_jerk", "detail_swim", "item_masks",
     "gaussian_blur", "unsharp", "identity", "tune_unsharp",
     "aux_dict", "run_sequence", "score_sequence", "evaluate_screen_detail",
+    # distribution-level / reference-relative metrics (sim-carried detail phase; see the section below)
+    "OCTAVE_EDGES", "OCTAVE_NAMES", "band_spectrum", "wasserstein1", "gradient_hist_distance",
+    "local_contrast_hist_distance", "patch_swd", "laplacian_pyramid", "lap_distance", "temporal_change",
+    "tof", "tlp", "fair_detail_scores", "spectrum_error_bl", "F_MAX_BL", "DETAIL_GATE_METRICS",
 ]
 
 LUMA = (0.2126, 0.7152, 0.0722)
@@ -240,6 +249,25 @@ def spectrum_log_ratio(pred, ref, mask=None) -> float:
     """Signed version of spectrum_error: < 0 = less high-frequency power than ref (blur), > 0 = more."""
     d = _log_diff(pred, ref, mask)
     return float(d.mean()) if d.size else float("nan")
+
+
+F_MAX_BL = 0.25     # cycles/px: upper limit of spectrum_error_bl (wavelength >= 4 px at the scored scale)
+
+
+def spectrum_error_bl(pred, ref, mask=None, f_max: float = F_MAX_BL) -> float:
+    """Band-limited spectrum_error (added 2026-11-09, replaces spectrum_error as a GATE; spectrum_error itself is
+    unchanged and still reported): the same per-bin |log10 P_pred - log10 P_ref|, averaged only over bins whose centre
+    is < f_max. Why: on s3d_v1 test the bins above 0.25 cycles/px hold reference power only ~15-200x the uint8
+    quantization floor, and their error is dominated by the phase alignment of fine detail with what lr already has:
+    lr + the reference's own detail (exactly registered) scored 0.366 vs lr 0.266 on spectrum_error, while the same
+    detail shifted 1 px scored 0.186 (its power spectrum is identical). Below 0.25 the ordering is the expected one
+    (tests3d/README.md, "Detail-oracle controls")."""
+    pp, _ = radial_power_spectrum(pred, mask)
+    pr, _ = radial_power_spectrum(ref, mask)
+    c = 0.5 * (BIN_EDGES[:-1] + BIN_EDGES[1:])
+    d = (np.log10(pp + FLOOR) - np.log10(pr + FLOOR))[c < f_max]
+    d = d[np.isfinite(d)]
+    return float(np.abs(d).mean()) if d.size else float("nan")
 
 
 def band_power(frames, mask=None, f_lo: float = 0.0, f_hi: float = 0.5) -> float:
@@ -586,10 +614,12 @@ def run_sequence(model_or_callable, lr: torch.Tensor, aux: torch.Tensor, extra_a
 
 
 def score_sequence(out: torch.Tensor, lr: torch.Tensor, hr: torch.Tensor, aux: torch.Tensor, mask=None,
-                   tweight=None) -> dict:
+                   tweight=None, hr_flow=None, fair: bool = True) -> dict:
     """All metrics of one output sequence (L,3,h,w) vs hr. mask: spatial region (default: dilated lr alpha);
     tweight: per-pixel weight of the temporal metrics (default: the same region). Temporal metrics warp `out`
-    with its OWN estimated apparent motion (sequence_flow(out)), never the stored fluid motion (module docstring)."""
+    with its OWN estimated apparent motion (sequence_flow(out)), never the stored fluid motion (module docstring).
+    fair=True also adds `fair_detail_scores` (spectrum_error_bl, band_*, grad_hist, contrast_hist, patch_swd, tlp,
+    tlp_log_ratio, pop, tof); legacy keys are unchanged. hr_flow: sequence_flow(hr), to avoid recomputing it."""
     if mask is None:
         mask = effect_mask(aux[:, 0])
     if tweight is None:
@@ -602,6 +632,9 @@ def score_sequence(out: torch.Tensor, lr: torch.Tensor, hr: torch.Tensor, aux: t
         r["swim"] = detail_swim(out, lr, motion, tweight)
     if out.shape[0] > 2:
         r["jerk"] = temporal_jerk(out, tweight)
+    if fair:
+        fs = fair_detail_scores(out, hr, mask, tweight, flow_ref=hr_flow, flow_out=motion)
+        r.update({k: v for k, v in fs.items() if k not in ("change_out", "change_ref")})
     return r
 
 
@@ -705,7 +738,7 @@ def evaluate_screen_detail(model_or_callable, version: str, split: str = "test",
             rec["jerk_hr"] = temporal_jerk(hr, tw)
         for name, fn in methods.items():
             out = run_sequence(fn, lr, aux, extra_aux)
-            rec[name] = score_sequence(out, lr, hr, aux, mask, tw)
+            rec[name] = score_sequence(out, lr, hr, aux, mask, tw, hr_flow=motion)
         per.append(rec)
         n_frames += lr.shape[0]
     res = {"version": version, "split": split, "length": length, "n_sequences": len(per), "n_frames": n_frames,
@@ -721,6 +754,10 @@ def evaluate_screen_detail(model_or_callable, version: str, split: str = "test",
     for name in methods:
         agg = {k: float(np.nanmean([p[name][k] for p in per]))
                for k in ("l1", "spectrum_error", "spectrum_log_ratio", "ms_dssim")}
+        # fair-to-unaligned-detail metrics (mean over sequences); the Layer 4 detail gates use DETAIL_GATE_METRICS
+        for k in per[0][name]:
+            if k not in agg and k not in ("flicker", "swim", "jerk"):
+                agg[k] = float(np.nanmean([p[name].get(k, np.nan) for p in per]))
         if "flicker" in per[0][name]:
             agg.update(flicker=float(np.nanmean([p[name]["flicker"] for p in per])),
                        flicker_ratio=_pooled(per, name, "flicker", "flicker_hr"),
@@ -734,3 +771,262 @@ def evaluate_screen_detail(model_or_callable, version: str, split: str = "test",
                        jerk_ratio=_pooled(per, name, "jerk", "jerk_hr"))
         res["methods"][name] = agg
     return res
+
+
+# ============================================================================ fair-to-unaligned-detail metrics
+# Added 2026-11-09 (sim-carried detail phase). Procedural / advected / adversarial detail never matches the
+# steered 256^3 reference pixel for pixel, so l1 and ms_dssim against it punish exactly the wisps we want, and
+# warp-error flicker rewards blur (a 1-px blur of hr scores 0.75). These metrics compare DISTRIBUTIONS on the effect
+# region (how much detail at each scale, what gradients / contrasts / local patches look like) and compare the
+# output's frame-to-frame CHANGE with the reference's own change (TecoGAN tOF / tLP, no pretrained network), so
+# both blur (too little change) and boiling / popping (too much) score worse than the reference itself.
+# All are 0 for pred == ref and lower is better, except the signed diagnostics (`*_log_ratio`, per-band values).
+OCTAVE_EDGES = np.array([1 / 64, 1 / 32, 1 / 16, 1 / 8, 1 / 4, 1 / 2])
+OCTAVE_NAMES = ("32-64px", "16-32px", "8-16px", "4-8px", "2-4px")      # wavelength range of each band
+
+
+def _lum_frames(x) -> torch.Tensor:
+    """(..., 3, h, w) or (..., h, w) luminance -> (N, h, w) float luminance."""
+    x = to_float(x)
+    y = luminance(x) if x.dim() >= 3 and x.shape[-3] == 3 else x
+    return y.reshape(-1, *y.shape[-2:])
+
+
+def _mask_frames(mask, n: int, h: int, w: int, device) -> torch.Tensor:
+    """mask None | (h,w) | (n,h,w) -> (n,h,w) bool."""
+    if mask is None:
+        return torch.ones(n, h, w, dtype=torch.bool, device=device)
+    m = torch.as_tensor(mask).to(device)
+    m = m > 0 if m.dtype != torch.bool else m
+    m = m.reshape(-1, h, w)
+    return m.expand(n, h, w) if m.shape[0] == 1 else m
+
+
+def band_spectrum(pred, ref, mask=None, edges=OCTAVE_EDGES, names=OCTAVE_NAMES) -> dict:
+    """Luminance power per OCTAVE band, pred vs ref (same crop / window / FLOOR as `spectrum_error`).
+
+    Returns {"bands": {name: log10((P_pred+F)/(P_ref+F))} (signed: < 0 missing detail at that scale, > 0 too much),
+             "distance": mean |band value| (decades)}.
+    The power spectrum magnitude is translation invariant, so this separates "the right amount of detail at each
+    scale" from "detail in the right place": an independent realization of the same texture scores ~0."""
+    pp, _ = radial_power_spectrum(pred, mask, edges)
+    pr, _ = radial_power_spectrum(ref, mask, edges)
+    d = np.log10(pp + FLOOR) - np.log10(pr + FLOOR)
+    bands = {n: float(v) for n, v in zip(names, d)}
+    fin = d[np.isfinite(d)]
+    return {"bands": bands, "distance": float(np.abs(fin).mean()) if fin.size else float("nan")}
+
+
+def wasserstein1(a: torch.Tensor, b: torch.Tensor, n_q: int = 1024) -> float:
+    """1-D Wasserstein-1 distance between two samples (any sizes): mean |Q_a(q) - Q_b(q)| over n_q mid-point
+    quantiles q = (i + 0.5) / n_q (exact for equal sizes when n_q = size)."""
+    a, b = a.flatten().float(), b.flatten().float().to(a.device)
+    if a.numel() == 0 or b.numel() == 0:
+        return float("nan")
+    q = (torch.arange(n_q, device=a.device, dtype=torch.float32) + 0.5) / n_q
+
+    def quant(x):
+        s = torch.sort(x).values
+        pos = q * x.numel() - 0.5
+        i0 = pos.floor().clamp(0, x.numel() - 1).long()
+        i1 = (i0 + 1).clamp(max=x.numel() - 1)
+        f = (pos - i0.float()).clamp(0, 1)
+        return s[i0] * (1 - f) + s[i1] * f
+    return float((quant(a) - quant(b)).abs().mean().item())
+
+
+def _grad_mag(y: torch.Tensor) -> torch.Tensor:
+    """(N,h,w) -> central-difference gradient magnitude (N,h,w), replicate border."""
+    p = F.pad(y[:, None], (1, 1, 1, 1), mode="replicate")[:, 0]
+    gx = 0.5 * (p[:, 1:-1, 2:] - p[:, 1:-1, :-2])
+    gy = 0.5 * (p[:, 2:, 1:-1] - p[:, :-2, 1:-1])
+    return torch.sqrt(gx * gx + gy * gy)
+
+
+def gradient_hist_distance(pred, ref, mask=None) -> float:
+    """W1 between the distributions of luminance gradient magnitude on the effect region (all frames pooled),
+    divided by the reference's mean gradient magnitude (dimensionless). Blur -> gradients too small; noise / boiling
+    -> too large; an independent realization of the same texture -> ~0. Placement-free."""
+    a, b = _lum_frames(pred), _lum_frames(ref)
+    b = b.to(a.device)
+    m = _mask_frames(mask, a.shape[0], *a.shape[-2:], a.device)
+    ga, gb = _grad_mag(a)[m], _grad_mag(b)[m]
+    return wasserstein1(ga, gb) / max(float(gb.mean().item()), 1e-8)
+
+
+def _local_std(y: torch.Tensor, sigma: float) -> torch.Tensor:
+    x = y[:, None]
+    mu = _sep_blur(x, sigma)
+    return (_sep_blur(x * x, sigma) - mu * mu).clamp(min=0).sqrt()[:, 0]
+
+
+def local_contrast_hist_distance(pred, ref, mask=None, sigmas=(1.0, 3.0)) -> float:
+    """Mean over scales sigma of W1(local std of luminance in a Gaussian window sigma, pred vs ref) on the effect
+    region, each divided by the reference's mean local std (dimensionless). Local contrast is what reads as
+    'wispy' vs 'soft'; it is a histogram, so placement-free."""
+    a, b = _lum_frames(pred), _lum_frames(ref)
+    b = b.to(a.device)
+    m = _mask_frames(mask, a.shape[0], *a.shape[-2:], a.device)
+    vals = []
+    for s in sigmas:
+        la, lb = _local_std(a, s)[m], _local_std(b, s)[m]
+        vals.append(wasserstein1(la, lb) / max(float(lb.mean().item()), 1e-8))
+    return float(np.mean(vals))
+
+
+def laplacian_pyramid(y: torch.Tensor, levels: int = 4) -> list:
+    """(N,1,h,w) -> [band_0 (finest), ..., band_{levels-1}]; band_k = G_k - up(G_{k+1}), G_{k+1} = avgpool2(blur G_k).
+    The low-pass residual is not returned (mean brightness is not 'detail')."""
+    out, g = [], y
+    for _ in range(levels):
+        if min(g.shape[-2:]) < 4:
+            break
+        lo = F.avg_pool2d(_sep_blur(g, 1.0), 2)
+        up = F.interpolate(lo, size=g.shape[-2:], mode="bilinear", align_corners=False)
+        out.append(g - up)
+        g = lo
+    return out
+
+
+def patch_swd(pred, ref, mask=None, patch: int = 7, levels: int = 3, n_patches: int = 4096, n_proj: int = 128,
+              seed: int = 0) -> float:
+    """Sliced Wasserstein distance between sets of local patches, per Laplacian-pyramid level (Karras et al. 2018
+    style, no learned weights), mean over levels.
+
+    Per level: `n_patches` patch centres drawn (fixed seed) from the effect-region pixels of all frames; patches of
+    `patch`^2 band-pass luminance values; both sets divided by the reference set's RMS (dimensionless; the level's
+    contrast still counts); projected on `n_proj` fixed random unit directions; W1 between the sorted projections,
+    averaged. Compares what local structure looks like, not where it is."""
+    a, b = _lum_frames(pred), _lum_frames(ref)
+    b = b.to(a.device)
+    N, h, w = a.shape
+    m = _mask_frames(mask, N, h, w, a.device).float()[:, None]
+    pa, pb = laplacian_pyramid(a[:, None], levels), laplacian_pyramid(b[:, None], levels)
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    r = patch // 2
+    dirs = torch.randn(n_proj, patch * patch, generator=g)
+    dirs = (dirs / dirs.norm(dim=1, keepdim=True)).to(a.device)
+    out = []
+    mk = m
+    for lv in range(len(pa)):
+        if lv:
+            mk = F.avg_pool2d(mk, 2)
+        la, lb = pa[lv][:, 0], pb[lv][:, 0]
+        hh, ww = la.shape[-2:]
+        if hh < patch or ww < patch:
+            break
+        valid = mk[:, 0, r:hh - r, r:ww - r] > 0.5
+        idx = torch.nonzero(valid)
+        if idx.shape[0] == 0:
+            continue
+        sel = torch.randint(0, idx.shape[0], (n_patches,), generator=g).to(a.device)
+        f, yy, xx = idx[sel, 0], idx[sel, 1] + r, idx[sel, 2] + r
+        off = torch.arange(-r, r + 1, device=a.device)
+        oy, ox = torch.meshgrid(off, off, indexing="ij")
+        Y = yy[:, None] + oy.flatten()[None]
+        X = xx[:, None] + ox.flatten()[None]
+        Fi = f[:, None].expand_as(Y)
+        da, db = la[Fi, Y, X], lb[Fi, Y, X]
+        s = db.pow(2).mean().sqrt().clamp(min=1e-6)
+        qa = torch.sort((da / s) @ dirs.T, dim=0).values
+        qb = torch.sort((db / s) @ dirs.T, dim=0).values
+        out.append(float((qa - qb).abs().mean().item()))
+    return float(np.mean(out)) if out else float("nan")
+
+
+def lap_distance(a, b, mask=None, levels: int = 4) -> torch.Tensor:
+    """Per-frame perceptual-style distance WITHOUT learned weights: mean over Laplacian-pyramid levels of the masked
+    mean |band_k(a) - band_k(b)| of luminance (each scale counts equally, the brightness residual not at all).
+    a, b (N, 3, h, w) or (N, h, w); mask (N,h,w)|(h,w)|None. Returns (N,) tensor (luminance units)."""
+    ya, yb = _lum_frames(a), _lum_frames(b)
+    yb = yb.to(ya.device)
+    N, h, w = ya.shape
+    m = _mask_frames(mask, N, h, w, ya.device).float()[:, None]
+    pa, pb = laplacian_pyramid(ya[:, None], levels), laplacian_pyramid(yb[:, None], levels)
+    acc = torch.zeros(N, device=ya.device)
+    for k, (ba, bb) in enumerate(zip(pa, pb)):
+        mk = m if k == 0 else F.adaptive_avg_pool2d(m, ba.shape[-2:])
+        den = mk.sum(dim=(1, 2, 3)).clamp(min=1e-8)
+        acc += ((ba - bb).abs() * mk).sum(dim=(1, 2, 3)) / den
+    return acc / max(len(pa), 1)
+
+
+def temporal_change(seq, mask=None, levels: int = 4, flow=None) -> np.ndarray:
+    """(L, 3, h, w) -> (L-1,) lap_distance(x_{t-1}, x_t) on the region mask_{t-1} OR mask_t: how much the image
+    changes from frame to frame, at all scales (unwarped, like TecoGAN's LP(b_{t-1}, b_t)).
+    flow (L,2,h,w) given: x_{t-1} is first brought to frame t with it (`warp_backward`), i.e. the change that is
+    left after following the sequence's apparent motion (used by the pop score)."""
+    x = to_float(seq)
+    L = x.shape[0]
+    if L < 2:
+        raise ValueError("need at least 2 frames")
+    m = None
+    if mask is not None:
+        mm = _mask_frames(mask, L, *x.shape[-2:], x.device)
+        m = mm[1:] | mm[:-1]
+    prev = x[:-1]
+    if flow is not None:
+        prev, _ = warp_backward(x[:-1], torch.as_tensor(flow).to(x.device)[1:])
+    return lap_distance(prev, x[1:], m, levels).cpu().numpy().astype(np.float64)
+
+
+def tlp(out, ref, mask=None, levels: int = 4, flow_out=None, flow_ref=None) -> dict:
+    """TecoGAN-style tLP with a weight-free perceptual distance: compare the OUTPUT's frame-to-frame change with the
+    REFERENCE's frame-to-frame change.
+        d_o(t) = lap_distance(out_{t-1}, out_t),  d_r(t) = lap_distance(ref_{t-1}, ref_t)      (unwarped)
+        tlp           = mean_t |d_o - d_r| / mean_t d_r          (0 = changes exactly as much as the reference)
+        tlp_log_ratio = mean_t log(d_o / d_r)                     (< 0: too static / blurred, > 0: boiling / noise)
+        pop           = burst(c_o) / burst(c_r), burst(c) = max_t c / median_t c, with c the change LEFT AFTER
+                        warping by the sequence's own flow (`temporal_change(..., flow=sequence_flow(x))`): spikes
+                        of non-motion change, e.g. periodic regeneration of detail coordinates; the reference's own
+                        burstiness is divided out (> 1 = poppier than the reference).
+    Both blur (too little change) and boiling (too much) move tlp up; the reference itself scores 0 / 0 / 1."""
+    do = temporal_change(out, mask, levels)
+    dr = temporal_change(ref, mask, levels)
+    fo = sequence_flow(out) if flow_out is None else flow_out
+    fr = sequence_flow(ref) if flow_ref is None else flow_ref
+    co = temporal_change(out, mask, levels, fo)
+    cr = temporal_change(ref, mask, levels, fr)
+    eps = 1e-9
+    burst = lambda d: float(d.max() / max(np.median(d), eps))
+    return {"tlp": float(np.abs(do - dr).mean() / max(dr.mean(), eps)),
+            "tlp_log_ratio": float(np.mean(np.log((do + eps) / (dr + eps)))),
+            "pop": burst(co) / max(burst(cr), eps),
+            "change_out": float(do.mean()), "change_ref": float(dr.mean())}
+
+
+def tof(out, ref, mask=None, flow_out=None, flow_ref=None) -> float:
+    """TecoGAN tOF: mean over t >= 1 of the masked mean endpoint distance |F_out(t) - F_ref(t)| (pixels), F = each
+    sequence's OWN apparent motion (`sequence_flow`: smooth pyramidal Lucas-Kanade). Detail that moves with the
+    content gives the reference's flow; detail stuck to the screen, re-rolled or boiling pulls the estimated
+    flow away from it. Flows may be passed in to avoid recomputing."""
+    fo = sequence_flow(out) if flow_out is None else flow_out
+    fr = sequence_flow(ref) if flow_ref is None else torch.as_tensor(flow_ref).to(fo.device)
+    L, _, h, w = fo.shape
+    m = _mask_frames(mask, L, h, w, fo.device).float()
+    e = (fo - fr).pow(2).sum(1).sqrt()                       # (L, h, w)
+    num = (e[1:] * m[1:]).sum(dim=(1, 2))
+    den = m[1:].sum(dim=(1, 2)).clamp(min=1e-8)
+    return float((num / den).mean().item())
+
+
+DETAIL_GATE_METRICS = ("spectrum_error_bl", "band_distance", "grad_hist", "patch_swd", "tlp")
+
+
+def fair_detail_scores(out, ref, mask=None, tmask=None, flow_ref=None, levels: int = 4, flow_out=None) -> dict:
+    """Everything above for one output sequence (L,3,h,w) vs the reference sequence: band spectrum (per band and
+    distance), gradient / local-contrast histogram distances, patch SWD, tLP (+ log ratio, pop) and tOF.
+    mask: spatial region (h,w)|(L,h,w); tmask: temporal region (default = mask)."""
+    tmask = mask if tmask is None else tmask
+    bs = band_spectrum(out, ref, mask)
+    r = {"spectrum_error_bl": spectrum_error_bl(out, ref, mask),
+         "band_distance": bs["distance"], **{f"band_{k}": v for k, v in bs["bands"].items()},
+         "grad_hist": gradient_hist_distance(out, ref, mask),
+         "contrast_hist": local_contrast_hist_distance(out, ref, mask),
+         "patch_swd": patch_swd(out, ref, mask)}
+    if to_float(out).shape[0] > 1:
+        fo = sequence_flow(out) if flow_out is None else torch.as_tensor(flow_out).to(to_float(out).device)
+        fr = sequence_flow(ref) if flow_ref is None else torch.as_tensor(flow_ref).to(fo.device)
+        r.update(tlp(out, ref, tmask, levels, flow_out=fo, flow_ref=fr))
+        r["tof"] = tof(out, ref, tmask, flow_out=fo, flow_ref=fr)
+    return r

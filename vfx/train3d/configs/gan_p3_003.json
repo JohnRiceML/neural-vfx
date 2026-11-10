@@ -1,0 +1,9 @@
+{"name": "gan_p3_w003",
+ "hypothesis": "GAN probe 3 (3 min, s3d_v1), weight sweep: as probe 2 (chroma_proj, no fm) with adv = temporal = 0.003. Detail oracle: hr's own detail shifted 2 px already fails ms_dssim vs lr, so only near-registered detail can pass the gates; find the largest adversarial weight whose hold-out l1 and ms_dssim stay <= lr (probe 2 at 0.01: 1.055 / 1.089).",
+ "init": "C:/Users/ricej/AppData/Local/neural-vfx/checkpoints/screen3d/v1_reg_backup.pt",
+ "init_override": {"chroma_proj": true},
+ "train": {"minutes": 3, "frames": 3, "holdout_sequences": 24, "weight_decay": 0.05, "val_every": 100000, "lr": 1e-4, "warmup_steps": 50},
+ "loss": {"ssim": 0.3, "speckle": 1.0, "spec_max_frac": 0.3},
+ "adv": {"weight": 0.003, "fm": 0.0, "temporal": 0.003, "d_width": 32},
+ "select": {"rule": "constrained_spec", "every": 300},
+ "eval": {"splits": ["test"], "max_sequences": 2}}

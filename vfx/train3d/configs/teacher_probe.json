@@ -1,0 +1,39 @@
+{
+ "name": "teacher_probe",
+ "hypothesis": "Teacher probe (5 min, s3d_v1, from scratch, regression objective of the control: L1 + grad + 0.02 low-band spectrum + speckle + 0.3 MS-SSIM + temporal): unconstrained net, trunk stride 2, 96 wide x 12 blocks, HR head 3x3 16->32->3, chroma_proj, grey_lowfreq 8, alpha_gate 0.5. Speed check and first look: does capacity buy registered detail (hold midband / ms_dssim) faster than the budget net (probe_nospeck reached ms_dssim 0.168 on test at 4 min)?",
+ "model": {
+  "width": 96,
+  "n_blocks": 12,
+  "trunk_stride": 2,
+  "hr_feats": 16,
+  "hr_hidden": 32,
+  "hr_kernel": 3,
+  "use_prev": false,
+  "grey_lowfreq": 8,
+  "alpha_gate": 0.5,
+  "chroma_proj": true
+ },
+ "train": {
+  "minutes": 5,
+  "frames": 3,
+  "holdout_sequences": 24,
+  "weight_decay": 0.05,
+  "val_every": 100000,
+  "lr": 0.0003
+ },
+ "loss": {
+  "ssim": 0.3,
+  "speckle": 1.0,
+  "spec_max_frac": 0.3
+ },
+ "select": {
+  "rule": "constrained_spec",
+  "every": 500
+ },
+ "eval": {
+  "splits": [
+   "test"
+  ],
+  "max_sequences": 4
+ }
+}

@@ -1,0 +1,57 @@
+{
+ "dataset": "s3d_v2",
+ "model": {
+  "width": 64,
+  "n_blocks": 8,
+  "trunk_stride": 4,
+  "hr_feats": 8,
+  "hr_hidden": 16,
+  "hr_kernel": 3,
+  "use_prev": false,
+  "grey_lowfreq": 8,
+  "alpha_gate": 0.5,
+  "chroma_proj": true
+ },
+ "train": {
+  "minutes": 15,
+  "frames": 3,
+  "holdout_scenarios": 12,
+  "chunk_sequences": 80,
+  "chunk_minutes": 2.0,
+  "weight_decay": 0.05,
+  "val_every": 100000,
+  "lr": 5e-05,
+  "val_test_sequences": 16,
+  "warmup_steps": 50
+ },
+ "loss": {
+  "ssim": 0.3,
+  "speckle": 1.0,
+  "spec_max_frac": 0.3
+ },
+ "select": {
+  "rule": "constrained_spec",
+  "every": 500,
+  "key": "midband",
+  "max_l1_rel": 1.1,
+  "max_ms_dssim_rel": 1.1,
+  "max_jerk_ratio": 1.1,
+  "max_speckle_rel_hr": 1.5
+ },
+ "eval": {
+  "splits": [
+   "test",
+   "ood"
+  ]
+ },
+ "name": "final2_v2_gan",
+ "hypothesis": "FINAL 2 (15 min, s3d_v2, amended rule): adversarial fine-tune of final 1's selected weights: conditional spatial + temporal patch D (32 wide, SN, hinge) + feature matching (adv 0.01, temporal 0.01, fm 0.1; D-only warm-up 200 steps), regression losses unchanged, chroma_proj on (no colour fringes). On s3d_v1 this weight gave crisper rims and a few lines but no filaments, and failed ms_dssim by ~10%. Question: with 3x the data, does the adversarial term produce visibly more plausible fine structure (pictures) at hr-like mid-band power, without speckle, colour fringes or boiling? Selection: amended rule (jerk <= 1.1, speckle and colour speckle <= 1.5x hr, l1 / ms_dssim <= 1.1x lr sanity bound; key |midband|). Kept as a separate named checkpoint, not promoted.",
+ "init": "FINAL1",
+ "adv": {
+  "weight": 0.01,
+  "temporal": 0.01,
+  "fm": 0.1,
+  "d_width": 32,
+  "d_warmup": 200
+ }
+}

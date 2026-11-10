@@ -170,3 +170,23 @@ blob moves through the light volume.
 
 Files: `renderer.py` (pipeline, params, camera), `kernels.py` (Warp kernels), `bench.py`,
 `aux_check.py` (aux self-check + cost).
+
+## Advected detail (`detail=`, sim-carried detail phase) — added 2026-11-09
+`draw(..., detail=AdvectedDetail)` (vfx/detail3d) samples procedural sub-grid detail while marching:
+every density/temperature tap becomes `kernels.detail_sample` (displaced point read through the
+advected noise coordinates, see vfx/detail3d/README.md). Nothing above the input volume's resolution
+is written. Also changed for detail draws only:
+* the **light volume** (key transmittance + sky occlusion) marches the detailed density
+  (`light_volume_detail`, `light_octaves` = 1 noise octave: finer ones are below its 80³ resolution),
+  so wisps cast and receive self-shadows at the light volume's resolution;
+* occupancy bricks are **dilated by one brick** (`dilate_occ` → `occd`), since displaced samples read
+  smoke up to ~1 brick away;
+* graph keys gain `("detail", id(detail), detail.version)`; `reuse_volume=True` additionally requires
+  the same detail object/version as the last prep.
+Works with any volume resolution (e.g. 64³ raw, or a 128³ hires density) and with `return_aux`.
+
+**`detail=None` is bit-identical to before**: the march / light kernels are built from one source by
+`_make_march(AUX, DETAIL)` / `_make_light_volume(DETAIL)`; the detail code sits in `wp.static(DETAIL)`
+branches, the non-detail variants get placeholder arguments they never read. Checked: 20 frames
+(presets 1-2 × march 0.5/1.0 × plain / reuse_volume / aux / no solid / 256³ volume) hash-identical
+before and after; `tests3d/test_render3d.py` 17 passed. Cost: see vfx/detail3d/README.md "Costs".

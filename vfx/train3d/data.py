@@ -14,18 +14,23 @@ import torch.nn.functional as F
 
 class GPUWindows:
     def __init__(self, version: str, split: str, device="cuda", max_sequences: int | None = None,
-                 seq_range: tuple | None = None):
-        """seq_range (a, b): only sequences a..b-1 (2 cameras per scenario, scenario-major: a hold-out of whole
-        scenarios is a contiguous even range)."""
+                 seq_range: tuple | None = None, seq_ids: list | None = None):
+        """seq_range (a, b): only sequences a..b-1 (s3d_v1: 2 cameras per scenario, scenario-major). seq_ids: explicit
+        sequence indices (whole-scenario hold-outs on datasets with a varying camera count: `scenario_split`)."""
         from vfx.datagen3d import load_sequences
         ds = load_sequences(version, split, 16, stride=16)
-        a, b = seq_range if seq_range else (0, len(ds))
-        b = min(b if b >= 0 else len(ds) + b, len(ds))
-        a = a if a >= 0 else len(ds) + a
+        if seq_ids is not None:
+            ids = list(seq_ids)
+        else:
+            a, b = seq_range if seq_range else (0, len(ds))
+            b = min(b if b >= 0 else len(ds) + b, len(ds))
+            a = a if a >= 0 else len(ds) + a
+            ids = list(range(a, b))
         if max_sequences is not None:
-            b = min(b, a + max_sequences)
+            ids = ids[:max_sequences]
+        self.ids = ids
         lr, hr, aux, ha, moving = [], [], [], [], []
-        for i in range(a, b):
+        for i in ids:
             it = ds[i]
             lr.append(it["lr"].to(device))
             hr.append(it["hr"].to(device))
@@ -81,3 +86,14 @@ class GPUWindows:
     def fixed_batch(self, B: int, K: int, crop: int, seed: int = 123):
         """Deterministic validation batch (no flips)."""
         return self.sample(B, K, crop, np.random.default_rng(seed), hflip=False)
+
+
+def scenario_split(version: str, split: str, holdout_scenarios: int):
+    """(train sequence ids, hold-out sequence ids): the LAST `holdout_scenarios` scenarios (all their cameras) are
+    held out. Items of load_sequences(version, split, 16, stride=16) are one per sequence, scenario-major."""
+    from vfx.datagen3d import load_sequences
+    ds = load_sequences(version, split, 16, stride=16)
+    sc = list(ds.seq_scenario)
+    n_sc = max(sc) + 1 if sc else 0
+    cut = n_sc - holdout_scenarios
+    return [j for j, k in enumerate(sc) if k < cut], [j for j, k in enumerate(sc) if k >= cut]

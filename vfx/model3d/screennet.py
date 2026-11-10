@@ -3,6 +3,8 @@
   rgb (n,3,H,W) in [0,1], aux (n,4,H,W) raw renderer units, prev (n,3,H,W) in [0,1] (optional)
       ── normalize aux, concat ── PixelUnshuffle(r) ── conv3x3 → N residual blocks (C) @ H/r x W/r
       ── conv3x3 → F*r^2 → PixelShuffle(r) → F ch @ H x W
+  optional mid path (mid_width > 0): trunk ── conv → PixelShuffle(2) ⊕ PixelUnshuffle(2)(rgb, aux) ── conv, res blocks
+      @ H/2 x W/2 ── conv (zero-init) → PixelShuffle(2) ── added to the F HR features
   HR head: concat[F feats, rgb, prev] → conv k → ReLU → conv k → Δrgb ; out = rgb + Δrgb
 
 H, W must be multiples of r (and of grey_lowfreq when set). The last conv is zero-initialised: untrained output == input frame.
@@ -39,6 +41,10 @@ class ScreenNetConfig:
     prev_warp: float = 0.0      # fraction of `motion` used to align the previous output (runtime + training)
     alpha_gate: float = 0.0     # k > 0: |Δrgb| <= k * alpha (detail only where the medium is; no halos on background)
     grey_lowfreq: int = 0       # k > 0: the part of Δrgb coarser than k px is made grey (no large-scale colour shift)
+    mid_width: int = 0          # > 0: extra stride-2 path (trunk features x2 + the input at 1/2 res), added to the HR features
+    mid_blocks: int = 1
+    chroma_proj: bool = False   # Δrgb projected per pixel onto span{rgb, grey}: detail may scale the input colour or add grey, never new hues
+    gate_dilate: int = 0        # > 0: alpha_gate uses alpha max-pooled over (2k+1)^2 px (room for thin wisps at plume edges)
 
 
 class ResBlock2D(nn.Module):
@@ -65,6 +71,14 @@ class ScreenNet(nn.Module):
         self.head = nn.Conv2d(cin * r * r, c, 3, padding=1)
         self.blocks = nn.Sequential(*[ResBlock2D(c, cfg.res_scale) for _ in range(cfg.n_blocks)])
         self.tail = nn.Conv2d(c, cfg.hr_feats * r * r, 3, padding=1)
+        if cfg.mid_width:      # zero-initialised output: a checkpoint without it loads and behaves unchanged
+            m, cin2 = cfg.mid_width, (3 + (AUX_CHANNELS if cfg.use_aux else 0)) * 4
+            self.mid_up = nn.Conv2d(c, m * 4, 3, padding=1)
+            self.mid_in = nn.Conv2d(m + cin2, m, 3, padding=1)
+            self.mid_blocks = nn.Sequential(*[ResBlock2D(m, cfg.res_scale * 5) for _ in range(cfg.mid_blocks)])
+            self.mid_out = nn.Conv2d(m, cfg.hr_feats * 4, 3, padding=1)
+            nn.init.zeros_(self.mid_out.weight)
+            nn.init.zeros_(self.mid_out.bias)
         k = cfg.hr_kernel
         hr_in = cfg.hr_feats + 3 + (3 if cfg.use_prev else 0)
         self.hr1 = nn.Conv2d(hr_in, cfg.hr_hidden, k, padding=k // 2)
@@ -85,20 +99,44 @@ class ScreenNet(nn.Module):
         if self.cfg.use_prev:
             parts.append(prev)
         x = torch.cat(parts, dim=1)
+        x0 = x
         x = F.relu(self.head(self.unshuffle(x)), inplace=True)
         x = self.blocks(x)
-        x = F.relu(self.shuffle(self.tail(x)))
+        f = self.shuffle(self.tail(x))
+        if self.cfg.mid_width:
+            u = F.pixel_shuffle(F.relu(self.mid_up(x)), 2)
+            s2 = F.pixel_unshuffle(x0[:, :3 + (AUX_CHANNELS if self.cfg.use_aux else 0)], 2)
+            mm = self.mid_blocks(F.relu(self.mid_in(torch.cat([u, s2], 1)), inplace=True))
+            f = f + F.pixel_shuffle(self.mid_out(mm), 2)
+        x = F.relu(f)
         hr = [x, rgb] + ([prev] if self.cfg.use_prev else [])
         d = self.hr2(F.relu(self.hr1(torch.cat(hr, dim=1)), inplace=True))      # Δrgb
+        if self.cfg.chroma_proj:
+            d = chroma_project(d, rgb)
         k = self.cfg.grey_lowfreq
         if k:       # keep fine detail in colour, but large-scale corrections may only change brightness
             lo = F.interpolate(F.avg_pool2d(d, k), scale_factor=k, mode="bilinear", align_corners=False)
             d = d - lo + lo.mean(1, keepdim=True)
         g = self.cfg.alpha_gate
         if g and aux is not None:
-            lim = aux[:, 0:1].clamp(0.0, 1.0) * g
+            a = aux[:, 0:1].clamp(0.0, 1.0)
+            if self.cfg.gate_dilate:
+                a = F.max_pool2d(a, 2 * self.cfg.gate_dilate + 1, 1, self.cfg.gate_dilate)
+            lim = a * g
             d = torch.minimum(torch.maximum(d, -lim), lim)
         return d
+
+
+def chroma_project(d, rgb, eps: float = 1e-3):
+    """Least-squares projection of d (n,3,H,W) onto span{rgb, (1,1,1)} per pixel (fp32; ridge eps for grey pixels)."""
+    dt = d.dtype
+    d, c = d.float(), rgb.float()
+    cc, c1, d1, dc = (c * c).sum(1, keepdim=True), c.sum(1, keepdim=True), d.sum(1, keepdim=True), (d * c).sum(1, keepdim=True)
+    a11, a12, a22 = cc + eps, c1, 3.0
+    det = a11 * a22 - a12 * a12 + eps
+    a = (a22 * dc - a12 * d1) / det
+    b = (a11 * d1 - a12 * dc) / det
+    return (a * c + b).to(dt)
 
 
 def save_screen_net(model: ScreenNet, path, extra: dict | None = None) -> None:
@@ -111,3 +149,18 @@ def load_screen_net(path, device="cuda") -> ScreenNet:
     m = ScreenNet(ScreenNetConfig(**{k: v for k, v in ck["config"].items() if k in names}))
     m.load_state_dict(ck["state_dict"])
     return m.to(device).eval()
+
+
+def load_screen_net_extended(path, device="cuda", **override) -> ScreenNet:
+    """Checkpoint weights in a (possibly larger) architecture: config = checkpoint config updated by `override`;
+    parameters the checkpoint lacks (e.g. the zero-initialised mid path) keep their init. Same output as the checkpoint
+    as long as the override only adds zero-initialised paths."""
+    ck = torch.load(path, map_location="cpu", weights_only=False)
+    names = {f.name for f in fields(ScreenNetConfig)}
+    cfg = {k: v for k, v in ck["config"].items() if k in names}
+    cfg.update(override)
+    m = ScreenNet(ScreenNetConfig(**cfg))
+    missing, unexpected = m.load_state_dict(ck["state_dict"], strict=False)
+    if unexpected or any(not k.startswith("mid_") for k in missing):
+        raise ValueError(f"incompatible override: missing {missing}, unexpected {unexpected}")
+    return m.to(device).train()

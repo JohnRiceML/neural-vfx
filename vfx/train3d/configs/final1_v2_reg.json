@@ -1,0 +1,48 @@
+{
+ "dataset": "s3d_v2",
+ "model": {
+  "width": 64,
+  "n_blocks": 8,
+  "trunk_stride": 4,
+  "hr_feats": 8,
+  "hr_hidden": 16,
+  "hr_kernel": 3,
+  "use_prev": false,
+  "grey_lowfreq": 8,
+  "alpha_gate": 0.5,
+  "chroma_proj": true
+ },
+ "train": {
+  "minutes": 20,
+  "frames": 3,
+  "holdout_scenarios": 12,
+  "chunk_sequences": 80,
+  "chunk_minutes": 2.0,
+  "weight_decay": 0.05,
+  "val_every": 100000,
+  "lr": 0.0001,
+  "val_test_sequences": 16,
+  "warmup_steps": 50
+ },
+ "loss": {
+  "ssim": 0.3,
+  "speckle": 1.0,
+  "spec_max_frac": 0.3
+ },
+ "select": {
+  "rule": "constrained_spec",
+  "every": 500
+ },
+ "eval": {
+  "splits": [
+   "test",
+   "ood"
+  ]
+ },
+ "name": "final1_v2_reg",
+ "hypothesis": "FINAL 1 (20 min, s3d_v2, pre-registered rule): FINE-TUNE of the v1 regression weights + chroma_proj (no new hues) with the run-2 regression recipe on s3d_v2's complete train scenarios (198 at start, 3 cameras each; hold-out = last 12 scenarios), 80-sequence GPU chunks swapped every 2 min. Two from-scratch attempts were aborted at 1-2.4 steps/s (GPU shared with the v2 build, app3d.compare, native tests: 11-15.6 of 16 GB), too few steps for a from-scratch run. Data lever: if more data helps, the hold-out curve should keep improving well past the ~5-min optimum seen on s3d_v1, and beat P (v1) on its hold-out (P: l1 0.990x, ms_dssim 0.977x lr, spectrum 0.169, midband -0.258).",
+ "init": "C:/Users/ricej/AppData/Local/neural-vfx/checkpoints/screen3d/v1_reg_backup.pt",
+ "init_override": {
+  "chroma_proj": true
+ }
+}

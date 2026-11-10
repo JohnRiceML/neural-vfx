@@ -31,7 +31,19 @@ BUDGET_MS = 6.0
 STAGE_BUDGET = {"sim": 2.0, "detail": 2.5, "render": 1.5}     # spec, per 60 Hz frame
 MARCH_SCALES = [1.0, 0.5, 0.25]
 SHORT = {"raw": "raw 64³", "trilinear": "trilinear 256³", "neural_vol": "neural vol (A)",
-         "neural_screen": "neural screen (B)", "ref128": "ref 128³ sim"}
+         "neural_screen": "neural screen (B)", "ref128": "ref 128³ sim",
+         "detail": "64³ + detail", "detail_screen": "detail + B", "hires": "hires 128³", "hires_detail": "hires + detail"}
+DETAIL_QUALITIES = ["low", "medium", "high"]
+DETAIL_BENCH_JSON = Path(__file__).resolve().parents[1] / "detail3d" / "bench_latest.json"
+
+
+def detail_march_delta() -> dict:
+    """Bench-measured added march ms per quality at 1440p / scale 0.5 (vfx.detail3d.bench), {} if absent."""
+    try:
+        rows = json.loads(DETAIL_BENCH_JSON.read_text(encoding="utf-8")).get("render", [])
+        return {r["detail"]: r for r in rows if r.get("march_scale") == 0.5 and r["detail"] != "none"}
+    except Exception:
+        return {}
 DIM_TXT = (150, 158, 175)
 BENCH_JSON = Path(__file__).resolve().parents[2] / "bench3d" / "results" / "latest.json"
 
@@ -132,7 +144,11 @@ class App:
         self.args = args
         self.b = load_backends(force_stub_sim=args.stub_sim, warmup=args.warmup_neural,
                                checkpoint_b=args.screen_ckpt)
+        self.b.screen_ckpt = args.screen_ckpt
         self.pipe = Pipeline(self.b, march_scale=args.march_scale, steps=args.steps)
+        self.pipe.set_detail_quality(args.detail_quality)
+        self.pipe.set_temporal(args.temporal)
+        self.detail_delta = detail_march_delta()
         self.ctl = Controls()
         self.orbit = Orbit()
         self.auto_orbit = args.orbit
@@ -165,6 +181,10 @@ class App:
     def cycle(self, which: str):
         cur = getattr(self, which)
         setattr(self, which, MODES[(MODES.index(cur) + 1) % len(MODES)])
+
+    def cycle_detail_quality(self):
+        q = self.pipe.detail_quality
+        self.pipe.set_detail_quality(DETAIL_QUALITIES[(DETAIL_QUALITIES.index(q) + 1) % len(DETAIL_QUALITIES)])
 
     def cycle_march_scale(self):
         i = (MARCH_SCALES.index(self.pipe.march_scale) + 1) % len(MARCH_SCALES) \
@@ -227,7 +247,8 @@ class App:
         """GPU ms of one view's stages: per tick (30 Hz work) and per 60 Hz display frame (amortized:
         sim / volume upscale / volume prep run every other frame, screen-space detail every frame)."""
         t = self.pipe.timer
-        sim = t.last("sim_ref") if mode == "ref128" else t.last("sim")
+        sim = t.last("sim_ref") if mode == "ref128" else t.last("sim_hires") if mode in ("hires", "hires_detail") \
+            else t.last("sim")
         if mode == "trilinear":
             det_tick, det_frame, det_lab = t.last("upscale"), 0.5 * t.last("upscale"), "detail  upscale@30"
         elif mode == "neural_vol":
@@ -235,15 +256,24 @@ class App:
         elif mode == "neural_screen":
             d = t.last(f"detail.{slot}")
             det_tick, det_frame, det_lab = d, d, "detail  net @60Hz"
+        elif mode in ("detail", "detail_screen", "hires_detail"):
+            # advected-detail step per tick (amortized /2); its march sampling is inside the render row
+            st_ = t.last("detail_step.hires" if mode == "hires_detail" else "detail_step.lr")
+            det_tick, det_frame = st_, 0.5 * st_
+            det_lab = f"detail  adv.{self.pipe.detail_quality[:3]}@30"
+            if mode == "detail_screen":
+                d = t.last(f"detail.{slot}")
+                det_tick, det_frame, det_lab = det_tick + d, det_frame + d, "detail  adv+net"
         else:
             det_tick = det_frame = 0.0
             det_lab = "detail  (none)"
         rn, rv = t.last(f"render.{slot}"), t.last(f"render_view.{slot}")
-        res = f"{_pipeline.REF_RES}³" if mode == "ref128" else "64³"
+        res = f"{_pipeline.REF_RES}³" if mode == "ref128" else "64³+128³ρ" if mode in ("hires", "hires_detail") else "64³"
         return {
             "rows": [("sim", f"sim {res}  @30Hz", f"{sim:5.2f}", 0.5 * sim, STAGE_BUDGET["sim"]),
                      ("detail", det_lab, f"{det_tick:5.2f}", det_frame, STAGE_BUDGET["detail"]),
-                     ("render", "render  new|reuse", f"{rn:4.2f}|{rv:4.2f}", 0.5 * (rn + rv), STAGE_BUDGET["render"])],
+                     ("render", "render+det new|reuse" if mode in ("detail", "detail_screen", "hires_detail")
+                      else "render  new|reuse", f"{rn:4.2f}|{rv:4.2f}", 0.5 * (rn + rv), STAGE_BUDGET["render"])],
             "tick_ms": {"sim": sim, "detail": det_tick, "render": rn},
             "tick_total": sim + det_tick + rn,
             "frame_ms": 0.5 * sim + det_frame + 0.5 * (rn + rv),
@@ -263,6 +293,12 @@ class App:
         if ref and self.mode != "ref128" and b["tick_total"] > 0:
             extra.append((f"direct 256³ sim {ref:4.1f} ms/step (bench3d {scene}) = "
                           f"{ref / b['tick_total']:4.1f}x this tick", (190, 200, 255)))
+        if self.mode in ("detail", "detail_screen", "hires_detail"):
+            q = self.pipe.detail_quality
+            dd = self.detail_delta.get(q)
+            extra.append((f"detail {q} (Q cycles): render row includes detail sampling"
+                          + (f"; bench 1440p/0.5: +{dd['added_full']:.2f} new | +{dd['added_view']:.2f} reuse ms"
+                             if dd else "; run vfx.detail3d.bench for the 1440p march delta"), (150, 220, 150)))
         b["extra"] = extra
         return b
 
@@ -282,7 +318,7 @@ class App:
             (f"{SHORT[self.mode]}" + (f"  |  {SHORT[self.mode2]}" if self.side else ""), Y),
             (f"preset {self.preset_id}: {self.preset.name}" + ("  [PAUSED]" if self.paused else ""), W),
             (f"fps {fps:5.1f}   1% low {low:5.1f}", G if low >= 50 else R),
-            (f"march {rr}", DIM_TXT),
+            (f"march {rr}" + ("  TEMPORAL" if self.pipe.temporal else ""), DIM_TXT),
             (f"VRAM torch peak {peak:4.0f} MB  dev {(total - free) / 2**20:5.0f}", W),
             (f"sim step {self.pipe.sim_steps}  fires {len(self.ctl.fires)}" + ("  TORCH" if self.ctl.torch_on else ""), W),
             (f"dissipation {self.pipe.sim_overrides.get('density_dissipation', '-')}/s  "
@@ -290,7 +326,7 @@ class App:
         ]
         if self.b.stubs:
             lines.append(("stubs: " + ", ".join(self.b.stubs), R))
-        for m in ("neural_vol", "neural_screen"):
+        for m in ("neural_vol", "neural_screen") + tuple(m_ for m_ in ("hires",) if m_ in self.modes()):
             if not self.pipe.available(m):
                 lines.append((f"{m}: unavailable", R))
         return lines
@@ -336,7 +372,9 @@ class App:
             "fps_mean": float(1000.0 / ft.mean()), "fps_1pct_low": float(1000.0 / worst.mean()),
             "frame_ms": {"mean": float(ft.mean()), "p99": float(np.percentile(ft, 99))},
             "gpu_ms": {k: agg(k) for k in ("sim", "sim_ref", "upscale", "neural_vol", "detail.0", "render.0",
-                                           "render_view.0", "detail.1", "render.1", "render_view.1")},
+                                           "render_view.0", "detail.1", "render.1", "render_view.1",
+                                           "detail_step.lr", "detail_step.hires", "sim_hires")},
+            "detail_quality": self.pipe.detail_quality, "temporal": self.pipe.temporal,
             "budget_main_view": {k: self.stage_ms(self.mode, 0)[k] for k in ("tick_total", "frame_ms")},
             "sim_config": self.pipe.sim_overrides,
             "gpu_ms_per_frame": {"mean": float(gf.mean()) if len(gf) else None,
@@ -441,6 +479,10 @@ def run_window(args):
                     app.side = not app.side
                 elif k == pygame.K_t:
                     app.cycle_march_scale()
+                elif k == pygame.K_q:
+                    app.cycle_detail_quality()
+                elif k == pygame.K_j:
+                    app.pipe.set_temporal(not app.pipe.temporal)
                 elif k == pygame.K_o:
                     app.toggle_obstacle()
                 elif k == pygame.K_r:
@@ -522,6 +564,10 @@ def parse_args(argv=None):
     ap.add_argument("--ref-res", type=int, default=128,
                     help="resolution of the direct-sim reference mode (128 default; 192 or 256 cost far more GPU time and VRAM)")
     ap.add_argument("--window", default="1600x900", help="window size WxH")
+    ap.add_argument("--temporal", action="store_true",
+                    help="temporally amortized ray-march (jittered starts + camera-reprojected history); J toggles")
+    ap.add_argument("--detail-quality", default="medium", choices=DETAIL_QUALITIES,
+                    help="advected-detail quality (noise octaves 1/2/4) for the detail modes; Q cycles it")
     return ap.parse_args(argv)
 
 

@@ -1,0 +1,8 @@
+{"name": "gan_p1",
+ "hypothesis": "GAN probe 1 (5 min, s3d_v1): fine-tune the promoted v1 regression net (init) with conditional patch D (spatial, 32 wide, SN, hinge) + temporal D on 3 unwarped frames + feature matching, small weights (adv 0.01, temporal 0.01, fm 0.1) on top of the unchanged regression losses. The 1.5-min smoke test at 0.05/0.05/0.5 drove hold-out l1 to 1.17x lr and ms_dssim to 1.27x lr (fails the gates) while spectrum fell 0.225 -> 0.126. Expect: spectrum below the init's 0.225 with l1/ms_dssim still under lr on the hold-out.",
+ "init": "C:/Users/ricej/AppData/Local/neural-vfx/checkpoints/screen3d/v1_reg_backup.pt",
+ "train": {"minutes": 5, "frames": 3, "holdout_sequences": 24, "weight_decay": 0.05, "val_every": 400, "lr": 1e-4, "warmup_steps": 50},
+ "loss": {"ssim": 0.3, "speckle": 1.0, "spec_max_frac": 0.3},
+ "adv": {"weight": 0.01, "fm": 0.1, "temporal": 0.01, "d_width": 32},
+ "select": {"rule": "constrained_spec", "every": 400},
+ "eval": {"splits": ["test", "ood"]}}

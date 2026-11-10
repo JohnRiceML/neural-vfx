@@ -1,0 +1,9 @@
+{"name": "gan_p2",
+ "hypothesis": "GAN probe 2 (5 min, s3d_v1): probe 1 produced no filaments but orange/cyan colour fringes along smoke silhouettes (D rewards sharp edges; grey_lowfreq only greys structure coarser than 8 px), hold-out ms_dssim 1.12x lr. Here: chroma_proj (delta projected per pixel onto span{input rgb, grey}: detail can only scale the existing colour or add grey -> no new hues by construction), feature matching off to see the plain adversarial term (adv 0.01, temporal 0.01). Expect no colour fringes; ms_dssim still the binding constraint.",
+ "init": "C:/Users/ricej/AppData/Local/neural-vfx/checkpoints/screen3d/v1_reg_backup.pt",
+ "init_override": {"chroma_proj": true},
+ "train": {"minutes": 5, "frames": 3, "holdout_sequences": 24, "weight_decay": 0.05, "val_every": 400, "lr": 1e-4, "warmup_steps": 50},
+ "loss": {"ssim": 0.3, "speckle": 1.0, "spec_max_frac": 0.3},
+ "adv": {"weight": 0.01, "fm": 0.0, "temporal": 0.01, "d_width": 32},
+ "select": {"rule": "constrained_spec", "every": 400},
+ "eval": {"splits": ["test", "ood"]}}

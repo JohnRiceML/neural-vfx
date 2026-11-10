@@ -26,6 +26,9 @@ from vfx.core.fields import SIM_DT
 from vfx.core.fields3d import Camera, Volume
 from vfx.render.blackbody import blackbody_lut
 from vfx.render3d import kernels as K
+from vfx.render3d import temporal as TK
+
+GOLDEN = 0.6180339887498949
 
 
 @dataclass
@@ -91,7 +94,8 @@ def _gauss1d(sigma: float, device) -> torch.Tensor:
 
 class VolumeRenderer:
     def __init__(self, out_size: tuple[int, int], device: str = "cuda", march_scale: float = 1.0,
-                 params: RenderParams3D | None = None, cuda_graph: bool = True, profile: bool = False):
+                 params: RenderParams3D | None = None, cuda_graph: bool = True, profile: bool = False,
+                 temporal: bool = False):
         wp.init()
         self.device = torch.device(device)
         if self.device.type == "cuda" and self.device.index is None:
@@ -121,6 +125,15 @@ class VolumeRenderer:
         self._vel_tex = self._vel_tex0 = self._tex(2, 2, 2, 4, wp.float16)
         self._vel_buf = None
         self._vel_key = None
+        self._dummy_detail()
+        self._last_detail = None
+        # temporal amortization (opt-in, shortlist #2): see temporal.py
+        self.temporal = bool(temporal)
+        self.t_alpha, self.t_gamma, self.t_kT = 0.1, 1.25, 4.0      # base current weight, clip width, T-change gain
+        self._tcam_dev = torch.zeros(16, device=self.device)        # previous draw's camera + history-valid flag
+        self._tcam_pin = [torch.zeros(16).pin_memory() for _ in range(4)]
+        self._tprev = None
+        self._tframe = 0
         self.set_output(out_size, march_scale)
 
     # ------------------------------------------------------------------ configuration
@@ -136,7 +149,17 @@ class VolumeRenderer:
         self.bloom_buf = torch.zeros(bh, bw, 3, device=self.device)
         self._aux_hdr = None                      # (mh, mw, 4) premultiplied aux at march res (lazy)
         self._aux_out = None                      # (4, out_h, out_w) fp16 at output res (lazy)
+        self._hist = self._tres = None            # temporal history / resolve target at march res (lazy)
+        self._tprev = None                        # history invalid after a resize
         self._graphs.clear()
+
+    def set_temporal(self, on: bool) -> None:
+        """Toggle temporal amortization; turning it on starts from an empty history."""
+        self.temporal = bool(on)
+        self._tprev = None
+
+    def reset_history(self) -> None:
+        self._tprev = None
 
     def set_march_scale(self, s: float) -> None:
         self.set_output((self.out_h, self.out_w), s)
@@ -186,6 +209,19 @@ class VolumeRenderer:
         self.occ_s0 = wp.zeros((K.BRICKS,) * 3, dtype=wp.uint8, device=self.wp_device)
         self.solid_tex, self.occ_s = self.solid_tex0, self.occ_s0
 
+    def _dummy_detail(self) -> None:
+        """Placeholders for the detail arguments of the shared kernel signatures (detail=None draws
+        compile to the original code via wp.static; these are never sampled)."""
+        self._d_tex0 = self._tex(2, 2, 2, 4, wp.float32)
+        self._d_noise0 = self._tex(2, 2, 2, 4, wp.float16)
+        self._d_shade0 = K.DetailShade()
+        self._d_dyn0 = torch.zeros(8, device=self.device)
+
+    def _detail_args(self, f: dict | None, light: bool = False) -> list:
+        if f is None:
+            return [self._d_tex0, self._d_tex0, self._d_noise0, self._d_shade0, wp.from_torch(self._d_dyn0)]
+        return [f["coords"][0], f["coords"][1], f["noise"], f["shade_light" if light else "shade"], wp.from_torch(f["dyn"])]
+
     def _stream(self):
         ts = torch.cuda.current_stream(self.device)
         if self._wp_stream_key != ts.cuda_stream:
@@ -200,9 +236,11 @@ class VolumeRenderer:
             D, H, W = shape
             packed_t = torch.zeros(D, H, W, 2, dtype=torch.float16, device=self.device)
             occ_t = torch.zeros(K.BRICKS, K.BRICKS, K.BRICKS, dtype=torch.uint8, device=self.device)
+            occd_t = torch.zeros_like(occ_t)
             r = self._vol[shape] = {
                 "packed_t": packed_t, "packed": wp.from_torch(packed_t, dtype=wp.vec2h),
                 "occ_t": occ_t, "occ": wp.from_torch(occ_t),
+                "occd_t": occd_t, "occd": wp.from_torch(occd_t),      # dilated by 1 brick (detail draws)
                 "tex": self._tex(D, H, W, 2, wp.float16),
             }
         return r
@@ -237,6 +275,13 @@ class VolumeRenderer:
         self._vel_buf[..., :3].copy_(velocity.permute(1, 2, 3, 0))
         self._vel_tex.copy_from(self._vel_wp)
 
+    def _ensure_hist(self) -> None:
+        if self._hist is None:
+            self._hist = torch.zeros(self.mh, self.mw, 4, device=self.device)
+            self._tres = torch.zeros(self.mh, self.mw, 4, device=self.device)
+            self._tprev = None
+            self._graphs.clear()
+
     def _ensure_aux(self) -> None:
         if self._aux_out is None:
             self._aux_hdr = torch.zeros(self.mh, self.mw, 4, device=self.device)
@@ -247,7 +292,7 @@ class VolumeRenderer:
     @torch.no_grad()
     def draw(self, volume: Volume, camera: Camera, solid: torch.Tensor | None = None,
              reuse_volume: bool = False, *, return_aux: bool = False, velocity: torch.Tensor | None = None,
-             prev_camera: Camera | None = None):
+             prev_camera: Camera | None = None, detail=None):
         """Render to (out_h, out_w, 3) uint8 cuda, row 0 = top. The result is an internal buffer
         reused by the next draw(). Timings ('prep', 'view', 'total' ms) resolve lazily.
 
@@ -260,9 +305,17 @@ class VolumeRenderer:
         cuda at out_size, computed in the same march as the colour (see README "Aux buffers"); also
         internal buffers reused by the next draw. `velocity` (3,D,H,W) m/s at any resolution and
         `prev_camera` (the camera of the previous sim step) feed "motion"; both optional and
-        ignored when return_aux=False (which runs the unchanged colour-only march)."""
+        ignored when return_aux=False (which runs the unchanged colour-only march).
+
+        detail: a vfx.detail3d.AdvectedDetail (opt-in). The march and the light volume then sample the
+        detailed field (displaced / modulated by advected noise, see vfx/detail3d) instead of the plain
+        trilinear volume; no high-res volume is written. detail=None runs the original kernels and is
+        bit-identical to before. reuse_volume=True also requires the same detail object/version."""
         has_solid = solid is not None
-        if reuse_volume and self._last_vol_key is not None and self._last_vol_key[1] == has_solid:
+        dfields = detail.fields() if detail is not None else None
+        dkey = (id(detail), dfields["version"]) if detail is not None else None
+        if reuse_volume and self._last_vol_key is not None and self._last_vol_key[1] == has_solid \
+                and dkey == self._last_detail:
             shape = self._last_vol_key[0]
             res = self._vol[shape]
         else:
@@ -277,6 +330,18 @@ class VolumeRenderer:
             self._cam_i = (self._cam_i + 1) % len(self._cam_pin)
             asp = self.mw / self.mh
             cb = camera_basis(camera, asp)
+            if self.temporal:
+                self._tframe += 1
+                cb = cb.copy()
+                cb[14] = (self._tframe * GOLDEN) % 1.0          # per-frame ray-start jitter offset
+                tp = self._tcam_pin[self._cam_i]
+                if self._tprev is None:
+                    tp.zero_()
+                else:
+                    tp.copy_(torch.from_numpy(self._tprev))
+                    tp[15] = 1.0                                   # history valid
+                self._tcam_dev.copy_(tp, non_blocking=True)
+                self._tprev = cb.copy()
             pin[:16].copy_(torch.from_numpy(cb))
             pin[16:].copy_(torch.from_numpy(camera_basis(prev_camera, asp) if (return_aux and prev_camera is not None) else cb))
             self._cam_dev.copy_(pin, non_blocking=True)
@@ -296,8 +361,10 @@ class VolumeRenderer:
                 wp.launch(kern, dim=shape, inputs=[wp.from_torch(dens, dtype=wdt), wp.from_torch(temp, dtype=wdt),
                                                    res["packed"], res["occ"], float(self.p.d_eps), float(self.p.t_lo)])
                 self._mark(self.profile, "pack")
-                self._run(("prep", shape, has_solid, id(self.solid_tex)), lambda: self._prep(res, has_solid))
+                pkey = ("prep", shape, has_solid, id(self.solid_tex)) + ((("detail",) + dkey,) if dkey else ())
+                self._run(pkey, lambda: self._prep(res, has_solid, dfields))
                 self._last_vol_key = (shape, has_solid)
+                self._last_detail = dkey
             has_vel = 0
             if return_aux:
                 self._ensure_aux()
@@ -310,9 +377,13 @@ class VolumeRenderer:
             ev[1].record()
             if self.profile and reuse_volume:
                 self._mark(True, "start")
+            if self.temporal:
+                self._ensure_aux()
+                self._ensure_hist()
             key = ("view", shape, has_solid, id(self.solid_tex), bool(return_aux), has_vel,
-                   id(self._vel_tex) if return_aux else 0)
-            self._run(key, lambda: self._view(res, has_solid, return_aux, has_vel))
+                   id(self._vel_tex) if return_aux else 0) + ((("detail",) + dkey,) if dkey else ()) \
+                + ((("temporal",),) if self.temporal else ())
+            self._run(key, lambda: self._view(res, has_solid, return_aux, has_vel, dfields, self.temporal))
         ev[2].record()
         self._events = ev
         if return_aux:
@@ -365,15 +436,18 @@ class VolumeRenderer:
         x = F.conv2d(F.pad(x, (r, r, 0, 0), mode="replicate"), kx, groups=C)
         return F.conv2d(F.pad(x, (0, 0, r, r), mode="replicate"), ky, groups=C)
 
-    def _prep(self, res, has_solid: bool) -> None:
+    def _prep(self, res, has_solid: bool, dfields: dict | None = None) -> None:
         """Volume-only work: texture upload, light volume, fire-glow volume."""
         p, prof = self.p, self.profile
         shade = self._shade()
         L = int(p.light_res)
         res["tex"].copy_from(res["packed"])
+        if dfields is not None:
+            wp.launch(K.dilate_occ, dim=(K.BRICKS,) * 3, inputs=[res["occ"], res["occd"]])
         self._mark(prof, "upload")
-        wp.launch(K.light_volume, dim=(L, L, L),
-                  inputs=[res["tex"], self.solid_tex, int(has_solid), self.lut_wp, shade, self.light_arr, self.glow_src])
+        wp.launch(K.light_volume if dfields is None else K.light_volume_detail, dim=(L, L, L),
+                  inputs=[res["tex"], self.solid_tex, int(has_solid), self.lut_wp, shade, self.light_arr, self.glow_src]
+                  + self._detail_args(dfields, light=True))
         self.light_tex.copy_from(self.light_arr)
         # fire glow: emission pyramid 32^3 (narrow) + 8^3 (wide)
         g = self.glow_src_t[..., :3].float().permute(3, 0, 1, 2)[None]          # (1,3,L,L,L)
@@ -385,19 +459,36 @@ class VolumeRenderer:
         self.glow_tex.copy_from(self.glow_arr)
         self._mark(prof, "light")
 
-    def _view(self, res, has_solid: bool, aux: bool = False, has_vel: int = 0) -> None:
-        """Camera-dependent work: march (+ aux), bloom, composite."""
+    def _view(self, res, has_solid: bool, aux: bool = False, has_vel: int = 0, dfields: dict | None = None,
+              temporal: bool = False) -> None:
+        """Camera-dependent work: march (+ aux), [temporal resolve], bloom, composite."""
         p, prof = self.p, self.profile
         shade = self._shade()
+        want_aux = aux
+        aux = aux or temporal                               # temporal needs the march's opacity-weighted depth
         aux_hdr = self._aux_hdr if aux else self.hdr        # unused by the colour-only variant
-        wp.launch(K.march_aux if aux else K.march, dim=(self.mh, self.mw),
-                  inputs=[res["tex"], self.light_tex, self.glow_tex, self.solid_tex, res["occ"], self.occ_s,
+        if dfields is None:
+            kern, occ = (K.march_aux if aux else K.march), res["occ"]
+        else:
+            kern, occ = (K.march_aux_detail if aux else K.march_detail), res["occd"]
+        wp.launch(kern, dim=(self.mh, self.mw),
+                  inputs=[res["tex"], self.light_tex, self.glow_tex, self.solid_tex, occ, self.occ_s,
                           int(has_solid), float(self._solid_res), self.lut_wp, shade,
                           wp.from_torch(self._cam_dev[:16]), float(p.steps), wp.from_torch(self.hdr, dtype=wp.vec4),
                           self._vel_tex if aux else self._vel_tex0, int(has_vel), wp.from_torch(self._cam_dev[16:]),
-                          float(SIM_DT), float(self.out_w), float(self.out_h), wp.from_torch(aux_hdr, dtype=wp.vec4)])
+                          float(SIM_DT), float(self.out_w), float(self.out_h), wp.from_torch(aux_hdr, dtype=wp.vec4)]
+                  + self._detail_args(dfields))
         self._mark(prof, "march")
-        if aux:
+        if temporal:
+            wp.launch(TK.temporal_resolve, dim=(self.mh, self.mw),
+                      inputs=[wp.from_torch(self.hdr, dtype=wp.vec4), wp.from_torch(self._aux_hdr, dtype=wp.vec4),
+                              wp.from_torch(self._hist, dtype=wp.vec4), wp.from_torch(self._cam_dev[:16]),
+                              wp.from_torch(self._tcam_dev), wp.from_torch(self._tres, dtype=wp.vec4),
+                              float(self.t_alpha), float(self.t_gamma), float(self.t_kT)])
+            self._hist.copy_(self._tres)
+            self.hdr.copy_(self._tres)
+            self._mark(prof, "temporal")
+        if want_aux:
             wp.launch(K.aux_resolve, dim=(self.out_h, self.out_w),
                       inputs=[wp.from_torch(self._aux_hdr, dtype=wp.vec4), wp.from_torch(self._aux_out), 1.0e-3])
             self._mark(prof, "aux")

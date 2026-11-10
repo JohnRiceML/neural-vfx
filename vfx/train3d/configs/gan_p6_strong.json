@@ -1,0 +1,43 @@
+{
+ "name": "gan_p6_strong",
+ "hypothesis": "Probe 6 (4 min, s3d_v1), diagnostic, gates ignored: can this generator synthesise filaments at all? Strong adversarial (adv 0.1, temporal 0.05, fm 0.2), paired fine-scale terms that punish unregistered detail off (speckle 0, ms-ssim 0, grad 0.1), L1 kept at 0.3, mid path on, chroma_proj on. Judge by pictures and hold-out midband / speckle / jerk.",
+ "init": "C:/Users/ricej/AppData/Local/neural-vfx/checkpoints/screen3d/v1_reg_backup.pt",
+ "init_override": {
+  "chroma_proj": true,
+  "mid_width": 32,
+  "mid_blocks": 2
+ },
+ "train": {
+  "minutes": 4,
+  "frames": 3,
+  "holdout_sequences": 24,
+  "weight_decay": 0.05,
+  "val_every": 100000,
+  "lr": 0.0001,
+  "warmup_steps": 50
+ },
+ "loss": {
+  "l1": 0.3,
+  "grad": 0.1,
+  "ssim": 0.0,
+  "speckle": 0.0,
+  "spec": 0.02,
+  "spec_max_frac": 0.3
+ },
+ "adv": {
+  "weight": 0.1,
+  "fm": 0.2,
+  "temporal": 0.05,
+  "d_width": 32
+ },
+ "select": {
+  "rule": "constrained_spec",
+  "every": 300
+ },
+ "eval": {
+  "splits": [
+   "test"
+  ],
+  "max_sequences": 2
+ }
+}

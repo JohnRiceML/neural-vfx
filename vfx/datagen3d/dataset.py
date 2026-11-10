@@ -8,7 +8,11 @@ Item (all torch tensors):
   "hr_alpha" (L,h,w) uint8 medium alpha of the HR render x 255 (masks / eval)
   "seed" int, "cam" int, "t0" int (frame index of the window start within the 16-frame sequence),
   "moving" bool (camera moves in this sequence)
-Arrays are np.load(mmap_mode="r"), opened lazily per worker (DataLoader num_workers > 0 on Windows).
+Storage per scenario dir: s3d_v1 = four .npy files (np.load mmap_mode="r"); s3d_v2 = one lossless `data.pack`
+(vfx/datagen3d/pack.py; one contiguous read + zlib inflate per window). Both are opened lazily per worker
+(DataLoader num_workers > 0 on Windows). The number of cameras can differ between scenarios (v2: 3 per new
+scenario, 2 per scenario imported from v1); `ds.seq_scenario[j]` maps sequence j (scenario-major order,
+`ds.sequences`) to its scenario. Tags for slicing: `ds.tags(i)` = scenario tags + this item's camera tags.
 """
 from __future__ import annotations
 
@@ -21,7 +25,8 @@ from torch.utils.data import Dataset
 
 from vfx.core import paths
 
-from .runner import is_complete, scenario_dir
+from . import pack
+from .runner import is_complete, scenario_dir, storage_of
 
 
 class SequenceDataset3D(Dataset):
@@ -33,6 +38,7 @@ class SequenceDataset3D(Dataset):
             raise KeyError(f"split {split!r} not in {list(splits)}")
         self.scenarios: list[dict] = []
         self.index: list[tuple[int, int, int]] = []        # (scenario idx, cam, t0)
+        self.sequences: list[tuple[int, int]] = []          # (scenario idx, cam), scenario-major
         for seed in splits[split]:
             d = scenario_dir(self.root, split, seed)
             if not is_complete(d):
@@ -42,9 +48,12 @@ class SequenceDataset3D(Dataset):
             if self.length > T:
                 raise ValueError(f"length {length} > frames per sequence {T}")
             k = len(self.scenarios)
-            self.scenarios.append({"dir": d, "seed": int(seed), "tags": meta["tags"],
+            self.scenarios.append({"dir": d, "seed": int(seed), "tags": meta["tags"], "storage": storage_of(d),
+                                   "cam_tags": [c.get("tags", []) for c in meta["cams"]],
                                    "moving": [bool(c["moving"]) for c in meta["cams"]]})
+            self.sequences += [(k, c) for c in range(K)]
             self.index += [(k, c, t0) for c in range(K) for t0 in range(0, T - self.length + 1, stride)]
+        self.seq_scenario = [k for k, _ in self.sequences]
         self._mm: dict = {}
 
     def __len__(self):
@@ -58,25 +67,37 @@ class SequenceDataset3D(Dataset):
     def _arrays(self, k):
         a = self._mm.get(k)
         if a is None:
-            d = self.scenarios[k]["dir"]
-            a = self._mm[k] = {n: np.load(d / f"{n}.npy", mmap_mode="r") for n in ("lr", "hr", "aux", "hr_alpha")}
+            sc = self.scenarios[k]
+            d = sc["dir"]
+            if sc["storage"] == "pack":
+                a = self._mm[k] = pack.read_header(d / pack.PACK_NAME)
+            else:
+                a = self._mm[k] = {n: np.load(d / f"{n}.npy", mmap_mode="r") for n in ("lr", "hr", "aux", "hr_alpha")}
         return a
 
     def __getitem__(self, i):
         k, c, t0 = self.index[i]
         a = self._arrays(k)
-        sl = slice(t0, t0 + self.length)
-        return {"lr": torch.from_numpy(np.ascontiguousarray(a["lr"][c, sl])),
-                "hr": torch.from_numpy(np.ascontiguousarray(a["hr"][c, sl])),
-                "aux": torch.from_numpy(np.ascontiguousarray(a["aux"][c, sl])),
-                "hr_alpha": torch.from_numpy(np.ascontiguousarray(a["hr_alpha"][c, sl])),
+        if self.scenarios[k]["storage"] == "pack":
+            w = pack.read_window(a, c, t0, self.length)
+        else:
+            sl = slice(t0, t0 + self.length)
+            w = {n: np.ascontiguousarray(a[n][c, sl]) for n in ("lr", "hr", "aux", "hr_alpha")}
+        return {"lr": torch.from_numpy(w["lr"]), "hr": torch.from_numpy(w["hr"]),
+                "aux": torch.from_numpy(w["aux"]), "hr_alpha": torch.from_numpy(w["hr_alpha"]),
                 "seed": self.scenarios[k]["seed"], "cam": c, "t0": t0,
                 "moving": self.scenarios[k]["moving"][c]}
 
     def meta(self, i) -> dict:
-        """meta.json of item i's scenario (cameras per frame, crop, tracking, ...)."""
+        """meta.json of item i's scenario (cameras per frame, crop, tracking, tags, ...)."""
         k = self.index[i][0]
         return json.loads((self.scenarios[k]["dir"] / "meta.json").read_text())
+
+    def tags(self, i) -> list[str]:
+        """Scenario tags + camera tags of item i (e.g. "large_fire", "closeup", "flame_dominated")."""
+        k, c, _ = self.index[i]
+        sc = self.scenarios[k]
+        return list(sc["tags"]) + [t for t in sc["cam_tags"][c] if t not in sc["tags"]]
 
 
 def load_sequences(version: str, split: str = "train", length: int = 8, stride: int = 1) -> SequenceDataset3D:

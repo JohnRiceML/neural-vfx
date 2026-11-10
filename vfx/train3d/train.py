@@ -42,8 +42,19 @@ DEFAULTS = {
     "train": {"minutes": 20.0, "batch": 12, "crop": 192, "frames": 3, "lr": 3e-4, "min_lr": 1e-5,
               "warmup_steps": 200, "grad_clip": 1.0, "seed": 0, "hflip": True, "log_every": 50, "val_every": 500,
               "ema": 0.999, "detach_prev": False, "max_train_sequences": None, "bg_weight": 0.1,
-              "weight_decay": 1e-4, "holdout_sequences": 0},
+              "weight_decay": 1e-4, "holdout_sequences": 0,
+              # whole-scenario hold-out (datasets with a varying camera count) and GPU streaming of big train splits:
+              # a random chunk of `chunk_sequences` train sequences lives on the GPU, replaced every `chunk_minutes`
+              "holdout_scenarios": 0, "chunk_sequences": None, "chunk_minutes": 3.0},
     "loss": {"l1": 1.0, "grad": 0.5, "spec": 0.02, "spec_max_frac": 0.5, "temporal": 0.5, "ssim": 0.0, "speckle": 0.0},
+    # adversarial (vfx/train3d/adversarial.py): weight = spatial hinge G loss, temporal = temporal-D G loss,
+    # fm = feature matching on the spatial D. D starts at step 0, G adv terms after d_warmup steps.
+    "adv": {"weight": 0.0, "temporal": 0.0, "fm": 0.0, "d_lr": 2e-4, "d_width": 64, "d_down": 2, "d_flat": 2,
+            "r1": 0.0, "r1_every": 4, "aug_shift": 0, "d_warmup": 0, "betas": [0.5, 0.99]},
+    # model selection: "score" = old summed relative score on a fixed hold-out batch; "constrained_spec" = the
+    # pre-registered rule on whole hold-out sequences (vfx/train3d/holdout.py, EXPERIMENTS.md "selection rule").
+    "select": {"rule": "score", "every": 600, "max_l1_rel": 1.0, "max_ms_dssim_rel": 1.0, "max_jerk_ratio": 1.1,
+               "max_speckle_rel_hr": 1.5, "holdout_max_sequences": None},
     "eval": {"splits": ["test", "ood"], "max_sequences": None},
 }
 
@@ -105,6 +116,91 @@ def rollout(model, lr, hr, aux, mask, cfg):
     return total, terms, out
 
 
+class Adversary:
+    """Spatial (+ optional temporal) conditional patch discriminators, their optimizer, and the G-side terms."""
+
+    def __init__(self, cfg, K):
+        from vfx.train3d import adversarial as A
+        self.A, self.ac, self.K = A, cfg["adv"], K
+        ac = self.ac
+        self.ds = A.PatchD(10, ac["d_width"], ac["d_down"], ac["d_flat"]).cuda()
+        self.dt = (A.PatchD(A.temporal_channels(K), ac["d_width"], ac["d_down"], ac["d_flat"]).cuda()
+                   if ac["temporal"] and K > 1 else None)
+        ps = list(self.ds.parameters()) + (list(self.dt.parameters()) if self.dt is not None else [])
+        self.params = ps
+        self.opt = torch.optim.Adam(ps, lr=ac["d_lr"], betas=tuple(ac["betas"]))
+        self.scaler = torch.amp.GradScaler("cuda")
+        self.n = 0
+
+    def _inputs(self, y, lr, aux, mask):
+        """y, lr (B,K,3,H,W) -> spatial input (BK,10,H,W), weights, temporal input or None."""
+        A = self.A
+        al = aux[:, :, 0:1].clamp(0, 1)
+        m = mask.unsqueeze(2)
+        xs = A.spatial_input(y.flatten(0, 1), lr.flatten(0, 1), al.flatten(0, 1))
+        xt = A.temporal_input(y, lr, al) if self.dt is not None else None
+        return xs, m, xt
+
+    def d_step(self, out, lr, hr, aux, mask):
+        """One D update (fp16 autocast + own GradScaler). Returns detached tensors (no host sync)."""
+        A, ac = self.A, self.ac
+        out = out.detach().clamp(0, 1)
+        xs_f, m, xt_f = self._inputs(out, lr, aux, mask)
+        xs_r, _, xt_r = self._inputs(hr, lr, aux, mask)
+        mf = m.flatten(0, 1)
+        if ac["aug_shift"]:      # same random translation for real, fake and mask (D input statistics only)
+            xs_f, xs_r, mf = A.translate_aug([xs_f, xs_r, mf], ac["aug_shift"])
+        ws = A.patch_weight(mf, self.ds.stride)
+        do_r1 = ac["r1"] and self.n % ac["r1_every"] == 0
+        if do_r1:
+            xs_r.requires_grad_(True)
+        with torch.autocast("cuda", dtype=torch.float16):
+            dr, df = self.ds(xs_r).float(), self.ds(xs_f).float()
+            loss = A.d_hinge(dr, df, ws)
+            logs = {"d_s": loss.detach(), "d_real": A._wmean(dr, ws).detach(), "d_fake": A._wmean(df, ws).detach()}
+            if self.dt is not None:
+                wt = A.patch_weight(m[:, self.K // 2], self.dt.stride)
+                lt = A.d_hinge(self.dt(xt_r).float(), self.dt(xt_f).float(), wt)
+                loss = loss + lt
+                logs["d_t"] = lt.detach()
+        if do_r1:        # R1 in fp32 (double backward)
+            r1 = A.r1_penalty(self.ds(xs_r), xs_r, ws)
+            loss = loss + ac["r1"] * ac["r1_every"] * 0.5 * r1
+            logs["r1"] = r1.detach()
+        self.opt.zero_grad(set_to_none=True)
+        self.scaler.scale(loss).backward()
+        self.scaler.step(self.opt)
+        self.scaler.update()
+        self.n += 1
+        return logs
+
+    def g_terms(self, out, lr, hr, aux, mask):
+        """G-side adversarial terms (D frozen; gradients flow into `out`)."""
+        A, ac = self.A, self.ac
+        for p in self.params:
+            p.requires_grad_(False)
+        xs_f, m, xt_f = self._inputs(out, lr, aux, mask)
+        ws = A.patch_weight(m.flatten(0, 1), self.ds.stride)
+        terms = {}
+        with torch.autocast("cuda", dtype=torch.float16):
+            if ac["fm"]:
+                xs_r, _, _ = self._inputs(hr, lr, aux, mask)
+                df, ff = self.ds(xs_f, features=True)
+                with torch.no_grad():
+                    _, fr = self.ds(xs_r, features=True)
+                terms["fm"] = A.feature_match([f.float() for f in ff], [f.float() for f in fr], m.flatten(0, 1).float())
+            else:
+                df = self.ds(xs_f)
+            terms["adv"] = A.g_hinge(df.float(), ws)
+            if self.dt is not None:
+                wt = A.patch_weight(m[:, self.K // 2], self.dt.stride)
+                terms["adv_t"] = A.g_hinge(self.dt(xt_f).float(), wt)
+        for p in self.params:
+            p.requires_grad_(True)
+        total = ac["weight"] * terms["adv"] + ac["fm"] * terms.get("fm", 0.0) + ac["temporal"] * terms.get("adv_t", 0.0)
+        return total, terms
+
+
 @torch.no_grad()
 def quick_val(model, batch, cfg):
     """Training-curve numbers on a fixed batch: masked L1 and spectral term, model vs the lr input."""
@@ -146,10 +242,26 @@ def train(cfg):
     gen = np.random.default_rng(tc["seed"])
     t_load = time.time()
     ho = tc["holdout_sequences"]
-    data = GPUWindows(cfg["dataset"], "train", max_sequences=tc["max_train_sequences"],
-                      seq_range=(0, -ho) if ho else None)
-    hold = GPUWindows(cfg["dataset"], "train", seq_range=(-ho, 1 << 30)) if ho else None
-    test = GPUWindows(cfg["dataset"], "test")
+    chunk = tc["chunk_sequences"]
+    if tc["holdout_scenarios"]:
+        from vfx.train3d.data import scenario_split
+        train_ids, hold_ids = scenario_split(cfg["dataset"], "train", tc["holdout_scenarios"])
+        hold = GPUWindows(cfg["dataset"], "train", seq_ids=hold_ids)
+    else:
+        from vfx.datagen3d import load_sequences
+        n_all = len(load_sequences(cfg["dataset"], "train", 16, stride=16))
+        train_ids = list(range(0, n_all - ho))
+        hold = GPUWindows(cfg["dataset"], "train", seq_range=(-ho, 1 << 30)) if ho else None
+    if tc["max_train_sequences"]:
+        train_ids = train_ids[:tc["max_train_sequences"]]
+    chunk_rng = np.random.default_rng(tc["seed"] + 1)
+
+    def load_chunk():
+        ids = train_ids if not chunk or chunk >= len(train_ids) else sorted(int(i) for i in chunk_rng.choice(train_ids, chunk, replace=False))
+        return GPUWindows(cfg["dataset"], "train", seq_ids=ids)
+    data = load_chunk()
+    print(f"train sequences {len(train_ids)} (chunk {chunk}), hold-out {0 if hold is None else hold.N}", flush=True)
+    test = GPUWindows(cfg["dataset"], "test", max_sequences=tc.get("val_test_sequences"))
     print(f"data: train {data.N} seqs ({data.nbytes() / 2**30:.2f} GiB on GPU), test {test.N}; "
           f"{time.time() - t_load:.0f} s", flush=True)
     K = tc["frames"]
@@ -157,7 +269,8 @@ def train(cfg):
     if hold is not None:      # model selection ONLY on held-out train scenarios (never on test)
         val_batches["hold"] = hold.fixed_batch(32, K, 256)
     if cfg.get("init"):
-        model = load_screen_net(cfg["init"]).train()
+        from vfx.model3d.screennet import load_screen_net_extended
+        model = load_screen_net_extended(cfg["init"], **cfg.get("init_override", {})).train()
     else:
         model = ScreenNet(ScreenNetConfig(**cfg["model"])).cuda()
     model = model.to(memory_format=torch.channels_last)
@@ -174,8 +287,25 @@ def train(cfg):
         logf.write(json.dumps({"step": step, **d}) + "\n")
         logf.flush()
 
+    adv = Adversary(cfg, K) if (cfg["adv"]["weight"] or cfg["adv"]["fm"] or cfg["adv"]["temporal"]) else None
+    sel = cfg["select"]
+    hset = None
+    if sel["rule"] == "constrained_spec":
+        if hold is None:
+            raise ValueError("select.rule constrained_spec needs train.holdout_sequences > 0")
+        from vfx.train3d.holdout import HoldoutSet, select_key, select_ok
+        hset = HoldoutSet(hold, sel["holdout_max_sequences"])
+        ref = hset.reference()
+        print(f"hold-out reference: lr {ref['lr']}  hr speckle/frame {ref['hr_speckle']:.1f}", flush=True)
+        log(0, {"hold_ref": ref})
+        if cfg.get("init"):          # the init weights are a candidate too (selection may keep them)
+            r0 = hset.evaluate(model)
+            log(0, {"hold": r0})
+            print(f"  hold init {json.dumps({k: round(v, 4) for k, v in r0.items()})}", flush=True)
     budget, t0, step, n_bad, curve = tc["minutes"] * 60, time.time(), 0, 0, []
+    t_chunk = time.time()
     best = (float("inf"), None, 0)
+    best_any = (float("inf"), None, 0)
     model.train()
     while True:
         frac = (time.time() - t0) / budget
@@ -185,8 +315,20 @@ def train(cfg):
             * min(1.0, (step + 1) / tc["warmup_steps"])
         for g in opt.param_groups:
             g["lr"] = lr_now
+        if chunk and chunk < len(train_ids) and time.time() - t_chunk > tc["chunk_minutes"] * 60:
+            del data
+            torch.cuda.empty_cache()
+            data = load_chunk()
+            t_chunk = time.time()
         b = data.sample(tc["batch"], K, tc["crop"], gen, hflip=tc["hflip"])
-        total, terms, _ = rollout(model, *b, cfg)
+        total, terms, out = rollout(model, *b, cfg)
+        if adv is not None:
+            dlog = adv.d_step(out, *b)
+            if step >= cfg["adv"]["d_warmup"]:
+                at, aterms = adv.g_terms(out, *b)
+                total = total + at
+                terms = {**terms, **aterms}
+            terms = {**terms, **dlog}
         if not torch.isfinite(total):
             n_bad += 1
             if n_bad >= 50:
@@ -215,7 +357,7 @@ def train(cfg):
             ev_m = ema if ema is not None else model
             v = {f"{sp}_{k}": x for sp, bt in val_batches.items() for k, x in quick_val(ev_m, bt, cfg).items()}
             v["elapsed_min"] = round((time.time() - t0) / 60, 3)
-            if "hold_l1" in v:     # selection score: l1 + ms-ssim surrogate + spectrum, each relative to lr
+            if "hold_l1" in v and sel["rule"] == "score":     # selection score: l1 + ms-ssim surrogate + spectrum, each relative to lr
                 sc = v["hold_l1"] / v["hold_l1_lr"] + v["hold_ssim"] / v["hold_ssim_lr"] + v["hold_spec"] / v["hold_spec_lr"]
                 v["hold_score"] = sc
                 if sc < best[0]:
@@ -223,7 +365,30 @@ def train(cfg):
             curve.append({"step": step, **v})
             log(step, {"val": v})
             print("  val " + " ".join(f"{k}={x:.5g}" for k, x in v.items()), flush=True)
+        if hset is not None and step % sel["every"] == 0:
+            ev_m = ema if ema is not None else model
+            r = hset.evaluate(ev_m)
+            r["elapsed_min"] = round((time.time() - t0) / 60, 3)
+            ok = select_ok(r, sel)
+            r["ok"] = ok
+            k = select_key(r, sel)
+            if ok and k < best[0]:
+                best = (k, copy.deepcopy(ev_m.state_dict()), step)
+            # fallback if nothing is ever feasible: the old relative score (l1 + ms_dssim + spectrum vs lr)
+            fb = r["l1_rel"] + r["ms_dssim_rel"] + r["spectrum_error_rel"]
+            if fb < best_any[0]:
+                best_any = (fb, copy.deepcopy(ev_m.state_dict()), step)
+            curve.append({"step": step, "hold": r})
+            log(step, {"hold": r})
+            print(f"  hold {'OK ' if ok else 'bad'} " + " ".join(f"{a}={b:.4g}" for a, b in r.items() if a != "ok"),
+                  flush=True)
     final = ema if ema is not None else model
+    selection_failed = False
+    if hset is not None and best[1] is None and best_any[1] is not None:
+        print("selection: no hold-out evaluation met the constraints; falling back to the summed score "
+              "(NOT a candidate under the pre-registered rule)", flush=True)
+        best = best_any
+        selection_failed = True
     if best[1] is not None:
         final.load_state_dict(best[1])
         print(f"selected step {best[2]} (hold-out score {best[0]:.4f})", flush=True)
@@ -231,9 +396,10 @@ def train(cfg):
     save_screen_net(final, ck, {"dataset": cfg["dataset"], "step": step, "run": run_dir.name, "init": cfg.get("init")})
     CKPT_DIR.mkdir(parents=True, exist_ok=True)
     shutil.copy2(ck, CKPT_DIR / f"{run_dir.name}.pt")
-    summary = {"selected_step": best[2] if best[1] is not None else step, "steps": step, "minutes": round((time.time() - t0) / 60, 2), "params": param_count(final),
-               "val_curve_last": curve[-1] if curve else None}
-    del data, test, val_batches, hold
+    summary = {"selection_failed": selection_failed, "selected_step": best[2] if best[1] is not None else step, "steps": step, "minutes": round((time.time() - t0) / 60, 2), "params": param_count(final),
+               "val_curve_last": curve[-1] if curve else None,
+               "selected_hold": next((c["hold"] for c in curve if "hold" in c and c["step"] == best[2]), None)}
+    del data, test, val_batches, hold, hset
     torch.cuda.empty_cache()
     try:
         ev = final_eval(ck, cfg)
@@ -255,7 +421,7 @@ def train(cfg):
 
 
 def _compact(s):
-    out = {k: s.get(k) for k in ("steps", "selected_step", "minutes", "params")}
+    out = {k: s.get(k) for k in ("steps", "selected_step", "selection_failed", "minutes", "params")}
     ev = s.get("eval")
     if isinstance(ev, dict):
         for sp in ("test", "ood"):
@@ -267,6 +433,7 @@ def _compact(s):
     else:
         out["eval"] = ev
     out["val_last"] = s.get("val_curve_last")
+    out["selected_hold"] = s.get("selected_hold")
     return out
 
 

@@ -1,0 +1,37 @@
+{
+ "name": "ctrl_chroma_noadv",
+ "hypothesis": "Control (3 min, s3d_v1): the gan_p3 recipe with NO adversarial term (chroma_proj fine-tune of v1 with the regression losses only). Probes p3 at adv 0.001 and 0.003 both jumped from the init (hold ms_dssim 0.94x lr, midband -0.33) to about 1.0x lr and -0.15 within 300 steps, nearly independent of the weight: is that the GAN or the fine-tune?",
+ "init": "C:/Users/ricej/AppData/Local/neural-vfx/checkpoints/screen3d/v1_reg_backup.pt",
+ "init_override": {
+  "chroma_proj": true
+ },
+ "train": {
+  "minutes": 3,
+  "frames": 3,
+  "holdout_sequences": 24,
+  "weight_decay": 0.05,
+  "val_every": 100000,
+  "lr": 0.0001,
+  "warmup_steps": 50
+ },
+ "loss": {
+  "ssim": 0.3,
+  "speckle": 1.0,
+  "spec_max_frac": 0.3
+ },
+ "adv": {
+  "weight": 0.0,
+  "fm": 0.0,
+  "temporal": 0.0
+ },
+ "select": {
+  "rule": "constrained_spec",
+  "every": 300
+ },
+ "eval": {
+  "splits": [
+   "test"
+  ],
+  "max_sequences": 2
+ }
+}

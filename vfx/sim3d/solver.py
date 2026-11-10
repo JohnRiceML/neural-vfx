@@ -18,12 +18,14 @@ import torch
 import warp as wp
 
 from vfx.core.fields import AMBIENT_TEMP, DOMAIN_SIZE
-from vfx.core.fields3d import (CH3, NUM_CHANNELS_3D, FieldMeta3D, FieldState3D, Forces3D,
+from vfx.core.fields3d import (CH3, NUM_CHANNELS_3D, FieldMeta3D, FieldState3D, Forces3D, Volume,
                                rasterize_obstacles_3d)
 
+from . import hires as HR
 from . import kernels as K
-from .config import SOLVER3D_VERSION, SolverConfig3D
+from .config import SolverConfig3D, solver_version_tag
 from .pressure import PressureSolver3D
+from .pressure_fused import FusedPressure3D
 
 _CFG_SLOTS = {
     "buoyancy_alpha": K.P_ALPHA, "buoyancy_beta": K.P_BETA, "vorticity_eps": K.P_EPS,
@@ -81,7 +83,9 @@ class Solver3D:
     SEPARABLE_SMOOTH = True # [1,2,1]^3 smoothing as 3 separable passes (identical result)
     FAST_VCYCLE = True      # False = plain V-cycle (ablation / reference)
 
-    def __init__(self, res: int, config: SolverConfig3D | None = None, device="cuda"):
+    def __init__(self, res: int, config: SolverConfig3D | None = None, device="cuda", scalar_res: int | None = None):
+        """scalar_res (opt-in, e.g. 128): density / temperature / fuel are also carried on a finer
+        scalar_res^3 grid by the res^3 velocity and restricted back each step (see hires.py)."""
         wp.init()
         self.res = int(res)
         self.config = config if config is not None else SolverConfig3D()
@@ -115,6 +119,15 @@ class Solver3D:
         self._graphs: OrderedDict = OrderedDict()
         self._wrap_cache: dict = {}
         self._cap_stream = wp.Stream(self.wdev)
+        self.pressure_fused: FusedPressure3D | None = None    # built on first use of pressure_mode "fused"
+        self.scalar_res = None if scalar_res is None else int(scalar_res)
+        if self.scalar_res is not None:
+            self._init_hires()
+
+    @property
+    def version(self) -> str:
+        """SOLVER3D_VERSION for the default path, plus a suffix per opt-in option in use."""
+        return solver_version_tag(self.config, self.scalar_res)
 
     # ------------------------------------------------------------------ public API
     def reset(self, obstacles=()) -> FieldState3D:
@@ -123,7 +136,11 @@ class Solver3D:
         data = torch.zeros(NUM_CHANNELS_3D, N, N, N, device=self.device, dtype=torch.float32)
         data[CH3["temperature"]] = AMBIENT_TEMP
         meta = FieldMeta3D.for_res(N)
-        meta.solver_version = SOLVER3D_VERSION
+        meta.solver_version = self.version
+        if self.scalar_res is not None:
+            self.set_hires_obstacles(obstacles)
+            self.hi.zero_()
+            self.hi[HR.H_T] = AMBIENT_TEMP
         return FieldState3D(data=data, solid=solid, meta=meta)
 
     def step(self, state: FieldState3D, forces: Forces3D, dt: float) -> FieldState3D:
@@ -134,19 +151,23 @@ class Solver3D:
             wp.capture_launch(self._graph("step", state), stream=stream)
         state.meta.step += 1
         state.meta.dt = float(dt)
-        state.meta.solver_version = SOLVER3D_VERSION
+        state.meta.solver_version = self.version
         return state
 
     def step_profiled(self, state: FieldState3D, forces: Forces3D, dt: float) -> dict:
-        """Same step as step(), launched as three graphs with CUDA events in between.
-        Returns ms per stage {advection, forces, projection, total} (synchronizes)."""
+        """Same step as step(), launched as three graphs with CUDA events in between (four with
+        scalar_res: the fine-scalar stage is timed separately as `scalars`).
+        Returns ms per stage {advection, [scalars,] forces, projection, total} (synchronizes)."""
         self._check(state)
         stream = self._torch_stream()
         ts = torch.cuda.current_stream(torch.device(self.device))
-        ev = [torch.cuda.Event(enable_timing=True) for _ in range(4)]
+        kinds = ("s_adv", "s_forces", "project") if self.scalar_res is None else ("s_adv", "s_hires", "s_forces", "project")
+        names = [{"s_adv": "advection", "s_hires": "scalars", "s_forces": "forces", "project": "projection"}[k]
+                 for k in kinds]
+        ev = [torch.cuda.Event(enable_timing=True) for _ in range(len(kinds) + 1)]
         with wp.ScopedStream(stream, sync_enter=False):
             self._upload(forces, dt, stream)
-            graphs = [self._graph(k, state) for k in ("s_adv", "s_forces", "project")]
+            graphs = [self._graph(k, state) for k in kinds]
             # keep the GPU busy while the host enqueues, so no stage is charged for launch latency
             torch.cuda._sleep(3_000_000)
             ev[0].record(ts)
@@ -156,9 +177,91 @@ class Solver3D:
         ev[-1].synchronize()
         state.meta.step += 1
         state.meta.dt = float(dt)
-        state.meta.solver_version = SOLVER3D_VERSION
-        t = [ev[i].elapsed_time(ev[i + 1]) for i in range(3)]
-        return dict(advection=t[0], forces=t[1], projection=t[2], total=sum(t))
+        state.meta.solver_version = self.version
+        t = [ev[i].elapsed_time(ev[i + 1]) for i in range(len(kinds))]
+        out = dict(zip(names, t))
+        out["total"] = sum(t)
+        return out
+
+    # ------------------------------------------------------------------ finer scalar grid (opt-in)
+    def hires_volume(self) -> Volume | None:
+        """The fine density + temperature (views of the solver's buffer, no copy; valid until the next
+        step), or None without scalar_res."""
+        if self.scalar_res is None:
+            return None
+        return Volume(density=self.hi[HR.H_D], temperature=self.hi[HR.H_T])
+
+    def hires_fields(self) -> torch.Tensor | None:
+        """(3, S, S, S) density, temperature, fuel (the live buffer), or None."""
+        return None if self.scalar_res is None else self.hi
+
+    def set_hires_obstacles(self, obstacles=()):
+        """Rasterise obstacles at scalar_res (reset() does this). Call it whenever state.solid is changed
+        by hand, with the same obstacles: the fine grid does not read state.solid."""
+        if self.scalar_res is not None:
+            self.hi_solid.copy_(rasterize_obstacles_3d(list(obstacles), self.scalar_res, device=self.device))
+
+    def init_hires_from_state(self, state: FieldState3D):
+        """Fill the fine scalars from the coarse ones (trilinear, cell centred; 0 / ambient in fine solids).
+        For states built by hand; reset() already starts both grids empty."""
+        if self.scalar_res is None:
+            return
+        import torch.nn.functional as F
+        src = state.data[[CH3["density"], CH3["temperature"], CH3["fuel"]]][None]
+        up = F.interpolate(src, size=(self.scalar_res,) * 3, mode="trilinear", align_corners=False)[0]
+        fl = self.hi_solid < 0.5
+        self.hi[HR.H_D] = up[0] * fl
+        self.hi[HR.H_T] = torch.where(fl, up[1], torch.full_like(up[1], AMBIENT_TEMP))
+        self.hi[HR.H_F] = up[2] * fl
+
+    def _init_hires(self):
+        S, dev = self.scalar_res, self.device
+        if S < self.res:
+            raise ValueError("scalar_res must be >= res")
+        self.dxf = DOMAIN_SIZE / S
+        self.hi = torch.zeros(3, S, S, S, device=dev, dtype=torch.float32)
+        self.hi[HR.H_T] = AMBIENT_TEMP
+        self.hi_solid = torch.zeros(S, S, S, device=dev, dtype=torch.float32)
+        z = lambda shape: wp.zeros(shape, dtype=float, device=self.wdev)
+        self.hi_hat = z((3, S, S, S))
+        self.hi_adv = z((3, S, S, S))
+        self.hi_scal = z(K.S_SIZE)
+        self.hi_wp = wp.from_torch(self.hi)
+        self.hi_solid_wp = wp.from_torch(self.hi_solid)
+        nb, self.k_part_mass_f, self.k_fin_mass_f = _make_mass_kernels(S, self.BLOCK)
+        self.hi_mass_part = z(2 * nb)
+        self._hi_mass_nb = nb
+        self.n_diff_f = max(1, -(-S // 256))
+        self.hi_ratio = S / self.res                       # fine cells per coarse cell
+        self.hi_span = int(-(-S // self.res)) + 1          # fine cells a coarse cell can overlap per axis
+        # fine index -> coarse index: pc = a pf + b
+        self.hi_a = self.res / S
+        self.hi_b = 0.5 * self.res / S - 0.5
+
+    def _record_hires(self, data, solid):
+        S, d = self.scalar_res, self.wdev
+        dims = (S, S, S)
+        inv_dx = 1.0 / self.dx
+        hi, fs = self.hi_wp, self.hi_solid_wp
+        wp.launch(HR.advect_sl_fine, dim=dims, inputs=[hi, data, K.C_VX, self.prm, inv_dx, self.hi_a, self.hi_b,
+                                                         self.hi_hat], device=d)
+        wp.launch(HR.advect_mc_fine, dim=dims, inputs=[hi, data, K.C_VX, self.prm, inv_dx, self.hi_a, self.hi_b,
+                                                         self.hi_hat, self.hi_adv], device=d)
+        wp.launch_tiled(self.k_part_mass_f, dim=[self._hi_mass_nb], inputs=[hi, self.hi_adv, fs, self.hi_mass_part],
+                        block_dim=self.BLOCK, device=d)
+        wp.launch_tiled(self.k_fin_mass_f, dim=[1], inputs=[self.hi_mass_part, self.hi_scal], block_dim=self.BLOCK,
+                        device=d)
+        nd = self.n_diff_f
+        bufs = [hi, self.hi_hat] if nd % 2 == 0 else [self.hi_hat, hi]
+        wp.launch(HR.sources_fine, dim=dims, inputs=[self.hi_adv, fs, self.prm, self.hi_scal, self.dxf, bufs[0]], device=d)
+        for k in range(nd):
+            wp.launch(HR.diffuse_fine, dim=dims, inputs=[bufs[k % 2], fs, self.prm, float(nd), self.dxf,
+                                                          bufs[(k + 1) % 2]], device=d)
+
+    def _record_restrict(self, data, solid):
+        N = self.res
+        wp.launch(HR.restrict_scalars, dim=(N, N, N), inputs=[self.hi_wp, self.hi_solid_wp, solid, self.prm,
+                                                               self.hi_ratio, self.hi_span, data], device=self.wdev)
 
     def project(self, state: FieldState3D) -> FieldState3D:
         self._check(state)
@@ -239,6 +342,8 @@ class Solver3D:
         cfg = self.config
         for name, slot in _CFG_SLOTS.items():
             h[slot] = float(getattr(cfg, name))
+        if cfg.confinement_ref_res:      # opt-in: same eps * dx as a confinement_ref_res^3 run
+            h[K.P_EPS] = float(cfg.vorticity_eps) * self.res / float(cfg.confinement_ref_res)
         if len(forces.emitters) > K.MAX_EMITTERS or len(forces.impulses) > K.MAX_IMPULSES:
             raise ValueError(f"at most {K.MAX_EMITTERS} emitters / {K.MAX_IMPULSES} impulses")
         h[K.P_N_EM] = len(forces.emitters)
@@ -253,28 +358,60 @@ class Solver3D:
         wp.copy(self.prm, self._host[i], stream=stream)
         self._host_ev[i] = stream.record_event()
 
+    def _structure(self) -> tuple:
+        """Options that change the recorded launch sequence (part of the graph key). Empty for the
+        default path."""
+        c = self.config
+        if c.pressure_mode == "pcg":
+            return ()
+        if c.pressure_mode != "fused":
+            raise ValueError(f"pressure_mode must be 'pcg' or 'fused', got {c.pressure_mode!r}")
+        return ("fused", int(c.pressure_cycles), int(c.pressure_smooth), str(c.pressure_smoother),
+                c.pressure_tol > 0, int(c.pressure_max_iters))
+
+    def _record_pressure(self, data, solid):
+        c = self.config
+        if c.pressure_mode == "pcg":
+            self.pressure.record(data, K.C_VX, solid, self.prm, self.scal)
+            return
+        if self.pressure_fused is None:
+            self.pressure_fused = FusedPressure3D(self.pressure)
+        self.pressure_fused.record(data, K.C_VX, solid, self.prm, int(c.pressure_cycles), int(c.pressure_smooth),
+                                   str(c.pressure_smoother), adaptive=c.pressure_tol > 0,
+                                   max_cycles=int(c.pressure_max_iters))
+
+    def pressure_iters(self) -> int:
+        """PCG iterations (default) or V-cycles (fused) of the last projection (synchronizes)."""
+        p = self.pressure_fused if self.config.pressure_mode == "fused" and self.pressure_fused else self.pressure
+        return int(p.it.numpy()[0])
+
     def _graph(self, kind: str, state: FieldState3D):
-        key = (kind, state.data.data_ptr(), state.solid.data_ptr())
+        key = (kind, state.data.data_ptr(), state.solid.data_ptr()) + self._structure()
         g = self._graphs.get(key)
         if g is not None:
             self._graphs.move_to_end(key)
             return g
         data = self._wrap(state.data)
         solid = self._wrap(state.solid)
+        hires = self.scalar_res is not None
         self._cap_stream.wait_stream(wp.get_stream(self.wdev))
         with wp.ScopedStream(self._cap_stream, sync_enter=False):
             wp.capture_begin(stream=self._cap_stream, force_module_load=True)
             try:
                 if kind == "step":
                     self._record_advect(data, solid)
+                    if hires:
+                        self._record_hires(data, solid)
                     self._record_forces(data, solid)
-                    self.pressure.record(data, K.C_VX, solid, self.prm, self.scal)
+                    self._record_pressure(data, solid)
                 elif kind == "s_adv":
                     self._record_advect(data, solid)
+                elif kind == "s_hires":
+                    self._record_hires(data, solid)
                 elif kind == "s_forces":
                     self._record_forces(data, solid)
                 else:
-                    self.pressure.record(data, K.C_VX, solid, self.prm, self.scal)
+                    self._record_pressure(data, solid)
             finally:
                 g = wp.capture_end(stream=self._cap_stream)
         self._graphs[key] = g
@@ -303,6 +440,9 @@ class Solver3D:
         for k in range(nd):
             wp.launch(K.diffuse_heat_fuel, dim=dims, inputs=[bufs[k % 2], solid, self.prm, float(nd), bufs[(k + 1) % 2]],
                       device=d)
+        if self.scalar_res is not None:
+            # the coarse scalars the forces read = the fine scalars, box-restricted
+            self._record_restrict(data, solid)
         wp.launch(K.curl, dim=dims, inputs=[data, solid, 0.5 * inv_dx, self.omega], device=d)
         if self.SEPARABLE_SMOOTH:
             ta, tb = self.tmp_a, self.tmp_b

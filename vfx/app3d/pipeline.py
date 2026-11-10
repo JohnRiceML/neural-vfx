@@ -16,15 +16,24 @@ import torch.nn.functional as F
 from vfx.core.fields3d import CH3, LR_RES_3D, SIM_DT, Volume, rasterize_obstacles_3d
 from vfx.render3d import VolumeRenderer, camera_basis
 
-MODES = ["raw", "trilinear", "neural_vol", "neural_screen", "ref128"]
+MODES = ["raw", "trilinear", "neural_vol", "neural_screen", "ref128",
+         "detail", "detail_screen", "hires", "hires_detail"]          # sim-carried detail phase (additive)
 LABELS = {
     "raw": "raw 64³",
     "trilinear": "classical trilinear ×4 (256³)",
     "neural_vol": "neural volume (route A)",
     "neural_screen": "neural screen-space (route B)",
     "ref128": "reference: direct 128³ sim",
+    "detail": "64³ + advected detail",
+    "detail_screen": "64³ + advected detail + route B",
+    "hires": "64³ velocity + 128³ density (hires)",
+    "hires_detail": "hires 128³ density + advected detail",
 }
-UNTRAINED = {"neural_vol", "neural_screen"}     # unless Pipeline.is_trained(mode) (a checkpoint was loaded)
+DETAIL_MODES = {"detail", "detail_screen", "hires_detail"}
+HIRES_MODES = {"hires", "hires_detail"}
+SCREEN_MODES = {"neural_screen", "detail_screen"}
+HIRES_RES = 128
+UNTRAINED = {"neural_vol", "neural_screen", "detail_screen"}  # unless Pipeline.is_trained(mode) (a checkpoint was loaded)
 REF_RES = 128
 SOLID_RENDER_RES = 128          # obstacles are rasterized at this res for display in every mode
 
@@ -85,6 +94,66 @@ class Pipeline:
         self.neural_live = False          # VolumeUpscaler temporal state valid (ran last tick)
         self.tick_id = 0                  # renderers re-prepare their volume only when this changes
         self.cam_hist: dict = {}          # view slot -> {tick_id: [cameras drawn during that tick]}
+        # sim-carried detail phase (all lazy: nothing is created or run unless such a mode is visible)
+        self.detail_quality = "medium"
+        self.temporal = False             # renderer temporal amortization (shortlist #2), toggled with J
+        self.details: dict = {}           # "lr" (64^3 sim) / "hires" (hires solver) -> AdvectedDetail
+        self.detail_live: dict = {}
+        self.hires_solver = None
+        self.hires_state = None
+        self.screen_detail2 = None        # second route B instance for detail_screen (own temporal state)
+        self._check_detail_modes()
+
+    def _check_detail_modes(self) -> None:
+        try:
+            import vfx.detail3d  # noqa: F401
+        except Exception as e:
+            for m in DETAIL_MODES:
+                self.unavailable[m] = f"vfx.detail3d: {type(e).__name__}: {str(e)[:100]}"
+        import inspect
+        S = self.b.Solver
+        try:
+            ok = "scalar_res" in inspect.signature(S.__init__).parameters and hasattr(S, "hires_volume")
+        except (TypeError, ValueError):
+            ok = False
+        if not ok:
+            for m in HIRES_MODES:
+                self.unavailable.setdefault(m, "sim3d has no Solver3D(scalar_res=...) / hires_volume() yet")
+        if "neural_screen" in self.unavailable:
+            self.unavailable.setdefault("detail_screen", self.unavailable["neural_screen"])
+
+    def detail(self, which: str = "lr"):
+        d = self.details.get(which)
+        if d is None:
+            from vfx.detail3d import AdvectedDetail
+            d = self.details[which] = AdvectedDetail(LR_RES_3D, device=str(self.device), quality=self.detail_quality)
+        return d
+
+    def set_detail_quality(self, q: str) -> None:
+        self.detail_quality = q
+        for d in self.details.values():
+            d.set_quality(q)
+
+    def _step_detail(self, which: str, state) -> None:
+        d = self.detail(which)
+        if not self.detail_live.get(which):
+            d.reset()                       # coordinates are stale after a gap: restart (weights fade in)
+        t = self.timer.start(f"detail_step.{which}")
+        d.step(state, SIM_DT)
+        self.timer.stop(t)
+        self.detail_live[which] = True
+
+    def _ensure_hires(self) -> None:
+        if self.hires_solver is None:
+            self.hires_solver = self.b.Solver(LR_RES_3D, self._cfg(self.b.runtime_config, self.sim_overrides),
+                                              device=str(self.device), scalar_res=HIRES_RES)
+        if self.hires_state is None:
+            self.hires_state = self.hires_solver.reset(self.obstacles)
+            self.hires_state.data.copy_(self.state.data)
+            hf = self.hires_solver.hires_fields() if hasattr(self.hires_solver, "hires_fields") else None
+            if hf is not None:            # seed the fine scalars from the 64^3 state: switching is seamless
+                src = self.state.data[[CH3["density"], CH3["temperature"], CH3["fuel"]]][None]
+                hf.copy_(F.interpolate(src, size=tuple(hf.shape[1:]), mode="trilinear", align_corners=False)[0])
 
     def available(self, mode: str) -> bool:
         return mode not in self.unavailable
@@ -110,11 +179,15 @@ class Pipeline:
         self._apply_config(self.solver, self._cfg(self.b.runtime_config, self.sim_overrides))
         if self.ref_solver is not None:
             self._apply_config(self.ref_solver, self._cfg(self.b.SolverConfig, self.sim_overrides))
+        if self.hires_solver is not None:
+            self._apply_config(self.hires_solver, self._cfg(self.b.runtime_config, self.sim_overrides))
 
     def reset(self, obstacles: list) -> None:
         self.obstacles = list(obstacles)
         self.state = self.solver.reset(self.obstacles)
         self.ref_state = None
+        self.hires_state = None
+        self.detail_live = {}
         self.solid_render = rasterize_obstacles_3d(self.obstacles, SOLID_RENDER_RES, str(self.device)) \
             if self.obstacles else None
         self.vols.clear()
@@ -179,6 +252,29 @@ class Pipeline:
             self.neural_live = False
         if self.ref_state is not None:
             self.vols["ref128"] = Volume(self.ref_state.data[CH3["density"]], self.ref_state.data[CH3["temperature"]])
+        # --- sim-carried detail phase (opt-in modes only)
+        if modes & {"detail", "detail_screen"} and self.available("detail"):
+            self._step_detail("lr", st)
+            self.vols["detail"] = self.vols["detail_screen"] = raw
+        else:
+            self.detail_live["lr"] = False
+        if modes & HIRES_MODES and self.available("hires"):
+            try:
+                self._ensure_hires()
+                t = self.timer.start("sim_hires")
+                self.hires_state = self.hires_solver.step(self.hires_state, forces, SIM_DT)
+                self.timer.stop(t)
+                hv = self.hires_solver.hires_volume()
+                if hv is not None:
+                    self.vols["hires"] = self.vols["hires_detail"] = hv
+                if "hires_detail" in modes and self.available("hires_detail"):
+                    self._step_detail("hires", self.hires_state)
+            except Exception as e:                      # in-progress solver API -> mark unavailable
+                for m in HIRES_MODES:
+                    self.unavailable[m] = f"{type(e).__name__}: {str(e)[:120]}"
+        else:
+            self.hires_state = None
+            self.detail_live["hires"] = False
 
     # ------------------------------------------------------------------ 60 Hz render
     def renderer(self, size, slot: int = 0) -> VolumeRenderer:
@@ -186,11 +282,16 @@ class Pipeline:
         r = self.renderers.get((size, slot))
         if r is None:
             r = self.renderers[(size, slot)] = VolumeRenderer((size[1], size[0]), device=str(self.device),
-                                                              march_scale=self.march_scale)
+                                                              march_scale=self.march_scale, temporal=self.temporal)
             r.app_key = None
             if self.steps:
                 r.set_params(steps=float(self.steps))
         return r
+
+    def set_temporal(self, on: bool) -> None:
+        self.temporal = bool(on)
+        for r in self.renderers.values():
+            r.set_temporal(on)
 
     def set_march_scale(self, s: float) -> None:
         self.march_scale = s
@@ -199,7 +300,7 @@ class Pipeline:
 
     def is_trained(self, mode: str) -> str | None:
         """Checkpoint name if `mode` runs trained weights, else None (route B: see backends)."""
-        return self.b.trained.get(mode)
+        return self.b.trained.get("neural_screen" if mode == "detail_screen" else mode)
 
     def prev_camera(self, camera, slot: int):
         """The camera one sim step (SIM_DT) ago for this view: the camera of the draw at the same
@@ -249,17 +350,34 @@ class Pipeline:
         reuse = r.app_key == key           # no sim tick since this view last prepared its volume
         r.app_key = key
         t = self.timer.start(f"{'render_view' if reuse else 'render'}.{slot}")
-        if mode == "neural_screen":     # route B: render with aux (alpha, depth, motion) from the same march
+        if mode in DETAIL_MODES:            # sim-carried detail sampled in the march (+ light volume)
+            det = self.details.get("hires" if mode == "hires_detail" else "lr")
+            if mode == "detail_screen":
+                img, aux = r.draw(vol, camera, self.solid_render, reuse_volume=reuse, return_aux=True,
+                                  velocity=self.state.velocity, prev_camera=self.prev_camera(camera, slot), detail=det)
+            else:
+                img, aux = r.draw(vol, camera, self.solid_render, reuse_volume=reuse, detail=det), None
+        elif mode == "neural_screen":     # route B: render with aux (alpha, depth, motion) from the same march
             img, aux = r.draw(vol, camera, self.solid_render, reuse_volume=reuse, return_aux=True,
                               velocity=self.state.velocity, prev_camera=self.prev_camera(camera, slot))
         else:
             img, aux = r.draw(vol, camera, self.solid_render, reuse_volume=reuse), None
         self.timer.stop(t)
-        if mode == "neural_screen":
+        if mode in SCREEN_MODES:
             t = self.timer.start(f"detail.{slot}")
             try:
-                img = self.b.screen_detail.infer(img, self._screen_aux(camera, size, slot, aux))
+                sd = self.b.screen_detail if mode == "neural_screen" else self._screen_detail2()
+                img = sd.infer(img, self._screen_aux(camera, size, slot, aux))
             except Exception as e:
-                self.unavailable["neural_screen"] = f"{type(e).__name__}: {str(e)[:120]}"
+                self.unavailable[mode] = f"{type(e).__name__}: {str(e)[:120]}"
             self.timer.stop(t)
         return img
+
+    def _screen_detail2(self):
+        """detail_screen gets its own ScreenDetail (same checkpoint) so its temporal history is not
+        shared with a neural_screen view shown side by side."""
+        if self.screen_detail2 is None:
+            from vfx.app3d.backends import make_screen_detail
+            ck = getattr(self.b, "screen_ckpt", None)
+            self.screen_detail2, _ = make_screen_detail(ck, str(self.device))
+        return self.screen_detail2

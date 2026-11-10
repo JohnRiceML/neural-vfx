@@ -1,0 +1,8 @@
+{"name": "gan_smoke",
+ "hypothesis": "Smoke test of the adversarial pipeline (1.5 min, not a probe).",
+ "init": "C:/Users/ricej/AppData/Local/neural-vfx/checkpoints/screen3d/v1_reg_backup.pt",
+ "train": {"minutes": 1.5, "frames": 3, "holdout_sequences": 24, "weight_decay": 0.05, "val_every": 300, "lr": 1e-4, "warmup_steps": 50},
+ "loss": {"ssim": 0.3, "speckle": 1.0, "spec_max_frac": 0.3},
+ "adv": {"weight": 0.05, "fm": 0.5, "temporal": 0.05},
+ "select": {"rule": "constrained_spec", "every": 300},
+ "eval": {"splits": ["test"], "max_sequences": 4}}
