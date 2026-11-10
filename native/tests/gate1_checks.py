@@ -498,3 +498,176 @@ def check_t1(make, scene_name: str, cfg_label: str) -> dict:
             f"{py['step_graph']['median']:.3f} ms; GPU util {g0.get('util_pct')}/{g1.get('util_pct')} %, "
             f"mem {g0.get('mem_used_mib')}/{g1.get('mem_used_mib')} MiB (before/after)")
     return {"pass": bool(ok), "summary": summ, "backend": nat, "python": py, "gpu_before": g0, "gpu_after": g1}
+
+
+# ------------------------------------------------------------------ P3 noise floor (MEASUREMENT, NOT A GATE)
+# How far apart do two *Python* free runs end up when they differ only by a rounding-level perturbation?
+# The P3 run is replayed with a perturbation injected once, after step 1 (k = 0 stepped, before k = 1).
+# Members are compared with the unperturbed Python run at the same steps; the backend run is compared with the
+# same unperturbed run. Nothing here changes P3 or its thresholds.
+NF_SAMPLE_STEPS = (1, 2, 3, 5) + tuple(range(10, P3_STEPS + 1, 10))
+NF_VEL_SCALE_K = tuple(s * k for k in range(1, 9) for s in (1, -1))   # velocity *= 1 + k*1e-7, 16 members
+NF_ULP_SEEDS = tuple(range(16))                                        # 256 fluid cells x (vx,vy,vz,T) +-1 ulp
+NF_ULP_CELLS = 256
+NF_MATCHED_SEEDS = tuple(range(8))   # multiplicative noise with the backend's own step-1 rel_l2 per channel
+
+
+def _nf_perturb(st, kind: str, param, solid_np: np.ndarray, amp=None):
+    """Perturb the Python state in place (torch current stream = the solver's stream)."""
+    d = st.data
+    if kind == "vel_scale":                       # param = k; eps = k*1e-7 (k = 0 -> exact no-op control)
+        d[1:4] = (d[1:4].double() * (1.0 + param * 1e-7)).float()
+    elif kind == "ulp_nudge":                     # param = seed
+        rng = np.random.default_rng(1000 + int(param))
+        fluid = np.argwhere(solid_np < 0.5)
+        cells = fluid[rng.choice(len(fluid), NF_ULP_CELLS, replace=False)]
+        for (z, y, x) in cells:
+            for c in (1, 2, 3, 4):
+                v = d[c, z, y, x]
+                d[c, z, y, x] = torch.nextafter(v, v + (1.0 if rng.random() < 0.5 else -1.0) * float("inf"))
+    elif kind == "matched":                       # param = seed, amp = per-channel relative amplitude
+        g = torch.Generator(device=d.device).manual_seed(2000 + int(param))
+        for c in range(6):
+            if amp[c] > 0.0:
+                n = torch.randn(d[c].shape, generator=g, device=d.device, dtype=torch.float64)
+                base = d[c].double() - AMBIENT[c]
+                d[c] = (AMBIENT[c] + base * (1.0 + amp[c] * n)).float()
+    else:
+        raise ValueError(kind)
+    torch.cuda.synchronize()
+
+
+def _nf_compare(x: np.ndarray, ref: np.ndarray) -> dict:
+    bx, br = budgets(x), budgets(ref)
+    dv = x[1:4].astype(np.float64) - ref[1:4].astype(np.float64)
+    rv = ref[1:4].astype(np.float64)
+    return dict(heat_pct=100.0 * (bx["heat"] - br["heat"]) / abs(br["heat"]),
+                mass_pct=100.0 * (bx["mass"] - br["mass"]) / abs(br["mass"]),
+                centroid_m=float(np.linalg.norm(np.array(bx["centroid"]) - np.array(br["centroid"]))),
+                vel_rel_l2=float(np.sqrt((dv * dv).sum()) / (np.sqrt((rv * rv).sum()) + EPS)),
+                T_rel_l2=rel_l2(x[4], ref[4], AMBIENT_TEMP), dens_rel_l2=rel_l2(x[0], ref[0]))
+
+
+def _nf_python_run(sc, perturb=None) -> dict:
+    """One P3-identical Python run (fresh Solver3D, default config). Returns {step: state} at NF_SAMPLE_STEPS."""
+    py = Solver3D(RES)
+    st = py.reset(sc.obstacles)
+    solid_np = st.solid.cpu().numpy()
+    states = {}
+    for k in range(P3_STEPS):
+        py.step(st, sc.forces(k), DT)
+        if k == 0 and perturb is not None:
+            perturb(st, solid_np)
+        if k + 1 in NF_SAMPLE_STEPS:
+            states[k + 1] = st.data.cpu().numpy().copy()
+    del py
+    return states
+
+
+def _nf_dist(xs) -> dict:
+    a = np.asarray(xs, np.float64)
+    return dict(n=int(a.size), min=float(a.min()), median=float(np.median(a)), max=float(a.max()),
+                mean=float(a.mean()), std=float(a.std(ddof=1)) if a.size > 1 else 0.0,
+                max_abs=float(np.abs(a).max()))
+
+
+def _nf_position(val: float, xs, signed: bool = True) -> dict:
+    a = np.asarray(xs, np.float64)
+    sd = float(a.std(ddof=1))
+    out = dict(value=val, z=(val - float(a.mean())) / sd if sd > 0 else float("inf"),
+               members_with_abs_ge=int((np.abs(a) >= abs(val)).sum()), n=int(a.size))
+    out["empirical_p_abs"] = (out["members_with_abs_ge"] + 1) / (a.size + 1)
+    out["z_abs_vs_rms"] = abs(val) / float(np.sqrt((a * a).mean())) if np.any(a) else float("inf")
+    return out
+
+
+def measure_p3_noise_floor(make, scene_name: str) -> dict:
+    """MEASUREMENT (not a gate). See the block comment above and native/tests/README.md."""
+    sc = get_scene(scene_name)
+    ref = _nf_python_run(sc)
+    # backend run, fresh, same session, sampled at the same steps (downloads are read-only)
+    b = make(RES, SolverConfig3D())
+    b.reset(sc.obstacles)
+    nat = {}
+    for k in range(P3_STEPS):
+        b.step(sc.forces(k), DT)
+        if k + 1 in NF_SAMPLE_STEPS:
+            nat[k + 1] = b.download()
+    b.close()
+    native_curve = {s: _nf_compare(nat[s], ref[s]) for s in NF_SAMPLE_STEPS}
+    amp1 = channel_errors(nat[1], ref[1])["rel_l2"]          # backend's own step-1 rel_l2 per channel
+
+    # sanity control: zero perturbation (velocity * 1.0 through the same code path) must be bit-identical
+    ctl = _nf_python_run(sc, perturb=lambda st, s: _nf_perturb(st, "vel_scale", 0, s))
+    ctl_bits = {s: bit_compare(ctl[s], ref[s]) for s in NF_SAMPLE_STEPS}
+    control_ok = all(v["identical"] for v in ctl_bits.values())
+
+    groups = {"vel_scale": [("vel_scale", k) for k in NF_VEL_SCALE_K],
+              "ulp_nudge": [("ulp_nudge", s) for s in NF_ULP_SEEDS],
+              "matched_amp": [("matched", s) for s in NF_MATCHED_SEEDS]}
+    members = []
+    for gname, specs in groups.items():
+        for kind, param in specs:
+            run = _nf_python_run(sc, perturb=lambda st, s, kind=kind, param=param:
+                                 _nf_perturb(st, kind, param, s, amp1))
+            curve = {s: _nf_compare(run[s], ref[s]) for s in NF_SAMPLE_STEPS}
+            members.append(dict(group=gname, kind=kind, param=param, curve=curve,
+                                identical_at_1=bool(bit_compare(run[1], ref[1])["identical"])))
+            del run
+
+    last = P3_STEPS
+    rounding = [m for m in members if m["group"] in ("vel_scale", "ulp_nudge")]
+
+    def table(ms):
+        return {q: _nf_dist([m["curve"][last][q] for m in ms]) for q in ("heat_pct", "mass_pct", "centroid_m")}
+
+    def envelope(ms):
+        env = {}
+        for s in NF_SAMPLE_STEPS:
+            h = np.array([m["curve"][s]["heat_pct"] for m in ms])
+            v = np.array([m["curve"][s]["vel_rel_l2"] for m in ms])
+            env[s] = dict(heat_min=float(h.min()), heat_max=float(h.max()), heat_std=float(h.std(ddof=1)),
+                          heat_max_abs=float(np.abs(h).max()), vel_rel_l2_median=float(np.median(v)),
+                          vel_rel_l2_max=float(v.max()))
+        return env
+
+    def onset(curve_of_step, thr):
+        for s in NF_SAMPLE_STEPS:
+            if abs(curve_of_step(s)) > thr:
+                return s
+        return None
+
+    stats = {"rounding (vel_scale+ulp_nudge)": table(rounding),
+             "vel_scale": table([m for m in members if m["group"] == "vel_scale"]),
+             "ulp_nudge": table([m for m in members if m["group"] == "ulp_nudge"]),
+             "matched_amp": table([m for m in members if m["group"] == "matched_amp"])}
+    nat_last = native_curve[last]
+    position = {g: {q: _nf_position(nat_last[q], [m["curve"][last][q] for m in ms]) for q in
+                    ("heat_pct", "mass_pct", "centroid_m")}
+                for g, ms in (("rounding", rounding),
+                              ("matched_amp", [m for m in members if m["group"] == "matched_amp"]))}
+    env_r = envelope(rounding)
+    env_m = envelope([m for m in members if m["group"] == "matched_amp"])
+    onsets = {}
+    for thr in (0.01, 0.1, 1.0):   # heat % thresholds
+        onsets[f"heat_abs_pct>{thr}"] = dict(
+            native=onset(lambda s: native_curve[s]["heat_pct"], thr),
+            rounding_median_member=sorted([onset(lambda s, m=m: m["curve"][s]["heat_pct"], thr) or 10 ** 6
+                                           for m in rounding])[len(rounding) // 2],
+            rounding_earliest=min(onset(lambda s, m=m: m["curve"][s]["heat_pct"], thr) or 10 ** 6 for m in rounding))
+    for thr in (1e-3, 1e-2, 1e-1):
+        onsets[f"vel_rel_l2>{thr}"] = dict(
+            native=onset(lambda s: native_curve[s]["vel_rel_l2"], thr),
+            rounding_median_member=sorted([onset(lambda s, m=m: m["curve"][s]["vel_rel_l2"], thr) or 10 ** 6
+                                           for m in rounding])[len(rounding) // 2],
+            rounding_earliest=min(onset(lambda s, m=m: m["curve"][s]["vel_rel_l2"], thr) or 10 ** 6
+                                  for m in rounding))
+    return {"measurement": "P3 noise floor (not a gate)", "scene": scene_name, "steps": P3_STEPS,
+            "sample_steps": list(NF_SAMPLE_STEPS),
+            "python_ref_at_120": budgets(ref[last]), "backend_at_120": budgets(nat[last]),
+            "backend_step1_rel_l2_per_channel": dict(zip(CHANNELS_3D, amp1)),
+            "control_zero_perturbation": dict(bit_identical_all_samples=control_ok, per_step=ctl_bits),
+            "members_changed_at_step1": sum(1 for m in members if not m["identical_at_1"]),
+            "n_members": {g: len(v) for g, v in groups.items()},
+            "stats_at_120": stats, "native_position_at_120": position, "native_curve": native_curve,
+            "envelope_rounding": env_r, "envelope_matched_amp": env_m, "onsets": onsets, "members": members}

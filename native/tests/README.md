@@ -10,6 +10,7 @@ The native solver (`native/core`, `native/sim`) is a black box here and is reach
 | `backends.py` | `PyFakeSolver`: the same interface built on `vfx.sim3d.Solver3D`. `upload`/`reset` zero the warm-start φ, as the contract requires. `Perturbed`: deliberately broken fakes for the negative controls. |
 | `gate1_checks.py` | P1, P2, P3, S1–S4 and T1 as backend-agnostic functions. The Python reference runs in-process in the same session, so nothing large is stored. |
 | `test_gate1.py` | the gate tests (`--backend` selects the backend) |
+| `test_p3_noise_floor.py` | P3 noise-floor **measurement** (not a gate): Python rounding-perturbation ensemble vs the backend (section below) |
 | `test_harness_controls.py` | struct layouts, conversions, the memorylessness of the P1 reference, the skip path, negative controls, `dump_reference` replay |
 | `../tools/nvfx_scenes.py` | scenes from `vfx/sim3d/selfcheck.py`: `campfire`, `plume` (+SPHERE), `determinism`, `stress`, `mass_box` |
 | `../tools/dump_reference.py` | stored references for non-Python consumers (format in its docstring; output under `%LOCALAPPDATA%\neural-vfx\native_ref`) |
@@ -94,6 +95,30 @@ The fake zeroes `pressure.phi` on `upload`/`reset`, mirroring the contract's "up
 | density × 1.02 after each step | P3 | FAIL as expected: mass +300 %, centroid 0.041 m |
 | 2 PCG iterations, tol 0 | S1 (plume) | FAIL as expected: div 1.6e-2 |
 | 1-ulp nudge to one random cell per step | S3 (20 steps) | FAIL as expected: 722551 values differ |
+
+## P3 noise floor (a MEASUREMENT, not a gate): `test_p3_noise_floor.py`, `gate1_checks.measure_p3_noise_floor`
+This answers one question: is the backend-vs-Python P3 difference larger than the spread Python shows against itself?
+For each scene the harness replays the P3 run in Python (fresh `Solver3D`, default config, 120 steps). Each ensemble member gets one perturbation, injected after step 1:
+- `vel_scale`: velocity × (1 + k·1e-7) for k = ±1…8, computed in f64 and rounded to f32 (16 members).
+- `ulp_nudge`: vx, vy, vz and T nudged by ±1 ulp at 256 random fluid cells, seeds 0…15 (16 members).
+- `matched_amp`: multiplicative Gaussian noise per channel, with amplitude equal to the backend's own step-1 rel_l2 (8 members, reported separately).
+
+Every member is compared with the unperturbed run at steps 1, 2, 3, 5, 10, …, 120. The measured quantities are the signed heat %, signed mass %, centroid distance, and velocity, T and density rel_l2.
+A fresh backend run in the same session is compared with the same unperturbed run. At step 120 the backend's position in the ensemble is reported as z = (x − mean)/std and as k/N, the number of members with |x| ≥ |backend|.
+Control: a zero perturbation (k = 0, through the same code path) must reproduce the unperturbed run bit for bit. The test also asserts that every real perturbation changed the step-1 state.
+These are the only assertions. P3 and its thresholds are unchanged. Run: `%PY% -m pytest native/tests/test_p3_noise_floor.py -q -s` (about 65 s).
+Output: `native/build/test_results/p3_noise_floor.json` (every member's curve) and `.md`.
+
+Measured 2026-11-09 against nvfx 0.1, with the GPU shared with a training job at 97 % util and 11.8 GB used (this does not affect the numbers; nothing here is timed):
+
+| scene | Python rounding ensemble (N 32), heat % at 120: min / median / max / std | backend heat % | z | k/N | Python members failing P3's 1 % heat check |
+|---|---|---|---|---|---|
+| campfire | −1.19 / −0.07 / +1.60 / 0.71 | +0.42 | +0.7 | 17/32 | 6/32 |
+| plume | −1.52 / +1.48 / +4.14 / 1.41 | +2.38 | +0.7 | 7/32 | 25/32 |
+
+The zero-perturbation control was bit-identical. The backend's step-1 difference is rounding-level: rel_l2 is 0.9–2.7e-7 per channel. Backend trajectories do not separate earlier than perturbed Python ones.
+For plume, the backend's velocity rel_l2 is 1.2e-6 at step 20, while the ensemble median is 1.3e-4. The matched-amplitude members track the backend almost exactly (1.8e-4 at step 30 for both).
+Mass is far inside the noise in both scenes, and the centroid distance is z ≤ 1.3 and below 0.01 m in every member.
 
 ## Contract ambiguities found (for the lead)
 1. **ε in rel_l2 is unspecified.** This harness uses 1e-12.

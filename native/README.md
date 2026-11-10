@@ -85,6 +85,18 @@ Clarifications (lead, after the test engineer's contract review; no threshold ch
 - `step_index` counts completed `nvfx_solver_step` calls since create/reset (first step = 1).
   `nvfx_solver_get_timings` before any step has finished returns zeros with `step_index` 0.
 
+**Lead decision on P3 (2026-11-09, after measurement).** P3's 1 % heat threshold at step 120 is below
+Python's own sensitivity to rounding: in an independent ensemble of 32 Python runs perturbed at the 1e-7 /
+1-ulp level after step 1, 25 of 32 `plume` members and 6 of 32 `campfire` members miss it against the
+unperturbed Python run (heat spread: plume −1.5…+4.1 %, std 1.4 %). The check as written cannot tell a
+porting error from chaos. P3 stays in the suite and stays reported as it is (native plume: heat +2.38 %,
+FAIL); it is not edited to pass. The gate decision uses **P3e** instead: at step 120 the native mass, heat
+and centroid must each lie inside the same-session Python ensemble's range or within |z| ≤ 3, with mass
+≤ 1 % kept as an absolute ceiling. Measured (`results/p3_noise_floor.md`): plume heat z +0.7, centroid
+z +1.2; campfire heat z +0.7, mass z −0.8; native separates from Python no earlier than perturbed Python
+does. Known blind spot: a systematic heat bias under ~1 % would hide inside this spread; the guard against
+that is the teacher-forced P1, which passes at 3.3e-5.
+
 The thresholds are set before any native code exists. If one turns out to be wrong for a reason that is
 not a bug (for example a discontinuous limiter amplifying rounding), the test engineer reports the numbers
 and the lead decides; nobody edits a threshold to make a test pass.
