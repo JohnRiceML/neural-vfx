@@ -52,6 +52,26 @@ Options:
   - `--solver-only`: no renderer and no detail; the HUD shows over a flat background.
   - `--no-hud`.
   - `--sim-every-frame`.
+- Scripted runs (`--frames` / `--bench`; no human needed, the keyboard is ignored except Esc):
+  - `--script "EV;EV;..."` with `EV = K[-L]:name[=args]` over frames K..L:
+    - Key presses at frame K: `mode`, `preset=P`, `reset`, `pause`, `hud`, `vsync`.
+    - `puff=X,Y`: Shift+LMB at pixel X,Y.
+    - `fire=X,Y`: LMB held at a pixel. This is a fire at the cursor, plus a push if the cursor moves.
+    - `drag=X0,Y0,X1,Y1`: LMB held while the cursor moves linearly, giving fire plus push impulses.
+    - `orbit=DX,DY`: RMB drag, pixels per frame.
+    - `zoom=TICKS`: wheel ticks.
+    - The events go through the same code as the window input (`apply_pointer`, `handle_key`).
+  - By default a scripted run auto-orbits and holds a fire at (0.40, 0.14, 0.50). `--no-auto-orbit` and `--no-torch`
+    turn these off, and `--yaw RAD` sets the start angle.
+  - `--shot-at K1,K2,...`: extra screenshots `<screenshot>_f<K>.<ext>`.
+  - `--dump-aux PREFIX`, on the last frame:
+    - writes `PREFIX_alpha.bmp` and `PREFIX_motion.bmp` (R = motion x, G = motion y, 128 = 0, B = alpha);
+    - prints alpha coverage against the projected bbox handed to detail;
+    - prints motion and depth statistics, and the detail region for that bbox.
+  - `--compare`, on the last frame in raw mode, makes two comparisons, with the HUD rectangle excluded:
+    - the back buffer against the renderer's COLOR texture (the app's copy path);
+    - the back buffer against a stand-alone `nvfx_renderer_draw` of the same solver state and cameras (the hosted
+      record path).
 - Other:
   - `--novsync`, `--orbit` (start with auto-orbit), `--march-scale S` (default 0.5).
   - `--adapter N`: DXGI adapter index. The default is the high-performance adapter.

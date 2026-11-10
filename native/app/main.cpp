@@ -189,6 +189,14 @@ struct Args {
     int adapter = -1;
     float march_scale = 0.5f;
     double bench_dist = 2.15;
+    // scripted-run / diagnostic switches (correctness runs without a human)
+    std::wstring script;              // "K[-L]:event[=args];..." (see usage)
+    bool no_torch = false;            // scripted runs: no fixed torch
+    bool no_auto_orbit = false;       // scripted runs: fixed camera
+    double yaw = 0.0;                 // initial orbit yaw (rad)
+    std::vector<int> shot_at;         // extra screenshots at these frames
+    std::wstring dump_aux;            // path prefix: alpha / motion images + stats of the last frame
+    bool compare = false;             // last frame: back buffer vs a stand-alone nvfx_renderer_draw of the same state
 };
 
 void usage() {
@@ -205,7 +213,18 @@ void usage() {
         "  --frames N [--screenshot PATH.bmp|.ppm]   run N scripted frames, save the last back buffer\n"
         "  --sim-every-frame        sim step every frame instead of 30 Hz\n"
         "  --no-detail --no-render-aux --solver-only --no-hud   bisection switches\n"
-        "  --novsync --orbit --march-scale S --adapter N --debug-layer\n");
+        "  --novsync --orbit --march-scale S --adapter N --debug-layer\n"
+        "scripted runs (--frames / --bench):\n"
+        "  --script \"EV;EV;...\"   EV = K[-L]:name[=args], frames K..L (inclusive; L defaults to K):\n"
+        "      mode | preset=P | reset | pause | hud | vsync          (key presses, at frame K)\n"
+        "      puff=X,Y                                               (Shift+LMB at pixel X,Y, at frame K)\n"
+        "      fire=X,Y                                               (LMB held at pixel X,Y during K..L)\n"
+        "      drag=X0,Y0,X1,Y1                                       (LMB held, moving X0,Y0 -> X1,Y1 during K..L)\n"
+        "      orbit=DX,DY | zoom=TICKS                               (RMB drag px per frame / wheel at K)\n"
+        "  --no-torch --no-auto-orbit --yaw RAD\n"
+        "  --shot-at K1,K2,...      also save <screenshot>_f<K>.<ext> at those frames\n"
+        "  --dump-aux PREFIX        last frame: PREFIX_alpha.bmp, PREFIX_motion.bmp + alpha/motion/bbox stats\n"
+        "  --compare                last frame: back buffer vs stand-alone nvfx_renderer_draw + download (raw)\n");
 }
 
 bool parse_args(int argc, wchar_t** argv, Args& a) {
@@ -248,6 +267,20 @@ bool parse_args(int argc, wchar_t** argv, Args& a) {
         else if (s == L"--march-scale") { if (!(v = val())) return false; a.march_scale = float(_wtof(v)); }
         else if (s == L"--adapter") { if (!(v = val())) return false; a.adapter = _wtoi(v); }
         else if (s == L"--debug-layer") a.debug_layer = true;
+        else if (s == L"--script") { if (!(v = val())) return false; a.script = v; }
+        else if (s == L"--no-torch") a.no_torch = true;
+        else if (s == L"--no-auto-orbit") a.no_auto_orbit = true;
+        else if (s == L"--yaw") { if (!(v = val())) return false; a.yaw = _wtof(v); }
+        else if (s == L"--shot-at") {
+            if (!(v = val())) return false;
+            for (const wchar_t* p = v; *p;) {
+                a.shot_at.push_back(_wtoi(p));
+                while (*p && *p != L',') ++p;
+                if (*p == L',') ++p;
+            }
+        }
+        else if (s == L"--dump-aux") { if (!(v = val())) return false; a.dump_aux = v; }
+        else if (s == L"--compare") a.compare = true;
         else { std::fprintf(stderr, "[nvfx_demo] unknown argument %s (--help)\n", to_utf8(s).c_str()); return false; }
     }
     if (a.preset < 1 || a.preset > 4) { std::fprintf(stderr, "[nvfx_demo] --preset 1-4\n"); return false; }
@@ -257,6 +290,53 @@ bool parse_args(int argc, wchar_t** argv, Args& a) {
         return false;
     }
     if (!a.screenshot.empty() && a.frames == 0) a.frames = 300;
+    return true;
+}
+
+// ------------------------------------------------------------------ scripted input
+struct ScriptEvent {
+    int k0 = 0, k1 = 0;
+    std::string name;
+    float v[4] = {0, 0, 0, 0};
+    int nv = 0;
+};
+
+bool parse_script(const std::string& s, std::vector<ScriptEvent>& out) {
+    size_t i = 0;
+    while (i < s.size()) {
+        size_t j = s.find(';', i);
+        if (j == std::string::npos) j = s.size();
+        std::string e = s.substr(i, j - i);
+        i = j + 1;
+        if (e.empty()) continue;
+        ScriptEvent ev;
+        size_t c = e.find(':');
+        if (c == std::string::npos) { std::fprintf(stderr, "[nvfx_demo] script event '%s': missing ':'\n", e.c_str()); return false; }
+        std::string fr = e.substr(0, c), rest = e.substr(c + 1);
+        size_t d = fr.find('-');
+        ev.k0 = std::atoi(fr.c_str());
+        ev.k1 = d == std::string::npos ? ev.k0 : std::atoi(fr.c_str() + d + 1);
+        size_t q = rest.find('=');
+        ev.name = rest.substr(0, q);
+        if (q != std::string::npos) {
+            const char* p = rest.c_str() + q + 1;
+            while (*p && ev.nv < 4) {
+                ev.v[ev.nv++] = float(std::atof(p));
+                while (*p && *p != ',') ++p;
+                if (*p == ',') ++p;
+            }
+        }
+        static const char* known[] = {"mode", "preset", "reset", "pause", "hud", "vsync", "puff", "fire", "drag", "orbit", "zoom"};
+        static const int need[] = {0, 1, 0, 0, 0, 0, 2, 2, 4, 2, 1};
+        bool ok = false;
+        for (int k = 0; k < 11; ++k)
+            if (ev.name == known[k]) { ok = ev.nv >= need[k]; break; }
+        if (!ok || ev.k1 < ev.k0) {
+            std::fprintf(stderr, "[nvfx_demo] script event '%s': unknown name, missing args or bad frame range\n", e.c_str());
+            return false;
+        }
+        out.push_back(ev);
+    }
     return true;
 }
 
@@ -347,12 +427,14 @@ struct Orbit {
 struct Controls {
     std::vector<std::pair<NvfxEmitter, int>> puffs;   // emitter, ticks left
     std::vector<NvfxImpulse> impulses;
-    bool torch = false;
+    bool torch = false;               // cursor torch (LMB)
     float torch_pos[3] = {0.5f, 0.2f, 0.5f};
+    bool fixed_torch = false;         // scripted runs: a fire held at a fixed point
+    float fixed_pos[3] = {0.40f, 0.14f, 0.50f};
     std::vector<NvfxEmitter> em;                       // storage of the forces built for one tick
     std::vector<NvfxImpulse> imp;
 
-    void clear() { puffs.clear(); impulses.clear(); torch = false; }
+    void clear() { puffs.clear(); impulses.clear(); torch = false; }   // fixed_torch is a run setting: kept
     void push(const float p0[3], const float p1[3], double dt) {
         double v[3], m = 0;
         for (int i = 0; i < 3; ++i) { v[i] = (p1[i] - p0[i]) / std::max(dt, 1.0 / 240.0) * 0.6; m += v[i] * v[i]; }
@@ -365,6 +447,7 @@ struct Controls {
     void puff(const float p[3]) { puffs.push_back({puff_emitter(p), 8}); }
     NvfxForces forces(const Preset& pr) {
         em = pr.emitters;
+        if (fixed_torch) em.push_back(fire_emitter(fixed_pos, 0.04f));
         if (torch) em.push_back(fire_emitter(torch_pos, 0.04f));
         for (auto& p : puffs) em.push_back(p.first);
         if (em.size() > size_t(NVFX_MAX_EMITTERS)) em.resize(NVFX_MAX_EMITTERS);
@@ -565,6 +648,14 @@ struct Demo {
     std::string message;              // transient red HUD line (5 s)
     double message_t = -1e9;
     bool scripted = false;
+    std::vector<ScriptEvent> script;
+    // what the last frame drew (end-of-run diagnostics)
+    NvfxCamera last_cam = {}, last_prev = {};
+    bool last_have_prev = false;
+    int32_t last_flags = 0, last_bbox[4] = {0, 0, 0, 0};
+    bool last_neural = false;
+    int32_t hud_box[4] = {0, 0, 0, 0};
+    bool hud_drawn = false;
 
     // timings
     Track t_sim, t_render_full, t_render_reuse, t_detail, t_frame_sim, t_frame_other, t_present;
@@ -1002,62 +1093,88 @@ struct Demo {
     }
 
     // ---------------------------------------------------------------- input
-    void handle_keys() {
-        for (UINT k : g_in.keys) {
-            if (k == VK_ESCAPE) { g_in.quit = true; continue; }
-            if (scripted) continue;
-            switch (k) {
-            case 'N':
-                if (!neural && !detail_usable()) { message = "N: NEURAL UNAVAILABLE, STAYING RAW"; message_t = now_ms(); }
-                else neural = !neural;
-                break;
-            case 'C': auto_orbit = !auto_orbit; break;
-            case 'R': load_preset(preset_id); break;
-            case VK_SPACE: paused = !paused; break;
-            case 'V': vsync = !vsync; break;
-            case 'H': hud_on = !hud_on; break;
-            case 'G': {
-                float p[3];
-                if (cursor_world(p)) ctl.puff(p);
-                break;
-            }
-            case '1': case '2': case '3': case '4': load_preset(int(k - '0')); break;
-            default: break;
-            }
-        }
-        g_in.keys.clear();
-    }
+    // one frame of pointer input, from the window (interactive) or from --script
+    struct Pointer {
+        bool inside = false;
+        double x = 0, y = 0;          // client pixels
+        bool lmb = false, puff_click = false;
+        double rmb_dx = 0, rmb_dy = 0, wheel = 0;
+    };
+    bool ptr_inside = false;
+    float ptr_world[3] = {0.5f, 0.3f, 0.5f};
 
-    bool cursor_px(int& x, int& y) const {
-        POINT pt;
-        if (!GetCursorPos(&pt) || !ScreenToClient(hwnd, &pt)) return false;
-        x = pt.x; y = pt.y;
-        return GetForegroundWindow() == hwnd && x >= 0 && y >= 0 && x < W && y < H;
-    }
-    bool cursor_world(float out[3]) const {
-        int x, y;
-        if (!cursor_px(x, y)) return false;
-        orbit.cursor_point(x, y, W, H, out);
+    bool handle_key(UINT k) {        // returns false on a fatal library error
+        switch (k) {
+        case 'N':
+            if (!neural && !detail_usable()) { message = "N: NEURAL UNAVAILABLE, STAYING RAW"; message_t = now_ms(); }
+            else neural = !neural;
+            break;
+        case 'C': auto_orbit = !auto_orbit; break;
+        case 'R': return load_preset(preset_id);
+        case VK_SPACE: paused = !paused; break;
+        case 'V': vsync = !vsync; break;
+        case 'H': hud_on = !hud_on; break;
+        case 'G': if (ptr_inside) ctl.puff(ptr_world); break;
+        case '1': case '2': case '3': case '4': return load_preset(int(k - '0'));
+        default: break;
+        }
         return true;
     }
 
-    void interactive_input(double fdt) {
-        orbit.yaw -= g_in.rmb_dx * 0.006;
-        orbit.pitch = std::clamp(orbit.pitch + g_in.rmb_dy * 0.004, -0.15, 1.35);
-        g_in.rmb_dx = g_in.rmb_dy = 0;
-        if (g_in.wheel != 0) orbit.dist = std::clamp(orbit.dist * std::pow(0.9, g_in.wheel), 0.9, 4.5);
-        g_in.wheel = 0;
-        float p[3];
-        bool inside = cursor_world(p);
-        if (g_in.puff_click) {
-            if (inside) ctl.puff(p);
-            g_in.puff_click = false;
+    Pointer window_pointer() {
+        Pointer p;
+        POINT pt;
+        if (GetCursorPos(&pt) && ScreenToClient(hwnd, &pt)) {
+            p.x = pt.x; p.y = pt.y;
+            p.inside = GetForegroundWindow() == hwnd && pt.x >= 0 && pt.y >= 0 && pt.x < W && pt.y < H;
         }
-        ctl.torch = g_in.lmb && inside;              // LMB hold = fire at the cursor
-        if (ctl.torch) std::memcpy(ctl.torch_pos, p, sizeof p);
-        if (g_in.lmb && inside) {                     // LMB drag = push along the drag
-            if (have_last_cursor) ctl.push(last_cursor, p, fdt);
-            std::memcpy(last_cursor, p, sizeof p);
+        p.lmb = g_in.lmb;
+        p.puff_click = g_in.puff_click;
+        p.rmb_dx = g_in.rmb_dx; p.rmb_dy = g_in.rmb_dy; p.wheel = g_in.wheel;
+        g_in.puff_click = false;
+        g_in.rmb_dx = g_in.rmb_dy = g_in.wheel = 0;
+        return p;
+    }
+
+    // --script: pointer state and key presses of frame f
+    Pointer script_pointer(uint64_t f, std::vector<UINT>& keys) {
+        Pointer p;
+        for (const ScriptEvent& e : script) {
+            if (int64_t(f) < e.k0 || int64_t(f) > e.k1) continue;
+            bool first = int64_t(f) == e.k0;
+            const std::string& n = e.name;
+            if (n == "mode" && first) keys.push_back('N');
+            else if (n == "preset" && first) keys.push_back(UINT('0' + std::clamp(int(e.v[0]), 1, 4)));
+            else if (n == "reset" && first) keys.push_back('R');
+            else if (n == "pause" && first) keys.push_back(VK_SPACE);
+            else if (n == "hud" && first) keys.push_back('H');
+            else if (n == "vsync" && first) keys.push_back('V');
+            else if (n == "puff" && first) { p.inside = true; p.x = e.v[0]; p.y = e.v[1]; p.puff_click = true; }
+            else if (n == "fire") { p.inside = true; p.x = e.v[0]; p.y = e.v[1]; p.lmb = true; }
+            else if (n == "drag") {
+                double t = e.k1 > e.k0 ? double(int64_t(f) - e.k0) / double(e.k1 - e.k0) : 1.0;
+                p.inside = true; p.lmb = true;
+                p.x = e.v[0] + (e.v[2] - e.v[0]) * t;
+                p.y = e.v[1] + (e.v[3] - e.v[1]) * t;
+            }
+            else if (n == "orbit") { p.rmb_dx += e.v[0]; p.rmb_dy += e.v[1]; }
+            else if (n == "zoom" && first) p.wheel += e.v[0];
+        }
+        return p;
+    }
+
+    void apply_pointer(const Pointer& in, double fdt) {
+        orbit.yaw -= in.rmb_dx * 0.006;
+        orbit.pitch = std::clamp(orbit.pitch + in.rmb_dy * 0.004, -0.15, 1.35);
+        if (in.wheel != 0) orbit.dist = std::clamp(orbit.dist * std::pow(0.9, in.wheel), 0.9, 4.5);
+        ptr_inside = in.inside;
+        if (in.inside) orbit.cursor_point(in.x, in.y, W, H, ptr_world);
+        if (in.puff_click && in.inside) ctl.puff(ptr_world);
+        ctl.torch = in.lmb && in.inside;              // LMB hold = fire at the cursor
+        if (ctl.torch) std::memcpy(ctl.torch_pos, ptr_world, sizeof ptr_world);
+        if (in.lmb && in.inside) {                    // LMB drag = push along the drag
+            if (have_last_cursor) ctl.push(last_cursor, ptr_world, fdt);
+            std::memcpy(last_cursor, ptr_world, sizeof ptr_world);
             have_last_cursor = true;
         } else {
             have_last_cursor = false;
@@ -1142,6 +1259,8 @@ struct Demo {
         hc.grid[3] = (hud_on && tx.used_rows > 0 ? 1 : 0) | (has_source ? 2 : 0);
         hc.box[0] = ox - pad; hc.box[1] = oy - pad;
         hc.box[2] = ox + tx.used_cols * 6 * s + pad; hc.box[3] = oy + tx.used_rows * 9 * s + pad;
+        std::memcpy(hud_box, hc.box, sizeof hud_box);
+        hud_drawn = (hc.grid[3] & 1) != 0;
         hc.dims[0] = kHudCols; hc.dims[1] = kHudRows;
         std::memcpy(cb_map + size_t(slot) * kCbSlot, &hc, sizeof hc);
     }
@@ -1155,15 +1274,18 @@ struct Demo {
         if (frame_no % 30 == 0) sample_vram();
 
         // --- input -> camera, forces
-        handle_keys();
-        if (scripted) {
-            orbit.yaw += 0.35 * fdt;
-            ctl.torch = true;   // a fire held at a fixed point (deterministic)
-            ctl.torch_pos[0] = 0.40f; ctl.torch_pos[1] = 0.14f; ctl.torch_pos[2] = 0.50f;
-        } else {
-            interactive_input(fdt);
-            if (auto_orbit) orbit.yaw += 0.35 * fdt;
+        std::vector<UINT> keys;
+        for (UINT k : g_in.keys) {
+            if (k == VK_ESCAPE) g_in.quit = true;
+            else if (!scripted) keys.push_back(k);     // scripted runs ignore the keyboard (except Esc)
         }
+        g_in.keys.clear();
+        Pointer ptr = scripted ? script_pointer(frame_no, keys) : window_pointer();
+        apply_pointer(ptr, fdt);                       // before keys: G puffs at this frame's cursor
+        for (UINT k : keys)
+            if (!handle_key(k)) return false;
+        if (scripted) ctl.fixed_torch = !a.no_torch;   // a fire held at a fixed point (deterministic)
+        if (auto_orbit) orbit.yaw += 0.35 * fdt;
 
         int steps = 0;
         if (!paused) {
@@ -1210,6 +1332,9 @@ struct Demo {
 
             int32_t bbox[4] = {0, 0, W, H};
             nvfx_render_screen_bbox(&cam, W, H, bbox);
+            last_cam = cam; last_prev = prev; last_have_prev = have_prev; last_flags = flags;
+            std::memcpy(last_bbox, bbox, sizeof bbox);
+            last_neural = false;
             if (recording)
                 rec_bbox_frac.push_back(float(double(std::max(0, bbox[2] - bbox[0])) * std::max(0, bbox[3] - bbox[1]) /
                                               (double(W) * H)));
@@ -1227,6 +1352,7 @@ struct Demo {
                     src = detail_out.Get();
                     src_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
                     src_srv = SRV_DETAIL_OUT;
+                    last_neural = true;
                 } else {
                     // keep running raw; whatever the runner recorded before failing still executes (its rings expect it)
                     // (not destroyed here: this list may reference its resources; destroyed at exit)
@@ -1303,15 +1429,125 @@ struct Demo {
         if (SUCCEEDED(queue->Signal(fence.Get(), ++fence_value))) wait_fence(fence_value);
     }
 
-    bool screenshot(const std::wstring& path) {
-        // the back buffer of the frame just executed, still in PRESENT state (called before Present)
+    // the back buffer of the frame just executed, still in PRESENT state (called before Present). Synchronizes.
+    bool download_back(std::vector<uint8_t>& rgba) {
         const UINT bb = swap->GetCurrentBackBufferIndex();
-        std::vector<uint8_t> rgba(size_t(W) * H * 4);
-        if (!nv_ok(nvfx_texture2d_download(ctx, back[bb].Get(), uint32_t(D3D12_RESOURCE_STATE_PRESENT), rgba.data(),
-                                           uint32_t(W) * 4), "nvfx_texture2d_download(back buffer)"))
+        rgba.assign(size_t(W) * H * 4, 0);
+        return nv_ok(nvfx_texture2d_download(ctx, back[bb].Get(), uint32_t(D3D12_RESOURCE_STATE_PRESENT), rgba.data(),
+                                             uint32_t(W) * 4), "nvfx_texture2d_download(back buffer)");
+    }
+
+    bool screenshot(const std::wstring& path) {
+        std::vector<uint8_t> rgba;
+        if (!download_back(rgba) || !write_image(path, rgba, W, H)) return false;
+        std::printf("[nvfx_demo] frame %llu screenshot -> %s\n", (unsigned long long)frame_no, to_utf8(path).c_str());
+        return true;
+    }
+
+    std::wstring shot_path(uint64_t f) const {
+        std::wstring p = a.screenshot.empty() ? L"D:\\nvfx_demo_out\\shot.bmp" : a.screenshot;
+        size_t dot = p.find_last_of(L'.');
+        size_t sl = p.find_last_of(L"\\/");
+        if (dot == std::wstring::npos || (sl != std::wstring::npos && dot < sl)) dot = p.size();
+        wchar_t suf[32];
+        swprintf(suf, 32, L"_f%llu", (unsigned long long)f);
+        return p.substr(0, dot) + suf + p.substr(dot);
+    }
+
+    // last frame: the renderer's aux buffers as images + stats; is the bbox handed to detail sane?
+    bool dump_aux_files() {
+        if (!renderer) return true;
+        std::vector<float> al(size_t(W) * H), de(size_t(W) * H), mo(size_t(W) * H * 2);
+        if (!nv_ok(nvfx_renderer_download(renderer, NVFX_RENDER_TEX_ALPHA, al.data()), "nvfx_renderer_download(ALPHA)") ||
+            !nv_ok(nvfx_renderer_download(renderer, NVFX_RENDER_TEX_DEPTH, de.data()), "nvfx_renderer_download(DEPTH)") ||
+            !nv_ok(nvfx_renderer_download(renderer, NVFX_RENDER_TEX_MOTION, mo.data()), "nvfx_renderer_download(MOTION)"))
             return false;
-        if (!write_image(path, rgba, W, H)) return false;
-        std::printf("[nvfx_demo] screenshot -> %s\n", to_utf8(path).c_str());
+        const size_t N = size_t(W) * H;
+        int x0 = W, y0 = H, x1 = -1, y1 = -1;
+        size_t n_vis = 0, n_out = 0, n_motion_clear = 0, n_nan = 0;
+        double mmax = 0, msum = 0, mxs = 0, mys = 0, dmin = 1e9, dmax = 0;
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                size_t i = size_t(y) * W + x;
+                float A = al[i], D = de[i], mx = mo[i], my = mo[N + i];
+                if (!std::isfinite(A) || !std::isfinite(D) || !std::isfinite(mx) || !std::isfinite(my)) { ++n_nan; continue; }
+                if (A < 1e-3f && (mx != 0.0f || my != 0.0f)) ++n_motion_clear;
+                if (A <= 0.01f) continue;
+                ++n_vis;
+                x0 = std::min(x0, x); y0 = std::min(y0, y); x1 = std::max(x1, x + 1); y1 = std::max(y1, y + 1);
+                if (x < last_bbox[0] || x >= last_bbox[2] || y < last_bbox[1] || y >= last_bbox[3]) ++n_out;
+                double m = std::sqrt(double(mx) * mx + double(my) * my);
+                mmax = std::max(mmax, m); msum += m; mxs += mx; mys += my;
+                dmin = std::min(dmin, double(D)); dmax = std::max(dmax, double(D));
+            }
+        double nv = double(std::max<size_t>(n_vis, 1));
+        std::printf("[aux] alpha>0.01: %zu px (%.1f %% of frame), extent [%d,%d)-[%d,%d)\n", n_vis, 100.0 * n_vis / N, x0, y0, x1, y1);
+        std::printf("[aux] projected bbox handed to detail: [%d,%d)-[%d,%d) = %.1f %% of frame; visible px outside it: %zu\n",
+                    last_bbox[0], last_bbox[1], last_bbox[2], last_bbox[3],
+                    100.0 * (last_bbox[2] - last_bbox[0]) * (last_bbox[3] - last_bbox[1]) / double(N), n_out);
+        std::printf("[aux] motion over visible px (px per SIM_DT, y down): |m| max %.2f mean %.2f, mean (x %.2f, y %.2f); "
+                    "nonzero motion where alpha<1e-3: %zu px; non-finite: %zu\n", mmax, msum / nv, mxs / nv, mys / nv,
+                    n_motion_clear, n_nan);
+        std::printf("[aux] depth over visible px: %.3f .. %.3f m (camera distance to target %.3f m); draw flags 0x%x, prev cam %s\n",
+                    n_vis ? dmin : 0.0, dmax, orbit.dist, unsigned(last_flags), last_have_prev ? "yes" : "no (same camera)");
+        if (detail) {
+            NvfxDetailTimings dt = {};
+            int32_t reg[6] = {};
+            nvfx_detail_get_timings(detail, &dt);
+            nvfx_detail_region(detail, last_bbox, reg);
+            std::printf("[aux] detail region for this bbox: x %d y %d %dx%d (crop %dx%d); last finished detail frame %llu region %dx%d\n",
+                        reg[0], reg[1], reg[2], reg[3], reg[4], reg[5], (unsigned long long)dt.frame_index, dt.region[2], dt.region[3]);
+        }
+        // images: alpha grey; motion R = x, G = y (128 = 0, +-scale to the max), B = alpha
+        double ms = mmax > 1e-6 ? 127.0 / mmax : 1.0;
+        std::vector<uint8_t> img(N * 4, 255);
+        for (size_t i = 0; i < N; ++i) {
+            uint8_t g = uint8_t(std::clamp(al[i], 0.0f, 1.0f) * 255.0f + 0.5f);
+            img[i * 4 + 0] = img[i * 4 + 1] = img[i * 4 + 2] = g;
+        }
+        bool ok = write_image(a.dump_aux + L"_alpha.bmp", img, W, H);
+        for (size_t i = 0; i < N; ++i) {
+            img[i * 4 + 0] = uint8_t(std::clamp(128.0 + mo[i] * ms, 0.0, 255.0));
+            img[i * 4 + 1] = uint8_t(std::clamp(128.0 + mo[N + i] * ms, 0.0, 255.0));
+            img[i * 4 + 2] = uint8_t(std::clamp(al[i], 0.0f, 1.0f) * 255.0f);
+        }
+        ok = write_image(a.dump_aux + L"_motion.bmp", img, W, H) && ok;
+        std::printf("[aux] -> %s_alpha.bmp, %s_motion.bmp (motion scale: 127 = %.2f px)\n", to_utf8(a.dump_aux).c_str(),
+                    to_utf8(a.dump_aux).c_str(), mmax);
+        return ok;
+    }
+
+    // last frame, raw mode: (1) back buffer vs the renderer's COLOR texture (the app's copy path), (2) back buffer vs a
+    // stand-alone nvfx_renderer_draw of the same solver state + camera + prev camera (the hosted record path)
+    bool compare_library() {
+        if (!renderer) return true;
+        if (last_neural) { std::printf("[compare] skipped: last frame was NEURAL (use --mode raw)\n"); return true; }
+        std::vector<uint8_t> bb, col(size_t(W) * H * 4);
+        if (!download_back(bb)) return false;
+        auto diff = [&](const char* what) {
+            size_t n = 0, nd = 0;
+            int mx = 0;
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    if (hud_drawn && x >= hud_box[0] && x < hud_box[2] && y >= hud_box[1] && y < hud_box[3]) continue;
+                    size_t i = (size_t(y) * W + x) * 4;
+                    int d = 0;
+                    for (int c = 0; c < 3; ++c) d = std::max(d, std::abs(int(bb[i + c]) - int(col[i + c])));
+                    ++n;
+                    if (d) ++nd;
+                    mx = std::max(mx, d);
+                }
+            std::printf("[compare] %s: %zu px compared%s, %zu differ, max abs %d -> %s\n", what, n,
+                        hud_drawn ? " (HUD box excluded)" : "", nd, mx, nd == 0 ? "IDENTICAL" : "DIFFERENT");
+        };
+        if (!nv_ok(nvfx_renderer_download(renderer, NVFX_RENDER_TEX_COLOR, col.data()), "nvfx_renderer_download(COLOR)")) return false;
+        diff("back buffer vs renderer COLOR (app copy path)");
+        int32_t fl = last_flags & ~NVFX_RENDER_REUSE_VOLUME;
+        if (!nv_ok(nvfx_renderer_draw(renderer, solver, &last_cam, last_have_prev ? &last_prev : nullptr, fl), "nvfx_renderer_draw"))
+            return false;
+        if (!nv_ok(nvfx_renderer_download(renderer, NVFX_RENDER_TEX_COLOR, col.data()), "nvfx_renderer_download(COLOR)")) return false;
+        std::printf("[compare] app frame drew with flags 0x%x; stand-alone redraw with 0x%x\n", unsigned(last_flags), unsigned(fl));
+        diff("back buffer vs stand-alone nvfx_renderer_draw (same state/camera)");
         return true;
     }
 
@@ -1321,8 +1557,10 @@ struct Demo {
         neural = a.neural;
         vsync = a.vsync && a.bench_s <= 0;
         hud_on = !a.no_hud;
-        auto_orbit = a.orbit;
+        auto_orbit = a.orbit || (scripted && !a.no_auto_orbit);
+        orbit.yaw = a.yaw;
         if (a.bench_s > 0) orbit.dist = a.bench_dist;
+        if (!a.script.empty() && !parse_script(to_utf8(a.script), script)) return 2;
         if (a.neural && !detail_usable() && !a.solver_only)
             std::printf("[nvfx_demo] mode neural requested, detail unavailable (%s): running RAW\n", detail_status.c_str());
         std::printf("[nvfx_demo] adapter: %s | %dx%d | march %dx%d | tearing %s\n", adapter_name.c_str(), W, H, march_w,
@@ -1354,7 +1592,12 @@ struct Demo {
 
             if (!frame(fdt, recording)) { ok = false; exit_code = 3; }
             bool last = a.frames > 0 && frame_no + 1 >= uint64_t(a.frames);
+            if (ok && std::find(a.shot_at.begin(), a.shot_at.end(), int(frame_no)) != a.shot_at.end() &&
+                !screenshot(shot_path(frame_no)))
+                exit_code = 4;
             if (ok && last && !a.screenshot.empty() && !screenshot(a.screenshot)) exit_code = 4;
+            if (ok && last && !a.dump_aux.empty() && !dump_aux_files()) exit_code = 4;
+            if (ok && last && a.compare && !compare_library()) exit_code = 4;
             if (!present()) { ok = false; exit_code = 3; }
             double tp = now_ms();
             if (t_last_present > 0) {
