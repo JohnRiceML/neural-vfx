@@ -162,3 +162,37 @@ class ScreenDetail:              # route B; untrained weights are fine in this p
 ```
 Timing rule for this phase: another training job may be using the GPU. Check `nvidia-smi` before
 recording numbers and say in your report whether the GPU was shared; the lead re-runs `bench3d` on an idle GPU.
+
+## Route B training phase (screen-space detail) — added 2026-11-09
+Goal: train `ScreenDetail` so a render of the live 64^3 sim looks like a render of a matched 256^3 sim,
+inside 2.5 ms at 1440p, stable frame to frame and as the camera moves. Route A stays untrained.
+
+| Path | Owner |
+|---|---|
+| `vfx/render3d/`, `vfx/app3d/` | 3D render/sandbox engineer |
+| `vfx/datagen3d/` | 3D data engineer |
+| `vfx/model3d/`, `vfx/runtime3d/`, `vfx/train3d/` | 3D ML/runtime engineer |
+| `tests3d/`, `bench3d/`, `vfx/eval3d/` | 3D test/eval engineer |
+
+```python
+# vfx/render3d — addition
+VolumeRenderer.draw(volume, camera, solid=None, ..., return_aux=False, velocity=None)
+#   return_aux=True -> (frame, aux) where aux is a dict of cuda tensors at out_size:
+#     "alpha"  (h,w) float16  1 - transmittance of the medium along the ray (0 = empty)
+#     "depth"  (h,w) float16  opacity-weighted mean distance along the ray, meters (0 where alpha == 0)
+#     "motion" (2,h,w) float16 screen-space motion in pixels per SIM_DT (x right, y down): where the
+#              content at this pixel was one sim step ago = pixel - motion. Opacity-weighted projection of
+#              `velocity` ((3,D,H,W) m/s, any resolution) plus camera motion if a previous camera is given.
+#   Must not change the frame, and must cost nothing when return_aux=False.
+
+# vfx/datagen3d/__init__.py
+def load_sequences(version, split, length) -> torch Dataset
+#   items: dict of tensors for one camera over `length` consecutive sim steps:
+#     "lr"  (L,3,h,w) uint8   render of the raw 64^3 sim (exactly what the sandbox feeds route B)
+#     "hr"  (L,3,h,w) uint8   render of the guided 256^3 sim, same camera, light and renderer settings
+#     "aux" (L,4,h,w) float16 alpha, depth, motion_x, motion_y from the LR render
+#     plus "seed", "cam", "t0". Splits by scenario seed: train / test / ood. Whole dataset <= 4 GB.
+
+# vfx/runtime3d — ScreenDetail.infer(frame, aux) keeps its signature; aux is the dict above.
+# vfx/eval3d/metrics.py — image-space metrics (owned by the test engineer; training code calls these).
+```
