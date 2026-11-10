@@ -123,9 +123,14 @@ def _save(path: Path, arr: np.ndarray) -> None:
 
 
 def run(sc, out_dir, n_cams: int = DEFAULT_CAMS, guide: GuideConfig3D | None = DEFAULT_GUIDE,
-        hr_res: int = HR_RES_3D, cam_policy: str = "v1", n_spare: int = 0, storage: str = "npy") -> dict:
+        hr_res: int = HR_RES_3D, cam_policy: str = "v1", n_spare: int = 0, storage: str = "npy",
+        fixed_cams: tuple | None = None) -> dict:
     """cam_policy "v1": R.sample_cameras (s3d_v1); "v2": R.sample_cameras_v2 with `n_spare` extra candidate
-    cameras rendered and the first `n_cams` valid ones kept (VALID). storage "npy" | "pack"."""
+    cameras rendered and the first `n_cams` valid ones kept (VALID). storage "npy" | "pack".
+    fixed_cams = (list[OrbitCam], list[crop_xy_out]): render exactly these cameras / windows (s3d_hi reuses
+    s3d_v2's), all kept; n_cams / cam_policy / n_spare are then ignored."""
+    if fixed_cams is not None:
+        n_cams, n_spare = len(fixed_cams[0]), 0
     d = Path(out_dir)
     d.mkdir(parents=True, exist_ok=True)
     (d / "meta.json").unlink(missing_ok=True)
@@ -141,11 +146,14 @@ def run(sc, out_dir, n_cams: int = DEFAULT_CAMS, guide: GuideConfig3D | None = D
         tracks.append(tr)
         if s == sc.warmup - 1:
             centroid = R.effect_centroid(lr)
-            if cam_policy == "v2":
+            if fixed_cams is not None:
+                cams, crops = list(fixed_cams[0]), [list(c) for c in fixed_cams[1]]
+            elif cam_policy == "v2":
                 cams = R.sample_cameras_v2(rng, centroid, n_cams + n_spare, sc, T, SIM_DT)
             else:
                 cams = R.sample_cameras(rng, centroid, n_cams)
-            crops = [R.choose_crop(rng, c, T, SIM_DT) for c in cams]
+            if fixed_cams is None:
+                crops = [R.choose_crop(rng, c, T, SIM_DT) for c in cams]
             pr.begin(sc.obstacles, cams, crops, T)
         if s >= sc.warmup:
             tr0 = time.perf_counter()

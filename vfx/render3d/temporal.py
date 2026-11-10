@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import warp as wp
 
-from vfx.render3d.kernels import box_hit, safe_inv
+from vfx.render3d.kernels import sample_v4_cr
 
 
 @wp.func
@@ -74,7 +74,8 @@ def temporal_resolve(cur: wp.array2d(dtype=wp.vec4), aux: wp.array2d(dtype=wp.ve
                      out: wp.array2d(dtype=wp.vec4), alpha_base: float, gamma: float, k_t: float):
     """cur: this frame's march buffer; aux: (alpha, alpha*depth, ...) premultiplied from the same march;
     hist: last resolved buffer; cam: current camera basis (16); tcam: previous draw's camera basis
-    (16; tcam[15] = history valid flag). out: resolved (rgb, T) = the new history."""
+    (16; tcam[14] = minimum current weight for this draw, raised on sim-tick draws because the volume
+    itself changed; tcam[15] = history valid flag). out: resolved (rgb, T) = the new history."""
     r, c = wp.tid()
     H = cur.shape[0]
     W = cur.shape[1]
@@ -117,7 +118,8 @@ def temporal_resolve(cur: wp.array2d(dtype=wp.vec4), aux: wp.array2d(dtype=wp.ve
     if not valid:
         out[r, c] = now                 # disocclusion / off-screen: reset
         return
-    hp = to_c4(bilin4(hist, px, py))
+    # Catmull-Rom history fetch (clamped to its 2x2 footprint): bilinear re-sampling every frame blurs
+    hp = to_c4(sample_v4_cr(hist, px / float(W), py / float(H)))
     # neighbourhood statistics of the current frame (variance clip in YCoCg + T)
     m1 = wp.vec4(0.0, 0.0, 0.0, 0.0)
     m2 = wp.vec4(0.0, 0.0, 0.0, 0.0)
@@ -142,6 +144,7 @@ def temporal_resolve(cur: wp.array2d(dtype=wp.vec4), aux: wp.array2d(dtype=wp.ve
     # transparency-aware weight: trust history less where the medium's T changed or the T
     # neighbourhood is high-contrast (thin moving edges), and where the clip had to move history far
     dT = wp.abs(nc[3] - hp[3])
-    w = wp.clamp(alpha_base + k_t * dT + 0.5 * k_t * (hi[3] - lo[3]) * dT, alpha_base, 1.0)
+    a0 = wp.max(alpha_base, tcam[14])
+    w = wp.clamp(a0 + k_t * dT + 0.5 * k_t * (hi[3] - lo[3]) * dT, a0, 1.0)
     res = cl * (1.0 - w) + nc * w
     out[r, c] = from_c4(res)

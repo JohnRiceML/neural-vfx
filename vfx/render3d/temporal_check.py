@@ -116,26 +116,29 @@ def pictures(out):
             rs[k] = VolumeRenderer((H, W), march_scale=0.5, temporal=t)
             rs[k].set_params(steps=steps)
         frames = {k: [] for k in rs}
-        for i in range(24):                       # 12 sim ticks at 2 draws per tick (60 Hz over 30 Hz)
+        for i in range(23):                       # sim ticks at 2 draws per tick (60 Hz over 30 Hz); last draw = new tick
             if i % 2 == 0:
                 st = step(push=push and i >= 6)
                 vol = Volume(st.data[CH3["density"]], st.data[CH3["temperature"]])
             cam = orbit_cam(-30.0 + orbit * i, 1.9)
             for k, r in rs.items():
                 img = r.draw(vol, cam, solid, reuse_volume=(i % 2 == 1), detail=det)
-                if i >= 21:
+                if i >= 20:
                     frames[k].append(img.clone())
-        sheet = pygame.Surface((4 * W // 2, len(rs) * H // 2))
-        crops = pygame.Surface((4 * 300, len(rs) * 300))
+        sheet = pygame.Surface((5 * W // 2, len(rs) * H // 2))
+        crops = pygame.Surface((5 * 300, len(rs) * 300))
         for j, k in enumerate(rs):
             fr = frames[k]
             diff = ((fr[2].float() - fr[1].float()).abs() * 4).clamp(0, 255).byte()
-            for i, im in enumerate(fr + [diff]):
+            lag = ((fr[2].float() - frames["ref_768"][2].float()).abs() * 4).clamp(0, 255).byte()
+            for i, im in enumerate(fr + [diff, lag]):
                 sheet.blit(pygame.transform.smoothscale(surf(im), (W // 2, H // 2)), (i * W // 2, j * H // 2))
                 crops.blit(surf(im[120:420, 330:630]), (i * 300, j * 300))
         pygame.image.save(sheet, str(out / f"temporal_{name}.png"))
         pygame.image.save(crops, str(out / f"temporal_{name}_crops.png"))
-        print(name, "rows:", list(rs), "cols: t-2, t-1, t, |t - (t-1)| x4")
+        err = {k: float((frames[k][2].float() - frames["ref_768"][2].float()).abs().mean()) for k in rs}
+        print(name, "rows:", list(rs), "cols: t-2, t-1, t (new sim tick), |t - (t-1)| x4, |t - ref_768 at t| x4;",
+              "mean |t - ref_768| (0-255):", {k: round(v, 3) for k, v in err.items()})
 
 
 def main(argv=None):

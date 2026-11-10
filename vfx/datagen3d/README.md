@@ -116,10 +116,137 @@ windows of 8. **3.77 GB, 1259 s** (~85 ms per paired step incl. guidance and ren
 Tracking (rel L2 at 16³, per-scenario max over all steps ≥ 10): density median 0.069 / max 0.160,
 T median 0.047 / max 0.147, velocity median 0.094 / max 0.169. selfcheck PASS: lr/hr best shift (0,0) in
 696/696 frames; camera-only motion warp gain 5.9x; fluid motion: see below.
-Size lever for v2: zlib halves the arrays (lr 1.9x, hr 1.7x, aux 2.2x; ~10–17 ms to inflate one
+(Size lever noted at the time:) zlib halves the arrays (lr 1.9x, hr 1.7x, aux 2.2x; ~10–17 ms to inflate one
 scenario), at the cost of mmap.
 
+## s3d_v2 (2026-11-09) — 4x data, large fires close up, lossless storage
+Why: on s3d_v1 the screen-space net is data-limited (hold-out error bottoms out after 3–5 min) and weakest
+on large fires seen close up (vfx/train3d/EXPERIMENTS.md runs 1–3).
+
+**Splits** (432 scenarios, 1272 sequences × 16 frames, all 256² stored px):
+train 384 (seeds 0–383, v2 sampler, 3 cameras = 1152 seqs); test 24 / ood 24 = seeds 100000–100011 /
+200000–200011 **imported bit-identically from s3d_v1** (same arrays, 2 cameras each, meta gains v2 tags;
+`meta["imported_from"]`) + 100012–100023 / 200012–200023 new (v2 sampler, 3 cameras). Seed ranges are
+disjoint per split, so no v1 test/ood scenario can be in v2 train. Slice v1-comparable results with
+`imported_from == "s3d_v1"`.
+
+**Distribution** (`sample_scenario(seed, split, sampler="v2")`): kinds campfire .16 / big_fire .16 /
+multi_fire .12 / fire_obstacle .12 / torches_wind .07 / mixed .11 (35 % with a thin mid-air "slab", the
+preset-4 kind) / plume_sphere .11 / random .15. Fire size classes small r .03–.05 / medium .05–.08 /
+large .08–.115 m with fuel 4–9 / 6–14 / 10–22 /s, 1100–1550 K, 20 % sooty (density_rate .3–.8). Smoke
+r .04–.11, 1.5–5.5 /s. fire_obstacle: 1–2 fires + 1–3 floor-standing walls / pillars / crates (0.12–0.44 m
+tall) beside them, 40 % a sphere above. OOD (same three factor names as v1, ranges beyond every v2 train
+range): mid-air blocks half-height .045–.09 (train slabs ≤ .04), wind .8–1.6 m/s², emitters r .12–.16
+with fuel 18–30 (train ≤ .115 / 22). Exact presets never sampled (`is_preset_like`).
+Note: v2 train now contains thin mid-air slabs and fires up to r .115, so v1's OOD "box_obstacle" and
+"large_emitter" scenes are partly in-distribution for a v2-trained model (their tags still differ).
+
+**Cameras** (`render.sample_cameras_v2`): 55 % from a close-up band (orbit distance log-uniform 0.8–1.35 m:
+the 512-px window spans 0.21–0.35 m, so a large fire fills it), else 1.35–4.0 m; 50 % (65 % with fire) aimed
+at an emitter at a height inside the flame instead of the centroid; in fire_obstacle scenes 50 % look past a
+floor occluder at its fire; positions kept outside the 1 m domain; v1 motion model (38 % moving).
+**Spare cameras**: 5 candidates are rendered per scenario (rendering is ~1 % of the cost) and the first 3
+that pass `runner.VALID` are kept (effect visible in every frame ≥ 1 % of px and mean ≥ 2 %, frame mean
+4–246 /255, hr/lr effect luminance 0.6–1.67); rejects are listed in meta `rejected_cams`. 0 sequences had
+to be kept invalid (card `flagged` is empty).
+
+**Tags** (card `tag_definitions`, counts per split in `tag_counts` / `camera_tag_counts`; `ds.tags(i)` gives
+scenario + camera tags of an item):
+
+| share | v1 train | v2 train |
+|---|---|---|
+| scenarios with a large fire (r ≥ 0.08 m) | 0 % | 49 % |
+| cameras closeup (orbit ≤ 1.35 m) | 23 % | 54 % |
+| scenarios large_fire with a closeup camera | 0 % | 44 % |
+| cameras flame_dominated (≥ 25 % of effect px are flame) | — | 55 % |
+| cameras "fill" (≥ 50 % of the window covered) | — | 56 % |
+| multi_fire / smoke_only / occluder scenes | 21 / 30 / 0 % | 24 / 22 / 10 % |
+
+**Storage** (`pack.py`): one `data.pack` per scenario: per frame and array, an integer predictor (lr:
+x − left − up + upleft mod 256; hr: same on hr − lr; aux: same on the fp16 bit patterns mod 2¹⁶ then byte
+planes split; hr_alpha: same) + zlib level 6. Lossless (round trip verified bit-exact), stdlib only.
+Chunks are ordered (camera, frame, array), so a window is one contiguous read. **5.79 GB for 20.0 GB of
+raw arrays (3.46x)**; plain zlib would give ~1.9–2x, lzma-1 / bz2-9 with simple filters were at
+most ~10 % smaller and 5–6x slower to decode. Loading (one process, warm OS cache, CPU shared with the build + 2 training jobs):
+
+| loader | items/s, windows of 8 |
+|---|---|
+| s3d_v1 npy (mmap), serial | 4180 (memcpy from page cache); 359 through a DataLoader with collate + pin |
+| s3d_v2 pack, serial | 26 (≈ 4 ms per frame: inflate 1.8 ms, predictor cumsums 2.4 ms) |
+| s3d_v2 pack, 4 / 8 threads (zlib + numpy release the GIL) | 81 / 147 (≈ 1200 frames/s) |
+
+DataLoader **process** workers on this machine failed with WinError 1455 ("paging file too small") while the
+other jobs ran: each spawned worker re-imports torch/CUDA DLLs. Use threads (above) or 1–2 workers.
+
+**Guidance on large fires** (unchanged settings, `tune_guide --sampler v2 --configs unguided,c16`, 150 steps,
+5 large-fire train scenes + 1 OOD triple-large-fire; evidence in the scratchpad `data3d_v2/guide_large`):
+tracking max d / T / u 0.037–0.065 / 0.026–0.036 / 0.047–0.080 (unguided 0.42–0.62 / 0.27–0.50 / 0.66–1.03).
+Fine-scale power vs unguided 256³, bands 16-32 / 32-64 / 64-128: density 0.64–0.89 / 0.65–0.96 /
+0.74–1.31, temperature 0.84–1.19 / 0.91–1.36 / 0.91–1.53. Density detail is a bit lower than on v1's scenes
+(min 0.82) in the hottest single fire (scene 31: 0.64), temperature (what makes the flame) is retained.
+Renders: guided HR keeps the LR plume's shape and the unguided run's filaments. Build tracking over all 432
+scenarios (rel L2 at 16³, max over steps ≥ 10): density median 0.061 / p95 0.104 / max 0.247 (6 campfires
+> 0.16; the worst, a thin r 0.033 m fire, checked visually: aligned), T 0.036 / 0.081 / 0.188, velocity 0.074 / 0.150 / 0.270.
+
+**Bug found and fixed here** (`PairRenderer._fence`): `VolumeRenderer.draw` writes the camera into one of
+4 pinned host buffers and uploads it with `non_blocking=True`; with more than 4 draws queued ahead of the
+GPU the CPU overwrites a slot before its copy runs and a draw renders another camera (v2 pilot: hr of one
+camera showed another camera's view, hr/lr luminance 0.4–5x). We now sync before every draw. s3d_v1
+(4 draws per frame) re-rendered for 2 scenarios: same views (background diff ≤ 1 code) — not affected
+visibly. The render3d owner should make the ring safe for other callers.
+
+**Build**: 2026-11-09, sim3d-warp-0.1.0, GPU shared with 2–4 training / eval jobs the whole time;
+~97 min wall over 3 sessions (stopped twice by the free-disk guard while C: free space swung by ~15 GB:
+the Windows pagefile grew under RAM pressure; the build now pauses below 4 GB free and resumes at 7 GB).
+6–90 s per scenario (~100–200 ms per paired step shared, 85 ms on v1's quieter GPU). No non-finite runs.
+
+## s3d_hi (2026-11-09) — sharper target on a v2 subset
+`build --version s3d_hi`: the first 48 train seeds + all 24 test seeds of s3d_v2 with the **same scenarios,
+cameras and crop windows** (read from v2's meta.json, `runner.run(fixed_cams=...)`), hr from a guided
+**320³** sim (5x the 64³ grid per axis). lr is re-simulated in the same run: equal to v2's lr up to sim
+nondeterminism (test 100000: mean |Δ| 0.03 codes). Same item format; card `hr_res` / `source`. Lives on D:
+(`datasets/s3d_hi` is a junction).
+
+**Resolution reached: 320³.** Guided pair (64³ + HR + guidance), one process, big-fire scene:
+256³ 3.8 GiB / 81 ms/step, 320³ 6.9 GiB / 204 ms/step (GPU shared), 384³ ran out of device memory with
+another job holding 3.6 GB (needs ~12 GiB by N³ scaling; measured 1014 ms/step while spilling into shared
+system memory). 384³ would only fit on an otherwise idle card and would OOM anyone else; 352³ is not a
+multiple of 64 (the guide needs an integer factor). 512³ (~27 GiB) does not fit.
+
+**Guidance at 5x** (tune_guide `--hr-res 320`, 150 steps, unchanged settings): tracking max d/T/u big fire
+0.064 / 0.037 / 0.066, smoke plume 0.078 / 0.051 / 0.152 (unguided 0.53 / 0.28 / 1.08 and 0.38 / 0.14 / 1.60);
+fine power vs unguided 320³, bands 4-8 … 64-128: density 0.80–1.10 (fire), 0.88–1.88 (plume); temperature
+0.89–1.46 / 0.99–2.39. Finite; max |u| 27–39 % above unguided (the run follows the LR flow).
+
+**Does 320³ show more on screen than 256³?** Same scenario + camera, luminance high-pass energy in the
+effect region (frames 0/8/15), hr320 / hr256: big-fire close-up 1.56 (σ 1 px, output px) / 1.49 (σ 1,
+stored px); smoke close-up 1.14 / 1.13; far smoke 1.43 / 1.37. Visible in 1:1 crops (more filaments at the
+plume edge). The gain is about the same at output and stored pixels, so the stored 256² footprint is not
+the limit at these distances; no larger window stored. Over the whole built set (same windows, mask = v2
+effect region, σ 1 stored px): hr320 / hr256 = 1.17 (train) / 1.22 (test), finer in 97 % of 204
+sequences; hr/lr = 2.0 (vs 1.6–1.7 for 256³).
+
+**Build**: 48 train (144 seqs) + 24 test (60 seqs), no ood split (empty list); **0.89 GB, 2035 s** (GPU
+shared; ~200–300 ms per paired step). Layer 3 (`VFX_DATASET3D=s3d_hi`): 9 passed, 1 skipped (no OOD),
+1 xfailed, 1 failed = the same close-up motion bound as v2 (identical cameras).
+
 ## What the training side must know
+* **s3d_v2**: decompressed train is 18.1 GB (1152 seqs × 15.7 MB) — it does not fit on the GPU like
+  `GPUWindows` loads v1 (2.9 GB). Stream with threads, or hold a rotating subset. Cameras per scenario vary
+  (3 new, 2 imported): use `ds.sequences` / `ds.seq_scenario` instead of assuming 2 per scenario (the
+  `seq_range` hold-out in `vfx/train3d/data.py` assumes 2). Hold-out by scenario seed, not by sequence index.
+* **s3d_v2 close-ups carry large stored motion**: p99 |motion| (alpha > 0.05) exceeds 50 stored px/step in
+  118 / 1272 sequences, max 86 (v1 max 62). It is real: hot gas at 2–3 m/s seen from 0.8–0.9 m is ~1100
+  stored px/m. Normalize motion inputs accordingly (do not assume |motion| < 64).
+* Layer 3 (`VFX_DATASET3D=s3d_v2 pytest tests3d/test_data3d_layer3.py`): 9 passed, 1 xfailed (stored
+  motion, known), 2 failed: `test_size_and_card` (5.79 GB vs the v1-era 4 GiB limit; v2's budget is 6 GB)
+  and `test_no_nan_inf_and_aux_ranges` only on its motion bound (p99 < 0.25 x 256 px/step; the close-up
+  sequences above). Alignment 103/103 frames (0,0); coarse corr median 0.997; hr/lr fine energy 1.93x.
+* selfcheck (`--max-scn 60`: all 48 test/ood + 60 train scenarios): splits, ranges, size, loader, motion
+  sign (static 91 % / moving 92 %), camera-only motion warp gain 5.9x all ok. Alignment first showed 4/781
+  frames with a ±3 px "best shift": close-ups whose only medium-free pixels are plain background (no
+  geometry; checked visually, same view). The check now needs a shift to beat no-shift by ≥ 10 % (a real
+  2-px shift is still caught) -> 781/781.
 * Frames are final display images (ACES + sRGB + dither, bloom); `lr` is what ScreenDetail's
   `pool(rgb)` sees at process_scale 0.5. At runtime, the aux from the 1440p render must be pooled the same
   way and motion halved to match the stored units.

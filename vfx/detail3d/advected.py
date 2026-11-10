@@ -46,21 +46,24 @@ class DetailParams:
     period: float = 1.0            # seconds each coordinate set lives before it is regenerated
     w_vort: float = 12.0           # amplitude = 1 - exp(-w_vort |curl u| dx - w_heat heat)
     w_heat: float = 0.0
-    heat_damp: float = 0.85        # less displacement in the hot flame core (keeps it coherent)
+    heat_damp: float = 0.95        # less displacement in the hot flame core (keeps it coherent)
+    damp_nb: float = 1.0           # 0: damp by the cell's own heat, 1: by the 3^3 max (thin flames)
     d_lo: float = 0.004            # density presence ramp (3^3 max) -> amplitude
     d_hi: float = 0.04
     amp_floor: float = 0.0         # minimum amplitude where smoke is present (0 = purely energy-keyed)
     smooth: int = 1                # box-blur passes on the amplitude (avoid kinks)
     max_disp: float = 0.3          # cap on |D| (m)
     amp_eps: float = 0.02
+    t_disp: float = 0.3            # fraction of the displacement applied to temperature in flames
+    t_hot: float = 700.0           # K: above this the temperature is re-read at the t_disp point
     light_octaves: int = 1         # octaves the light/shadow volume samples (finer ones are below its res)
     seed: int = 1
 
 
 QUALITY = {
-    "low": dict(octaves=1),
-    "medium": dict(octaves=2),
-    "high": dict(octaves=4),       # octave centres 12, 24, 48, 96 cycles/m: up to the 256^3 Nyquist (128)
+    "low": dict(octaves=1, disp_gain=0.5),
+    "medium": dict(octaves=2, disp_gain=0.5),
+    "high": dict(octaves=4, disp_gain=0.45),      # octave centres 12, 24, 48, 96 cycles/m: up to the 256^3 Nyquist (128)
 }
 
 
@@ -93,9 +96,9 @@ class AdvectedDetail:
         self.amp = torch.zeros(n, n, n, device=self.device)
         self.dyn = torch.zeros(8, device=self.device)               # read by the march (see kernels)
         self.reset_flags = torch.zeros(2, dtype=torch.int32, device=self.device)
-        self._pin = [torch.zeros(8).pin_memory() for _ in range(4)]
-        self._pin_r = [torch.zeros(2, dtype=torch.int32).pin_memory() for _ in range(4)]
-        self._pin_i = 0
+        from vfx.render3d.pinned import PinnedRing
+        self._pin = PinnedRing(8)                 # per-tick staging, safe however many ticks are queued
+        self._pin_r = PinnedRing(2, torch.int32)
         self._graphs: dict = {}
         self._wp_stream = None
         self._wp_stream_key = None
@@ -133,6 +136,7 @@ class AdvectedDetail:
         s.lac = float(p.lac)
         s.amp_eps = float(p.amp_eps)
         s.rot = wp.mat33(*[v for row in rotation() for v in row])
+        s.t_disp, s.t_hot = float(p.t_disp), float(p.t_hot)
         return s
 
     # ------------------------------------------------------------------ state
@@ -155,13 +159,14 @@ class AdvectedDetail:
         ph = self.phases(self.tick)
         w = np.sin(np.pi * ph) ** 2
         w = w / max(1e-6, math.sqrt(float((w ** 2).sum())))
-        pin, pr = self._pin[self._pin_i], self._pin_r[self._pin_i]
-        self._pin_i = (self._pin_i + 1) % len(self._pin)
+        pin, pr = self._pin.acquire(), self._pin_r.acquire()
         pin[:2] = torch.from_numpy(w.astype(np.float32))
         pin[2:8] = torch.from_numpy(self.offsets.reshape(-1).astype(np.float32))
         pr[:] = torch.from_numpy(np.asarray(resets, np.int32))
         self.dyn.copy_(pin, non_blocking=True)
         self.reset_flags.copy_(pr, non_blocking=True)
+        self._pin.record()
+        self._pin_r.record()
 
     def _stream(self):
         ts = torch.cuda.current_stream(self.device)
@@ -204,7 +209,7 @@ class AdvectedDetail:
         amp_raw = self.amp_raw if D == self.res else torch.zeros(D, D, D, device=self.device)
         wp.launch(K.energy_amp, dim=(D, D, D),
                   inputs=[wp.from_torch(data), wp.from_torch(solid), CH3["density"], CH3["vel_x"], CH3["temperature"],
-                          float(p.w_vort), float(p.w_heat), float(p.heat_damp), float(AMBIENT_TEMP), float(p.d_lo), float(p.d_hi),
+                          float(p.w_vort), float(p.w_heat), float(p.heat_damp), float(p.damp_nb), float(AMBIENT_TEMP), float(p.d_lo), float(p.d_hi),
                           wp.from_torch(amp_raw)])
         a = amp_raw[None, None]
         if D != self.res:

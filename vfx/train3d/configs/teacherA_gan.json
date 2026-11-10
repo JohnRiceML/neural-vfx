@@ -1,0 +1,57 @@
+{
+ "dataset": "s3d_v2",
+ "model": {
+  "width": 64,
+  "n_blocks": 8,
+  "trunk_stride": 4,
+  "hr_feats": 8,
+  "hr_hidden": 16,
+  "hr_kernel": 3,
+  "use_prev": false,
+  "grey_lowfreq": 8,
+  "alpha_gate": 0.5,
+  "chroma_proj": true
+ },
+ "train": {
+  "minutes": 15,
+  "frames": 3,
+  "holdout_scenarios": 12,
+  "chunk_sequences": 80,
+  "chunk_minutes": 2.0,
+  "weight_decay": 0.05,
+  "val_every": 100000,
+  "lr": 5e-05,
+  "val_test_sequences": 16,
+  "warmup_steps": 50
+ },
+ "loss": {
+  "ssim": 0.3,
+  "speckle": 1.0,
+  "spec_max_frac": 0.3
+ },
+ "select": {
+  "rule": "constrained_spec",
+  "every": 500,
+  "key": "midband",
+  "max_l1_rel": 1.1,
+  "max_ms_dssim_rel": 1.1,
+  "max_jerk_ratio": 1.1,
+  "max_speckle_rel_hr": 1.5
+ },
+ "eval": {
+  "splits": [
+   "test",
+   "ood"
+  ]
+ },
+ "name": "teacherA_gan",
+ "hypothesis": "Lead item A follow-up (15 min, s3d_v2, amended rule as final 2): the unconstrained teacher (2.08M, stride 2) fine-tuned with the SAME adversarial objective as final 2 (spatial + temporal conditional patch D, adv 0.01, temporal 0.01, fm 0.1). The regression teacher showed capacity alone does not bring filaments; final 2 showed the adversarial term on the budget net brings a little texture plus artifacts. Question: does capacity + adversarial objective produce reference-like thin filaments (pictures)? If yes -> distil; if no -> the limit is the screen-space approach / the target, not the net.",
+ "init": "C:/Users/ricej/AppData/Local/neural-vfx/checkpoints/screen3d/teacherA_v2_20261109_214240.pt",
+ "adv": {
+  "weight": 0.01,
+  "temporal": 0.01,
+  "fm": 0.1,
+  "d_width": 32,
+  "d_warmup": 200
+ }
+}

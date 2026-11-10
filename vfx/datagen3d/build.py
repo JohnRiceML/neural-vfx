@@ -38,10 +38,15 @@ VERSION_PRESETS = {
     "s3d_v2": {"n_train": 384, "n_test": 24, "n_ood": 24, "frames": DEFAULT_FRAMES, "cams": 3, "sampler": "v2",
                "cam_policy": "v2", "n_spare": 2, "storage": "pack", "size_limit_gb": 6.0,
                "import_from": "s3d_v1", "import": {"test": 12, "ood": 12}},
+    # higher-resolution target on a subset of s3d_v2: same seeds, scenarios and cameras / windows, hr from a
+    # guided HR_RES^3 sim (lr re-simulated in the same run, = v2's lr up to sim nondeterminism). See README.
+    "s3d_hi": {"source": "s3d_v2", "subset": {"train": 48, "test": 24, "ood": 0}, "hr_res": 320,
+               "frames": DEFAULT_FRAMES, "storage": "pack", "size_limit_gb": 2.0, "sampler": "v2",
+               "cam_policy": "fixed (source cameras)"},
 }
 DEFAULTS = {"n_train": 8, "n_test": 2, "n_ood": 2, "frames": DEFAULT_FRAMES, "cams": runner.DEFAULT_CAMS,
             "sampler": "v1", "cam_policy": "v1", "n_spare": 0, "storage": "npy", "size_limit_gb": 4.0,
-            "import_from": None, "import": {}}
+            "import_from": None, "import": {}, "source": None, "subset": None, "hr_res": HR_RES_3D}
 SIZE_LIMIT_GB = 4.0
 MIN_FREE_GB = 9.0
 PAUSE_FREE_GB = 4.0
@@ -49,6 +54,33 @@ RESUME_FREE_GB = 7.0
 PACK_RATIO_EST = 3.45                 # lossless ratio of the pack storage (3.48 on a 10-scenario v2 pilot; 3.2-4x on v1);
                                       # the build also stops when the files on disk reach the size limit
 BYTES_PER_PX = 3 + 3 + 8 + 1          # lr, hr uint8 RGB; aux 4 x fp16; hr_alpha uint8
+
+
+def source_seeds(cfg) -> dict:
+    """Seeds of a subset build: the first `subset[split]` seeds of the source version's splits."""
+    src = json.loads((paths.dataset_dir(cfg["source"]) / "splits.json").read_text())
+    return {sp: src[sp][:cfg["subset"].get(sp, 0)] for sp in ("train", "test", "ood")}
+
+
+def source_job(cfg, split: str, seed: int):
+    """(scenario, (cams, crops), source meta) of a source-version scenario, cameras exactly as stored there."""
+    meta = json.loads((runner.scenario_dir(paths.dataset_dir(cfg["source"]), split, seed) / "meta.json").read_text())
+    sampler = "v1" if (meta.get("imported_from") or meta.get("cam_policy") == "v1") else "v2"
+    sc = sample_scenario(seed, split, meta["frames"], sampler)
+    if json.loads(json.dumps(sc.asdict()["emitters"])) != meta["scenario"]["emitters"]:
+        raise SystemExit(f"{split}/{seed}: scenario does not reproduce the source meta")
+    cams = []
+    for c in meta["cams"]:
+        o = c["orbit"]
+        cam = R.OrbitCam(**{k: (tuple(v) if isinstance(v, list) else v) for k, v in o.items() if k != "info"})
+        if "info" in o:
+            cam.info = o["info"]
+        cams.append(cam)
+    return sc, (cams, [c["crop_xy_out"] for c in meta["cams"]]), meta
+
+
+def seeds_of(cfg) -> dict:
+    return source_seeds(cfg) if cfg.get("source") else split_seeds(cfg["n_train"], cfg["n_test"], cfg["n_ood"])
 
 
 def split_seeds(n_train, n_test, n_ood) -> dict:
@@ -127,7 +159,7 @@ def measure_step_ms(n: int = 30) -> float:
 
 
 def plan(cfg: dict, measure: bool = True) -> dict:
-    seeds = split_seeds(cfg["n_train"], cfg["n_test"], cfg["n_ood"])
+    seeds = seeds_of(cfg)
     steps = sum(sample_scenario(s, sp, cfg["frames"], cfg["sampler"]).num_steps for sp, ss in seeds.items()
                 for s in ss if not imported(cfg, sp, s))
     n = sum(len(v) for v in seeds.values())
@@ -204,9 +236,13 @@ def _card(version, cfg, seeds, root: Path, build_seconds: float) -> dict:
         },
         "flagged": flagged,
         "seed_ranges": {k: [SEED_BASE[k], SEED_BASE[k] + SEED_SPAN - 1] for k in seeds},
-        "lr_res": LR_RES_3D, "hr_res": HR_RES_3D, "dt": SIM_DT,
+        "lr_res": LR_RES_3D, "hr_res": cfg["hr_res"], "dt": SIM_DT,
+        "source": ({"version": cfg["source"], "subset": cfg["subset"],
+                    "note": "same scenario seeds, cameras and crop windows as the source version; lr re-simulated "
+                            "with the hr run (equal to the source lr up to sim nondeterminism), hr from the "
+                            "guided hr_res^3 sim"} if cfg.get("source") else None),
         "lr_solver": "Solver3D(64, runtime_config(**scenario.sim))  (= sandbox)",
-        "hr_solver": "Solver3D(256, SolverConfig3D(**scenario.sim)) guided toward the LR run",
+        "hr_solver": f"Solver3D({cfg['hr_res']}, SolverConfig3D(**scenario.sim)) guided toward the LR run",
         "guidance": DEFAULT_GUIDE.asdict(),
         "tracking_rel_l2_16": {
             "what": "rel L2 at 16^3 of guided HR vs LR; per scenario max over all steps >= 10 (incl. warm-up) "
@@ -245,7 +281,7 @@ def _card(version, cfg, seeds, root: Path, build_seconds: float) -> dict:
 
 def build(version: str, cfg: dict, force: bool = False, log=print) -> dict:
     root = paths.dataset_dir(version)
-    seeds = split_seeds(cfg["n_train"], cfg["n_test"], cfg["n_ood"])
+    seeds = seeds_of(cfg)
     n = sum(len(v) for v in seeds.values())
     est = estimate_bytes(n, cfg["frames"], cfg["cams"], cfg["storage"])
     limit = cfg["size_limit_gb"]
@@ -262,8 +298,11 @@ def build(version: str, cfg: dict, force: bool = False, log=print) -> dict:
     jobs = [(sp, s) for sp in ("test", "ood", "train") for s in seeds[sp]]
     todo = [(sp, s) for sp, s in jobs if not runner.is_complete(runner.scenario_dir(root, sp, s))]
     log(f"[datagen3d] {len(jobs) - len(todo)} complete, {len(todo)} to run")
-    cost = {j: 3 if imported(cfg, *j) else sample_scenario(j[1], j[0], cfg["frames"], cfg["sampler"]).num_steps + 25
-            for j in todo}
+    if cfg.get("source"):
+        cost = {j: source_job(cfg, *j)[0].num_steps + 25 for j in todo}
+    else:
+        cost = {j: 3 if imported(cfg, *j) else sample_scenario(j[1], j[0], cfg["frames"], cfg["sampler"]).num_steps + 25
+                for j in todo}
     total = sum(cost.values()) or 1
     t0 = time.perf_counter()
     done = 0
@@ -277,9 +316,13 @@ def build(version: str, cfg: dict, force: bool = False, log=print) -> dict:
             log(f"[datagen3d] {i + 1}/{len(todo)} {sp} scn_{s:06d} imported from {cfg['import_from']} "
                 f"tags={m['tags']} {time.perf_counter() - ts:.1f}s | {el:6.0f}s elapsed", flush=True)
             continue
-        sc = sample_scenario(s, sp, cfg["frames"], cfg["sampler"])
-        m = runner.run(sc, d, n_cams=cfg["cams"], cam_policy=cfg["cam_policy"], n_spare=cfg["n_spare"],
-                       storage=cfg["storage"])
+        if cfg.get("source"):
+            sc, fixed, _ = source_job(cfg, sp, s)
+            m = runner.run(sc, d, storage=cfg["storage"], hr_res=cfg["hr_res"], fixed_cams=fixed)
+        else:
+            sc = sample_scenario(s, sp, cfg["frames"], cfg["sampler"])
+            m = runner.run(sc, d, n_cams=cfg["cams"], cam_policy=cfg["cam_policy"], n_spare=cfg["n_spare"],
+                           storage=cfg["storage"], hr_res=cfg["hr_res"])
         done += cost[(sp, s)]
         el = time.perf_counter() - t0
         tr = m["tracking_16"]["max_after_step10"]

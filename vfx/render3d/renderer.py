@@ -26,6 +26,7 @@ from vfx.core.fields import SIM_DT
 from vfx.core.fields3d import Camera, Volume
 from vfx.render.blackbody import blackbody_lut
 from vfx.render3d import kernels as K
+from vfx.render3d.pinned import PinnedRing
 from vfx.render3d import temporal as TK
 
 GOLDEN = 0.6180339887498949
@@ -111,8 +112,7 @@ class VolumeRenderer:
         self.lut_t = torch.from_numpy(lut).to(self.device)
         self.lut_wp = wp.from_torch(self.lut_t, dtype=wp.vec3)
         self._cam_dev = torch.zeros(32, device=self.device)        # [current camera | previous camera]
-        self._cam_pin = [torch.zeros(32).pin_memory() for _ in range(4)]
-        self._cam_i = 0
+        self._cam_ring = PinnedRing(32)          # per-draw staging; safe for any number of queued draws
         self._vol: dict = {}                # per volume shape: packed array, texture, occupancy
         self._graphs: dict = {}
         self._last_vol_key = None
@@ -129,9 +129,10 @@ class VolumeRenderer:
         self._last_detail = None
         # temporal amortization (opt-in, shortlist #2): see temporal.py
         self.temporal = bool(temporal)
-        self.t_alpha, self.t_gamma, self.t_kT = 0.1, 1.25, 4.0      # base current weight, clip width, T-change gain
+        self.t_alpha, self.t_gamma, self.t_kT = 0.1, 1.0, 4.0       # base current weight, clip width, T-change gain
+        self.t_alpha_tick = 0.5          # current weight on draws with a new volume (the gas moved: less history)
         self._tcam_dev = torch.zeros(16, device=self.device)        # previous draw's camera + history-valid flag
-        self._tcam_pin = [torch.zeros(16).pin_memory() for _ in range(4)]
+        self._tcam_ring = PinnedRing(16)
         self._tprev = None
         self._tframe = 0
         self.set_output(out_size, march_scale)
@@ -326,25 +327,27 @@ class VolumeRenderer:
         if self.profile:
             self._stage_events = []
         with wp.ScopedStream(self._stream(), sync_enter=False, sync_exit=False):
-            pin = self._cam_pin[self._cam_i]
-            self._cam_i = (self._cam_i + 1) % len(self._cam_pin)
+            pin = self._cam_ring.acquire()
             asp = self.mw / self.mh
             cb = camera_basis(camera, asp)
             if self.temporal:
                 self._tframe += 1
                 cb = cb.copy()
                 cb[14] = (self._tframe * GOLDEN) % 1.0          # per-frame ray-start jitter offset
-                tp = self._tcam_pin[self._cam_i]
+                tp = self._tcam_ring.acquire()
                 if self._tprev is None:
                     tp.zero_()
                 else:
                     tp.copy_(torch.from_numpy(self._tprev))
+                    tp[14] = 0.0 if reuse_volume else self.t_alpha_tick
                     tp[15] = 1.0                                   # history valid
                 self._tcam_dev.copy_(tp, non_blocking=True)
+                self._tcam_ring.record()
                 self._tprev = cb.copy()
             pin[:16].copy_(torch.from_numpy(cb))
             pin[16:].copy_(torch.from_numpy(camera_basis(prev_camera, asp) if (return_aux and prev_camera is not None) else cb))
             self._cam_dev.copy_(pin, non_blocking=True)
+            self._cam_ring.record()
             if not reuse_volume:
                 dens, temp = volume.density, volume.temperature
                 if dens.dtype != temp.dtype or dens.dtype not in (torch.float32, torch.float16):

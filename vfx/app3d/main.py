@@ -296,9 +296,8 @@ class App:
         if self.mode in ("detail", "detail_screen", "hires_detail"):
             q = self.pipe.detail_quality
             dd = self.detail_delta.get(q)
-            extra.append((f"detail {q} (Q cycles): render row includes detail sampling"
-                          + (f"; bench 1440p/0.5: +{dd['added_full']:.2f} new | +{dd['added_view']:.2f} reuse ms"
-                             if dd else "; run vfx.detail3d.bench for the 1440p march delta"), (150, 220, 150)))
+            extra.append((f"detail {q} (Q): in render row; 1440p bench "
+                          + (f"+{dd['added_full']:.2f}|+{dd['added_view']:.2f} ms" if dd else "n/a"), (150, 220, 150)))
         b["extra"] = extra
         return b
 

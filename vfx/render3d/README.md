@@ -190,3 +190,39 @@ Works with any volume resolution (e.g. 64³ raw, or a 128³ hires density) and w
 branches, the non-detail variants get placeholder arguments they never read. Checked: 20 frames
 (presets 1-2 × march 0.5/1.0 × plain / reuse_volume / aux / no solid / 256³ volume) hash-identical
 before and after; `tests3d/test_render3d.py` 17 passed. Cost: see vfx/detail3d/README.md "Costs".
+
+## Fix: per-draw camera upload with many queued draws (2026-11-09)
+Reported by the data engineer: the camera basis was staged in a fixed ring of 4 pinned buffers, so with
+more than 4 draws queued ahead of the GPU (no host sync) a buffer was rewritten before its async copy
+ran and some frames rendered another draw's camera. Now `pinned.PinnedRing`: each slot records a CUDA
+event after its copy; a slot is reused only when its event has completed (`query()`, no sync); if all are
+in flight a new slot is allocated (up to 256, then the oldest is waited on — a sync, never a wrong frame).
+The same fix applies to AdvectedDetail's per-tick parameter upload, which had the identical pattern.
+Regression check: `python -m vfx.render3d.camera_queue_check` (40 draws with 40 cameras queued behind a
+0.1 s GPU busy-wait vs the same cameras drawn one at a time): 0/40 differ (ring grew to 40 slots, no
+forced waits). Negative control with the old 4-slot behaviour: 36/40 frames wrong, detail ticks differ.
+Single-draw output unchanged (36 frames hash-identical to tag `v0.3-screen-space-baseline`, rendered by
+the tag's own code in a separate worktree).
+
+## Temporal amortization (`temporal=True`, shortlist #2, opt-in) — 2026-11-09
+`VolumeRenderer(..., temporal=True)` / `set_temporal(on)`; sandbox `--temporal` or key `J`. Default off;
+the off path is bit-identical (the per-frame jitter offset rides in the unused `cam[14]` slot, 0 when off:
+`frac(ign + 0) == ign`; 36 frames hash-identical to the tag).
+* march with a golden-ratio per-frame offset on the interleaved-gradient ray-start jitter; the aux variant
+  runs internally for the opacity-weighted depth;
+* `temporal.temporal_resolve` (march res): reproject the history by CAMERA MOTION ONLY at that depth (floor
+  hit for floor pixels, domain-centre distance for empty ones; gas velocity never used), Catmull-Rom history
+  fetch, 3x3 variance clip in YCoCg (luma tone-curved) + transmittance, current weight raised with |ΔT| and
+  T-neighbourhood contrast, to 0.5 on draws with a new volume (sim tick), reset when the point leaves the
+  screen / on first frame / resize.
+* Pictures (`python -m vfx.render3d.temporal_check --out DIR --skip-time`; rows off / on / on 96 steps /
+  768-step reference; cols t-2, t-1, t (new tick), |t-(t-1)| x4, |t - ref| x4): no double images or trails
+  on a pushed plume, fire or a 6°/frame orbit, but visible softening of fine detail, floor-grid lines and
+  obstacle edges under camera motion.
+* Error vs a 768-step render (mean |Δ| in 0-255, 960x540, campfire + detail): plain march at 192 steps/m
+  is already 0.03-0.07 from it. Temporal helps only with a static camera at very low step counts (24
+  steps/m: 0.64 -> 0.42); with any orbit it is worse (static volume, 1°/frame, 96 steps: 0.15 plain vs 0.56
+  temporal) — repeated history resampling blurs thin features and one representative depth cannot
+  reproject a deep translucent medium exactly. Not recommended as default in its current form; it would
+  need sub-pixel jitter + output-res history to recover the resampling blur.
+* Cost: to be measured on a quiet card (`temporal_check` without `--skip-time`).

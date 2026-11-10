@@ -66,7 +66,10 @@ def alignment(lr: np.ndarray, hr: np.ndarray, a_lr: np.ndarray, a_hr: np.ndarray
                 best = (e, dy, dx)
             if dy == 0 and dx == 0:
                 err0 = e
-    return (best[1], best[2]), err0, float(np.abs(L - H)[m].mean())
+    # featureless medium-free areas (plain background in v2 close-ups) give a noisy argmin: only a shift that
+    # explains the gradients clearly better (>= 10 %) than no shift counts as a misalignment
+    sh = (best[1], best[2]) if best[0] < 0.9 * err0 else (0, 0)
+    return sh, err0, float(np.abs(L - H)[m].mean())
 
 
 SCALES = (-0.5, 0.0, 0.5, 1.0)

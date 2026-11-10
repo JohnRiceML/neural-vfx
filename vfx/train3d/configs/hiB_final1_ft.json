@@ -1,0 +1,45 @@
+{
+ "dataset": "s3d_hi",
+ "model": {
+  "width": 64,
+  "n_blocks": 8,
+  "trunk_stride": 4,
+  "hr_feats": 8,
+  "hr_hidden": 16,
+  "hr_kernel": 3,
+  "use_prev": false,
+  "grey_lowfreq": 8,
+  "alpha_gate": 0.5,
+  "chroma_proj": true
+ },
+ "train": {
+  "minutes": 15,
+  "frames": 3,
+  "holdout_scenarios": 6,
+  "chunk_sequences": null,
+  "chunk_minutes": 2.0,
+  "weight_decay": 0.05,
+  "val_every": 100000,
+  "lr": 5e-05,
+  "val_test_sequences": 16,
+  "warmup_steps": 50
+ },
+ "loss": {
+  "ssim": 0.3,
+  "speckle": 1.0,
+  "spec_max_frac": 0.3
+ },
+ "select": {
+  "rule": "constrained_spec",
+  "every": 400
+ },
+ "eval": {
+  "splits": [
+   "test",
+   "ood"
+  ]
+ },
+ "name": "hiB_final1_ft",
+ "hypothesis": "Lead item B (15 min): fine-tune the budget final 1 (the teacher was not worth it, item A) on s3d_hi train (48 scenarios x 2 cameras; hr = guided 320^3 instead of 256^3; same seeds as a v2 subset, lr inputs NOT identical to v2's for the same scene - up to ~10 codes mean difference, re-simulated), same regression objective, original rule 1 on 6 held-out hi scenarios. Question: does a sharper target give a visibly or measurably better result, or more hallucination / instability (flicker, swim, speckle)? Compared with final 1 on s3d_hi test (320^3 reference) and on s3d_v2 test.",
+ "init": "C:/Users/ricej/AppData/Local/neural-vfx/checkpoints/screen3d/final1_v2_reg_20261109_210028.pt"
+}

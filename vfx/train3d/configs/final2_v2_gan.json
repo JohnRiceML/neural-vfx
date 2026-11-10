@@ -46,7 +46,7 @@
  },
  "name": "final2_v2_gan",
  "hypothesis": "FINAL 2 (15 min, s3d_v2, amended rule): adversarial fine-tune of final 1's selected weights: conditional spatial + temporal patch D (32 wide, SN, hinge) + feature matching (adv 0.01, temporal 0.01, fm 0.1; D-only warm-up 200 steps), regression losses unchanged, chroma_proj on (no colour fringes). On s3d_v1 this weight gave crisper rims and a few lines but no filaments, and failed ms_dssim by ~10%. Question: with 3x the data, does the adversarial term produce visibly more plausible fine structure (pictures) at hr-like mid-band power, without speckle, colour fringes or boiling? Selection: amended rule (jerk <= 1.1, speckle and colour speckle <= 1.5x hr, l1 / ms_dssim <= 1.1x lr sanity bound; key |midband|). Kept as a separate named checkpoint, not promoted.",
- "init": "FINAL1",
+ "init": "C:/Users/ricej/AppData/Local/neural-vfx/runs/screen3d/final1_v2_reg_20261109_210028/model.pt",
  "adv": {
   "weight": 0.01,
   "temporal": 0.01,

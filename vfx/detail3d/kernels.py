@@ -22,6 +22,8 @@ class DetailShade:
     lac: float           # lacunarity (frequency factor between octaves)
     amp_eps: float       # below this per-cell amplitude the sample is left untouched (cost)
     rot: wp.mat33        # rotation applied to the rest coordinate between octaves
+    t_disp: float        # fraction of the displacement applied to temperature (1 = same point as density)
+    t_hot: float         # temperature (K) above which the temperature is re-read at the t_disp point
 
 
 # ---------------------------------------------------------------------- sampling (render side)
@@ -67,8 +69,13 @@ def detail_sample(vol: wp.Texture3D, q: wp.vec3, dc0: wp.Texture3D, dc1: wp.Text
     """(density, temperature) of the detailed field at q: both read at the displaced point (flames and
     smoke move together: tongues, no colour shift), density times the multiplicative factor."""
     w = detail_warp(q, dc0, dc1, noise, ds, dyn)
-    s = wp.texture_sample(vol, wp.vec3(w[0], w[1], w[2]), dtype=wp.vec2f)
-    return wp.vec2(s[0] * w[3], s[1])
+    qd = wp.vec3(w[0], w[1], w[2])
+    s = wp.texture_sample(vol, qd, dtype=wp.vec2f)
+    T = s[1]
+    if ds.t_disp < 1.0 and T > ds.t_hot:
+        # flames: gentler displacement of temperature along the same direction (coherent, no colour shift)
+        T = wp.texture_sample(vol, q + (qd - q) * ds.t_disp, dtype=wp.vec2f)[1]
+    return wp.vec2(s[0] * w[3], T)
 
 
 @wp.kernel
@@ -153,7 +160,7 @@ def advect_coords(data: wp.array4d(dtype=float), vc: int, old0: wp.Texture3D, ol
 
 @wp.kernel
 def energy_amp(data: wp.array4d(dtype=float), solid: wp.array3d(dtype=float), ci_d: int, ci_v: int, ci_t: int,
-               w_vort: float, w_heat: float, heat_damp: float, t_amb: float, d_lo: float, d_hi: float,
+               w_vort: float, w_heat: float, heat_damp: float, damp_nb: float, t_amb: float, d_lo: float, d_hi: float,
                out: wp.array3d(dtype=float)):
     """Raw per-cell detail amplitude, before smoothing:
        energy  = |curl u| * dx  (m/s: velocity difference across one cell = the resolved small-scale
@@ -200,7 +207,8 @@ def energy_amp(data: wp.array4d(dtype=float), solid: wp.array3d(dtype=float), ci
     a = 1.0 - wp.exp(-w_vort * e - w_heat * heat)
     t = wp.clamp((dmax - d_lo) / (d_hi - d_lo), 0.0, 1.0)
     pres = wp.max(t * t * (3.0 - 2.0 * t), wp.clamp(heat * 4.0, 0.0, 1.0))
-    core = wp.clamp((data[ci_t, z, y, x] - t_amb) / 1000.0, 0.0, 1.0)
+    own = wp.clamp((data[ci_t, z, y, x] - t_amb) / 1000.0, 0.0, 1.0)
+    core = own + (wp.clamp(hmax / 1000.0, 0.0, 1.0) - own) * damp_nb     # damp_nb 1: whole flame neighbourhood
     out[z, y, x] = a * pres * (1.0 - smax) * (1.0 - heat_damp * core)
 
 

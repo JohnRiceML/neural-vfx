@@ -63,7 +63,7 @@ def save_png(path, arr):
     write_png(path, arr)
 
 
-def run_scene(split, seed, steps, spec_steps, configs, out: Path, renderer, sampler="v1"):
+def run_scene(split, seed, steps, spec_steps, configs, out: Path, renderer, sampler="v1", hr_res=256):
     sc = sample_scenario(seed, split, sampler=sampler)
     res = {}
     renders, slices = {}, {}
@@ -74,7 +74,7 @@ def run_scene(split, seed, steps, spec_steps, configs, out: Path, renderer, samp
         tr, spec, spec_t = [], [], []
         t0 = time.perf_counter()
         vmax = None
-        for s, lr, hr, t in sim.run_pair(sc, cfg, steps=steps):
+        for s, lr, hr, t in sim.run_pair(sc, cfg, steps=steps, hr_res=hr_res):
             tr.append(t)
             if s >= steps - spec_steps:
                 spec.append(radial_power(hr.data[CH3["density"]]))
@@ -90,7 +90,7 @@ def run_scene(split, seed, steps, spec_steps, configs, out: Path, renderer, samp
                      "track_last": tr[-1].round(4).tolist(), "spec": spec.tolist(), "spec_t": spec_t.tolist(), "umax": round(umax, 3),
                      "finite": finite, "sec": round(dt, 1), "ms_per_step": round(1000 * dt / steps, 1)}
         dmax = float(lr.data[CH3["density"]].max()) + 1e-6
-        slices["lr"] = slice_img(torch.nn.functional.interpolate(lr.data[None, :1], scale_factor=4)[0, 0], dmax)
+        slices["lr"] = slice_img(torch.nn.functional.interpolate(lr.data[None, :1], scale_factor=hr_res // lr.data.shape[-1])[0, 0], dmax)
         slices[name] = slice_img(hr.data[CH3["density"]], dmax)
         renders["lr"] = renderer.draw(Volume(lr.data[0], lr.data[4]), cam, solid_r).cpu().numpy()
         renders[name] = renderer.draw(Volume(hr.data[0], hr.data[4]), cam, solid_r).cpu().numpy()
@@ -101,7 +101,7 @@ def run_scene(split, seed, steps, spec_steps, configs, out: Path, renderer, samp
             res[name]["spec_ratio"] = (np.asarray(res[name]["spec"]) / (base + 1e-12)).round(3).tolist()
             res[name]["spec_ratio_T"] = (np.asarray(res[name]["spec_t"]) / (base_t + 1e-12)).round(3).tolist()
         del res[name]["spec"], res[name]["spec_t"]
-    tag = f"{split}_{seed}_{sc.kind}"
+    tag = f"{split}_{seed}_{sc.kind}_hr{hr_res}"
     names = ["lr"] + list(configs)
     save_png(out / f"slices_{tag}.png", np.concatenate([slices[n] for n in names], 1))
     save_png(out / f"render_{tag}.png", np.concatenate([renders[n] for n in names], 1))
@@ -116,6 +116,7 @@ def main(argv=None):
     ap.add_argument("--configs", default="unguided,base,vel_only,weak,c8,c16,strong_s")
     ap.add_argument("--scenes", default=None, help="split:seed,...")
     ap.add_argument("--sampler", default="v1", help="scenario distribution: v1 | v2")
+    ap.add_argument("--hr-res", type=int, default=256, help="guided HR resolution (multiple of 64)")
     a = ap.parse_args(argv)
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -125,7 +126,7 @@ def main(argv=None):
     scenes = SCENES if a.scenes is None else [(x.split(":")[0], int(x.split(":")[1])) for x in a.scenes.split(",")]
     allres = {}
     for split, seed in scenes:
-        tag, tags, res = run_scene(split, seed, a.steps, a.spec_steps, configs, out, r, a.sampler)
+        tag, tags, res = run_scene(split, seed, a.steps, a.spec_steps, configs, out, r, a.sampler, a.hr_res)
         allres[tag] = {"tags": tags, **res}
         print(tag, tags)
         for n, v in res.items():

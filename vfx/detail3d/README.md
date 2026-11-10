@@ -53,17 +53,39 @@ dilated by one brick for detail draws (displaced samples can read smoke up to a 
   speckles. The 256³ reference's extra structure is mostly at 2–4 coarse cells (billows, curled sheet
   edges), so octave 0 now sits at 12 cycles/m with a large displacement (2.5 cm, ~1.6 cells).
 * Heat-driven amplitude (`w_heat`): shattered the flame core. Replaced by `heat_damp` (less there).
+* Flames (the weak spot): (1) the heat damping uses the 3³ max of the heat (`damp_nb`), so thin torch
+  flames are not split apart by their own edges; (2) temperature is re-read at 0.3x the displacement
+  (`t_disp`, same direction: flames and smoke stay coherent, hue untouched). Campfire spectrum error
+  vs 256³ 0.36 -> 0.26 decades, twin torches 0.13 -> 0.12, flicker 1.06x -> 0.92x the reference, and
+  the flame core stays whole. Earlier `t_disp` 0.5 alone was the first improvement. Tried and dropped: stretching the noise vertically in hot cells for tall tongues —
+  the heat-dependent scale of the absolute noise coordinate slides the pattern frame to frame
+  (flicker 1.27x the reference vs 1.12x) and did not look better.
+* "high" (4 octaves, up to the 256³ Nyquist) adds hair-like fibres; spectrum and flicker move slightly
+  AWAY from the 256³ reference (flicker 1.19x at gain 0.5, 1.14x at 0.45). Medium is the best match;
+  high is kept at gain 0.45 for close-ups. (Octaves 3-4 were silently zero until the noise coordinate
+  was wrapped explicitly at each tap: the texture unit returned 0 for coordinates of a few hundred tiles.)
+
+### Temporal behaviour (preset 1, 6 consecutive sim steps, eval3d metrics, effect-region weighted)
+| | flicker / hr | temporal jerk / hr | detail swim / hr |
+|---|---|---|---|
+| raw 64³ | 0.45 | 0.40 | – |
+| detail medium | 1.12 | 1.09 | 1.10 |
+| detail high | 1.19 (gain 0.5) / 1.14 (0.45) | 1.18 / 1.12 | 1.15 / 1.12 |
+All within the eval3d gate (≤ 1.2 x the 256³ reference): the detail changes from frame to frame about
+as much as real 256³ detail does, and the added layer moves with the content (swim ≈ 1.1).
 
 ## Parameters (`DetailParams`; defaults are the tuned values)
 | name | default | meaning |
 |---|---|---|
-| octaves | 2 (quality) | noise taps per coordinate set: low 1 / medium 2 / high 4 (centres 12-96 cycles/m, band edge 128 = 256³ Nyquist) |
+| octaves | 2 (quality) | noise taps per coordinate set: low 1 / medium 2 / high 4 (centres 12-96 cycles/m, band edge 128 = 256³ Nyquist; high uses disp_gain 0.45) |
 | freq0, lac | 12 cycles/m, 2 | centre frequency of octave 0 (64³ Nyquist = 32), lacunarity |
 | disp, disp_gain | 0.025 m, 0.5 | displacement at octave 0 (× amplitude), per-octave factor (0.5 ∝ wavelength) |
 | mult, mult_gain | 0, 0.7 | multiplicative density detail (off) |
 | period | 1.0 s | lifetime of a coordinate set (regeneration) |
 | w_vort | 12 | amplitude = 1 - exp(-w_vort · |curl u| dx) |
-| heat_damp | 0.85 | amplitude × (1 - heat_damp · (T - T_amb)/1000) |
+| heat_damp, damp_nb | 0.95, 1 | amplitude × (1 - heat_damp · heat/1000 K); heat = 3³ max (damp_nb 1) or the cell's own (0) |
+| t_disp, t_hot | 0.3, 700 K | flames: temperature read at t_disp × the displacement where T > t_hot |
+| light_octaves | 1 | octaves the light / shadow volume samples |
 | d_lo, d_hi | 0.004, 0.04 | density presence ramp (3³ max) |
 | smooth | 1 | box-blur passes on the amplitude |
 | max_disp | 0.3 m | cap on the advected displacement |
