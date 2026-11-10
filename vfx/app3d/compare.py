@@ -110,6 +110,7 @@ class Timer:
 
     def resolve(self) -> dict:
         last = {}
+        torch.cuda.synchronize()        # events must have completed before elapsed_time()
         for n, a, b in self.pending:
             ms = a.elapsed_time(b)
             last[n] = last.get(n, 0.0) + ms
