@@ -18,6 +18,7 @@ import torch
 
 from vfx.core.fields3d import SIM_DT, Camera, Forces3D, Impulse3D
 from vfx.app3d.backends import load_backends
+from vfx.app3d import pipeline as _pipeline
 from vfx.app3d.pipeline import LABELS, MODES, UNTRAINED, Pipeline
 from vfx.app3d.presets import DEFAULT_OBSTACLE, PRESETS, fire_emitter, puff_emitter
 from vfx.render3d import camera_basis
@@ -238,7 +239,7 @@ class App:
             det_tick = det_frame = 0.0
             det_lab = "detail  (none)"
         rn, rv = t.last(f"render.{slot}"), t.last(f"render_view.{slot}")
-        res = "128³" if mode == "ref128" else "64³"
+        res = f"{_pipeline.REF_RES}³" if mode == "ref128" else "64³"
         return {
             "rows": [("sim", f"sim {res}  @30Hz", f"{sim:5.2f}", 0.5 * sim, STAGE_BUDGET["sim"]),
                      ("detail", det_lab, f"{det_tick:5.2f}", det_frame, STAGE_BUDGET["detail"]),
@@ -518,11 +519,19 @@ def parse_args(argv=None):
     ap.add_argument("--demo-input", action="store_true", help="headless: scripted fire / push / puff input")
     ap.add_argument("--quit-after", type=float, default=0.0, help="windowed: exit after N seconds")
     ap.add_argument("--fps", type=int, default=60, help="windowed frame cap")
+    ap.add_argument("--ref-res", type=int, default=128,
+                    help="resolution of the direct-sim reference mode (128 default; 192 or 256 cost far more GPU time and VRAM)")
+    ap.add_argument("--window", default="1600x900", help="window size WxH")
     return ap.parse_args(argv)
 
 
 def main(argv=None):
     args = parse_args(argv)
+    global WIN_W, WIN_H
+    WIN_W, WIN_H = (int(v) for v in args.window.lower().split("x"))
+    _pipeline.REF_RES = args.ref_res
+    LABELS["ref128"] = f"reference: direct {args.ref_res}³ sim"
+    SHORT["ref128"] = f"ref {args.ref_res}³ sim"
     os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
     if args.headless:
         run_headless(args)
