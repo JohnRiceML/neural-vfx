@@ -171,3 +171,32 @@ Gate 2 interpretations made by this harness (for the lead; no threshold changed)
 6. **S4 "bounded as in Python" has no number.** The provisional bound is 1.5× Python's max|u|, plus Tmax ≤ max_temperature.
 7. **`NvfxSolverTimings.step_index`** has no stated base (0 or 1), and nothing says what `get_timings` returns before the first step completes.
    The harness accepts only `total_ms > 0` and `step_index > warm-up count`.
+
+## Gate 3a — native ray-marcher (`test_gate3a.py`, `gate3a_checks.py`, `nvfx_render_ctypes.py`, `../tools/gate3a_dither_probe.py`)
+**Status (2026-11-09): written, collected (77 tests), CPU-only unit tests pass (6). NOTHING on the GPU has run (GPU pause).**
+Black box: written from `render/nvfx_render.h`, `include/nvfx.h` and the API part of `render/README.md` only.
+Reference: `VolumeRenderer((1440, 2560), march_scale=0.5).draw(volume, cam, solid=state.solid, return_aux=True,
+velocity=state.velocity, prev_camera=prev)` on the Python `Solver3D` state after 150 steps; that state (data + solid)
+is uploaded to a native solver (`nvfx_solver_upload_state`, round-trip checked bit-exact: `PRE_upload_*`) and drawn natively.
+
+Cameras: `Camera()`; `Camera()` orbited 60° about the vertical axis through the domain centre; close-up = `bench.camera_at(d)`
+with the largest d in 1.3…0.6 whose Python alpha > 0.05 coverage is ≥ 1/3 (`PRE_closeup_coverage_*`).
+prev_camera = camera orbited −3° about the domain centre (moving camera). R4 also runs with prev_camera None (moving volume only).
+
+| test | what |
+|---|---|
+| `test_unit_*` | struct layouts; `NvfxRenderParams` field order = `RenderParams3D` (AST); `camera_at` = bench.py (executed from source); orbit/yaw geometry; R1–R4 comparators incl. threshold boundaries; PNG round-trip. No GPU, no DLL, no torch. |
+| `HC3_*`, `PRE_closeup_*` | Python only (CUDA, no DLL): Python vs Python must PASS; Python yawed 1° vs Python must FAIL R1; motion swapped / negated must FAIL R4 |
+| `N_api_defaults`, `N_march_size` | `nvfx_render_params_default` / `nvfx_camera_default` = Python defaults (f32); march buffer size = Python's |
+| `R1`–`R6` | per (scene, camera), thresholds quoted from native/README.md. R4 gates on the mean end-point error (stricter than the per-component mean, which is reported). R5: AUX off vs on colour bytes. R6: same draw again after two other draws, all 4 outputs bit-identical. |
+| `NC_R1_yaw1_*`, `NC_R4_{swapxy,negate}_*` | negative controls vs native; must FAIL |
+| `R1_dither_modes` | REPORT: R1 in a fresh process per `NVFX_RENDER_DITHER_MODE` (unset, 0, 1, 2) and which mode the default is byte-identical to. The gate R1 is the in-process default run (the test fails R1 if the env var is set). |
+| `T2_{full,view}` | ≥ 300 distinct `nvfx_renderer_get_timings` draws after 30 warm-up, aux on: (full) native solver stepped between draws, (view) `REUSE_VOLUME` with the camera orbiting 0.25°/frame; `flags` checked. Python `VolumeRenderer.timings` (`last_timings(sync=True)`) in the same session; nvidia-smi before/after. |
+
+R1's "no structured error visible" is not automated. The gate is the two numbers. Reported proxy: `struct_energy` = share of the
+signed error energy that survives 8×8 block averaging (≈ 0.016 for uncorrelated dither, ≈ 1 for smooth error), and the same
+vs the error with its pixels shuffled (`struct_ratio`). The images are flagged for the lead's visual review.
+Images: `native/build/test_results/gate3a_images/<scene>_<camera>_{python,native,diff_x8,nc_yaw1_diff_x8}.png` + `contact_sheet.png`
+(rows = cases; columns Python | native | diff ×8, ¼ size, diff max-pooled). Dither-probe inputs: `native/build/gate3a_cache/`.
+Run (its own pytest process: one nvfx.dll per process; DLL = env NVFX_DLL, else `native/build-render/bin/nvfx.dll`):
+`%PY% -m pytest native/tests/test_gate3a.py -q -s`. Output: `native/build/test_results/gate3a_native.json` / `.md`.
