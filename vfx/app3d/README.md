@@ -159,3 +159,30 @@ In `hires*` modes the sim row is the scalar_res solver's step. If sim3d lacked `
 `compare --detail` (off by default, so the default panels and contact sheet are unchanged) inserts
 `64³ + detail | detail + route B | hires 128³ + detail` between route B and the guided 256³ reference
 (the hires panel only if sim3d supports scalar_res); `--detail-quality`, `--no-route-b-detail`.
+
+## Particle modes, solver opt-ins, `--best` (2026-11-09; additive, defaults unchanged)
+| mode | what is rendered |
+|---|---|
+| `particles` — particles 128³ | `vfx.particles3d.DetailParticles(1_000_000, 128, config=<the 64³ runtime config>)`, stepped after `solver.step` with the same forces, `volume()` drawn by the renderer |
+| `particles_detail` — particles + advected detail | the particle volume drawn with `detail=` the 64³ AdvectedDetail (particles for dense billowing columns, advected noise for thin wisps) |
+| `raw_default` — raw 64³, default solver | a separate 64³ solver with the plain runtime config (no opt-ins), stepped only when visible: the honest baseline next to `--best` |
+
+Particles are created on first use, reset on preset change / reset and when the mode becomes visible
+again, and get the runtime config (incl. any opt-ins) whenever it changes. HUD detail row:
+"particles@30" (+ advected step for `particles_detail`) per tick, /2 per 60 Hz frame — quiet-card cost
+3.2 ms/tick (≈ 1.6 ms per 60 Hz frame), over the 2.5 ms/tick line; it is shown as measured.
+
+**Solver opt-ins** (default off; `P` / `--sim-fused`, `K` / `--sim-confref`): `fused` swaps the runtime
+config for `vfx.sim3d.fused_config(**preset)` (multigrid pressure, quiet card 0.48-0.62 vs 0.88-1.01
+ms/step for the default 4-iteration PCG); `confref` sets `confinement_ref_res=128` (resolution-consistent
+swirl: the 64³ plume rises like a finer sim). They apply to the 64³ sim and everything that rides on it
+(all modes except `ref128`, which keeps the full-quality config, and `raw_default`). The HUD shows them in
+the status column ("solver opt-ins: fused-p+conf@128"), in the sim row label and as a green sub-label on
+each affected view. `scalar_res=128` is the `hires` / `hires_detail` modes (separate solver instance).
+Switching `fused` on recaptures the solver's graph once (one hitch).
+
+**`--best`** = `--mode detail --detail-quality medium --sim-fused --sim-confref --side-by-side --mode2
+raw_default`: the current best guess (advected detail + resolution-consistent confinement + fused
+pressure) next to raw 64³ from the default solver. `--best-particles` uses `particles_detail` instead.
+`compare --particles` adds `particles 128³ 1M | particles + detail` panels before the reference (its 64³
+run comes from `vfx.datagen3d.sim.run_pair`, so the solver opt-ins do not apply there).

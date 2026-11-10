@@ -90,9 +90,30 @@ as much as real 256³ detail does, and the added layer moves with the content (s
 | smooth | 1 | box-blur passes on the amplitude |
 | max_disp | 0.3 m | cap on the advected displacement |
 
-## Measured costs
-See "Costs" below (filled from `python -m vfx.detail3d.bench --out vfx/detail3d/bench_latest.json`;
-the sandbox HUD reads that file for the march delta).
+## Measured costs (quiet card, run by the lead; `vfx/detail3d/bench_latest.json`)
+`python -m vfx.detail3d.bench --out vfx/detail3d/bench_latest.json` (the sandbox HUD reads this file).
+RTX 5080, GPU at 36 % / 2.2 GB before the run (idle apart from the desktop). Campfire, 64³ after 150
+steps, 2560x1440, 192 steps/m, CUDA events, min of interleaved batches. *new* = draw with a new volume
+(incl. the detailed light volume), *reuse* = camera-only redraw, *avg* = (new + reuse) / 2 per 60 Hz frame.
+
+`AdvectedDetail.step`: **0.09-0.12 ms per sim tick** at every quality (it does not depend on octaves).
+
+| march | detail | new ms | reuse ms | 60 Hz avg | added avg vs none |
+|---|---|---|---|---|---|
+| 0.5 | none | 0.83 | 0.64 | 0.74 | – |
+| 0.5 | low (1 oct) | 1.30 | 0.81 | 1.06 | +0.32 |
+| 0.5 | **medium (2)** | **1.35** | **0.85** | **1.10** | **+0.36** |
+| 0.5 | high (4) | 1.63 | 0.99 | 1.31 | +0.57 |
+| 0.25 | none | 0.80 | 0.59 | 0.69 | – |
+| 0.25 | low | 1.02 | 0.79 | 0.90 | +0.21 |
+| 0.25 | medium | 1.04 | 0.60 | 0.82 | +0.13 |
+| 0.25 | high | 1.68 | 0.61 | 1.14 | +0.45 |
+
+Detail stage = step/2 + added march ≈ **0.41 ms per 60 Hz frame** at medium (budget 2.5); render with
+detail 1.10 ms average (budget 1.5; the new-volume frame alone is 1.35, high's 1.63 is over on that frame).
+The new-volume increase is mostly the light volume marching detailed density (80³ voxels × ~100 steps).
+Earlier numbers on a contended GPU (73-99 % busy) were 0.07 ms step and +0.18..+0.63 ms; the test
+engineer's `test_cost_within_detail_budget_1440p` measured 2.14 ms under contention (skipped itself).
 
 ## Sources (research notes)
 `reports/Real time neural smoke techniques.md` (ranked shortlist #1, "Procedural upres is cheap,

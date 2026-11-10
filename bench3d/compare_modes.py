@@ -68,64 +68,85 @@ def _ckpt_dir():
     return CHECKPOINTS / "screen3d"
 
 
-def default_screen_ckpts(extra=()) -> list[tuple[str, Path, str]]:
-    """[(label, path, why)] route B checkpoints to compare."""
+def screen_ckpts(extra=()) -> list[tuple[str, Path, str, bool]]:
+    """[(label, path, why, report_only)] route B checkpoints to compare (lead's designation 2026-11-09)."""
     d = _ckpt_dir()
     out = []
-    for name, why in (("latest.pt", "current checkpoint"), ("v1_reg_backup.pt", "regression-trained backup"),
-                      ("adversarial.pt", "designated adversarial"), ("adv_latest.pt", "designated adversarial")):
+    for name, why, ro in (("final1_v2_reg_20261109_210028.pt", "route B regression (designated; s3d_v2)", False),
+                          ("v1_reg_backup.pt", "route B regression v1 (old, kept for history)", False),
+                          ("final2_v2_gan_20261109_212544.pt", "route B adversarial (designated)", False)):
         if (d / name).is_file():
-            out.append((name, d / name, why))
-    gans = sorted(d.glob("gan_*.pt"), key=lambda p: p.stat().st_mtime)
-    if gans:
-        out.append((gans[-1].name, gans[-1], "newest gan_*.pt (adversarial run; not designated by its owner)"))
+            out.append((name, d / name, why, ro))
+    for p in sorted(d.glob("teacher*.pt"), key=lambda p: p.stat().st_mtime):
+        if not p.name.startswith("teacher_probe"):
+            out.append((p.name, p, "teacher (REPORT-ONLY, not a budget candidate)", True))
     for p in extra:
         p = Path(p)
-        if p.is_file() and all(p != q for _, q, _ in out):
-            out.append((p.name, p, "--screen-ckpts"))
+        if p.is_file() and all(p != q for _, q, _, _ in out):
+            out.append((p.name, p, "--screen-ckpts", False))
     return out
 
 
 def discover(extra_ckpts=()) -> list[dict]:
-    """Every approach with availability and the reason when unavailable."""
+    """Every approach with availability and the reason when unavailable. Row spec keys:
+    sim: "lr" (the 64^3 runtime states the reference is steered to follow) | "hr" | {"res", "cfg", "extra",
+    "scalar_res"} (own sim); vol: "state" | "tri" | "hires" | "particles"; detail_q; post: None|"unsharp"|"routeB";
+    matched: whether the reference is a matched twin of this row's 64^3 flow."""
     rows = []
     sim, e_sim = _try(lambda: __import__("vfx.sim3d", fromlist=["_"]))
     rd, e_rd = _try(lambda: __import__("vfx.render3d", fromlist=["_"]))
     rt, e_rt = _try(lambda: __import__("vfx.runtime3d", fromlist=["_"]))
     rp, e_rp = _try(lambda: __import__("vfx.datagen3d.sim", fromlist=["run_pair"]).run_pair)
     det, e_det = _try(lambda: __import__("vfx.detail3d", fromlist=["AdvectedDetail"]).AdvectedDetail)
+    par, e_par = _try(lambda: __import__("vfx.particles3d", fromlist=["DetailParticles"]).DetailParticles)
     base_ok = sim is not None and rd is not None
     base_reason = e_sim or e_rd
 
-    def add(key, label, base, ok, reason, **kw):
-        rows.append({"key": key, "label": label, "base": base, "available": bool(ok), "reason": None if ok else reason, **kw})
+    def add(key, label, ok, reason, sim_="lr", vol="state", detail_q=None, post=None, **kw):
+        own = isinstance(sim_, dict)
+        rows.append({"key": key, "label": label, "available": bool(ok), "reason": None if ok else reason,
+                     "sim": sim_, "vol": vol, "detail_q": detail_q, "post": post,
+                     "base": "own" if own else ("hr" if sim_ == "hr" else "raw64"),
+                     "matched": not own or not (sim_.get("cfg") != "runtime" or sim_.get("extra")), **kw})
 
-    add("reference", "steered 256^3 (reference)", "hr", base_ok and rp is not None, base_reason or e_rp)
-    add("raw", "raw 64^3", "raw64", base_ok, base_reason)
-    add("trilinear", "trilinear 256^3", "raw64", base_ok and rt is not None, base_reason or e_rt)
-    add("unsharp", "unsharp mask (screen)", "raw64", base_ok, base_reason)
-    for label, path, why in default_screen_ckpts(extra_ckpts):
-        add(f"routeB:{path}", f"route B {label}", "raw64", base_ok and rt is not None and hasattr(rt, "ScreenDetail"),
-            base_reason or e_rt, checkpoint=str(path), checkpoint_note=why)
+    add("reference", "steered 256^3 (reference)", base_ok and rp is not None, base_reason or e_rp, sim_="hr")
+    add("raw", "raw 64^3", base_ok, base_reason)
+    add("trilinear", "trilinear 256^3", base_ok and rt is not None, base_reason or e_rt, vol="tri")
+    add("unsharp", "unsharp mask (screen)", base_ok, base_reason, post="unsharp")
+    for label, path, why, ro in screen_ckpts(extra_ckpts):
+        add(f"routeB:{path}", f"route B {label}" + (" [report-only]" if ro else ""),
+            base_ok and rt is not None and hasattr(rt, "ScreenDetail"), base_reason or e_rt, post="routeB",
+            checkpoint=str(path), checkpoint_note=why, report_only=ro)
     has_detail_kw = base_ok and "detail" in inspect.signature(rd.VolumeRenderer.draw).parameters
     det_ok = det is not None and has_detail_kw
     det_reason = e_det if det is None else ("VolumeRenderer.draw has no `detail` parameter yet" if not has_detail_kw else None)
-    add("advected", "AdvectedDetail", "raw64", base_ok and det_ok, base_reason or det_reason)
+    for q in ("medium", "low", "high"):
+        add(f"detail_{q}", f"detail (AdvectedDetail {q})", base_ok and det_ok, base_reason or det_reason, detail_q=q)
     scal_ok = base_ok and "scalar_res" in inspect.signature(sim.Solver3D.__init__).parameters \
         and hasattr(sim.Solver3D, "hires_volume")
-    add("scalar128", "Solver3D(scalar_res=128)", "own", scal_ok,
-        base_reason or "Solver3D(scalar_res=...) / hires_volume() not implemented yet")
-    fused_ok = base_ok and hasattr(sim.SolverConfig3D(), "pressure_mode")
-    add("fused", 'pressure_mode="fused"', "own", fused_ok,
-        base_reason or "SolverConfig3D.pressure_mode not implemented yet")
-    add("combo", "fused + scalar_res=128 + AdvectedDetail", "own", fused_ok and scal_ok and det_ok,
-        "needs fused, scalar_res and AdvectedDetail")
-    add("direct128", "direct 128^3 sim", "own", base_ok, base_reason)
+    fused_ok = base_ok and hasattr(sim, "fused_config")
+    conf_ok = base_ok and hasattr(sim.SolverConfig3D(), "confinement_ref_res")
+    for tag, cfg, extra, ok, why in (("", "runtime", {}, True, None),
+                                     ("_fused", "fused", {}, fused_ok, "vfx.sim3d.fused_config missing"),
+                                     ("_confref", "runtime", {"confinement_ref_res": 128}, conf_ok,
+                                      "SolverConfig3D.confinement_ref_res missing")):
+        spec = {"res": 64, "cfg": cfg, "extra": extra, "scalar_res": 128}
+        nm = {"": "", "_fused": " + fused_config()", "_confref": " + confinement_ref_res=128"}[tag]
+        add(f"hires{tag}", f"hires (scalar_res=128){nm}", scal_ok and ok, base_reason or why or
+            "Solver3D(scalar_res=...) missing", sim_=spec, vol="hires")
+        add(f"hires_detail{tag}", f"hires_detail (scalar_res=128 + detail medium){nm}", scal_ok and ok and det_ok,
+            base_reason or why or det_reason or "scalar_res missing", sim_=spec, vol="hires", detail_q="medium")
+    add("fused", "raw 64^3 + fused_config()", fused_ok, base_reason or "fused_config missing",
+        sim_={"res": 64, "cfg": "fused", "extra": {}, "scalar_res": None})
+    add("particles", "particles DetailParticles(1M, 128)", base_ok and par is not None, base_reason or e_par,
+        vol="particles")
+    add("particles_detail", "particles 1M@128 + detail medium", base_ok and par is not None and det_ok,
+        base_reason or e_par or det_reason, vol="particles", detail_q="medium")
+    add("direct128", "direct 128^3 sim", base_ok, base_reason, sim_={"res": 128, "cfg": "full", "extra": {}, "scalar_res": None})
     try:
         from vfx.app3d.pipeline import MODES
         known = {"raw", "trilinear", "neural_vol", "neural_screen", "ref128"}
-        new = [m for m in MODES if m not in known]
-        rows.append({"key": "_sandbox_modes", "sandbox_modes": list(MODES), "new_sandbox_modes": new})
+        rows.append({"key": "_sandbox_modes", "sandbox_modes": list(MODES), "new_sandbox_modes": [m for m in MODES if m not in known]})
     except Exception:  # noqa: BLE001
         pass
     return rows
@@ -136,17 +157,22 @@ def _overrides(pre) -> dict:
     return dict(pre.sim) if pre.sim else {}
 
 
+def _cfg(sim, kind: str, ov: dict, extra: dict):
+    from bench3d.run import make_config
+    fac = {"runtime": sim.runtime_config, "fused": getattr(sim, "fused_config", None), "full": sim.SolverConfig3D}[kind]
+    return make_config(fac, {**ov, **extra})
+
+
 class Runner:
     """One approach on one preset. own_sim=False: states come from `set_state` (quality pass shares the 64^3 run
-    the reference is steered to follow). Stage functions: step (sim), detail (pre-render volume work: upscale,
-    detail advection), render, post (screen-space work on the rendered frame). The frame is self.frame."""
+    the reference is steered to follow, or the reference itself). Stages: step (sim), detail (pre-render volume work:
+    upscale, detail advection, particles), render, post (screen-space work on the rendered frame)."""
 
     def __init__(self, row: dict, pre, size, march_scale: float, own_sim: bool, want_aux: bool = False):
         import torch
         from vfx.core.fields3d import rasterize_obstacles_3d
         from vfx.render3d import VolumeRenderer
         import vfx.sim3d as sim
-        from bench3d.run import make_config
 
         self.row, self.key, self.pre = row, row["key"], pre
         self.H, self.W = size
@@ -154,40 +180,35 @@ class Runner:
         self.solid = rasterize_obstacles_3d(pre.obstacles, SOLID_RES) if pre.obstacles else None
         self.want_aux = want_aux
         self.st = self.vol = self.frame = self.aux = None
-        self.solver = self.det = self.sd = None
+        self.solver = self.det = self.sd = self.dp = None
         self.prev_cam = None
+        self.forces = preset_forces(pre)
         ov = _overrides(pre)
-        rec = {"preset_overrides": ov, "solver_version": getattr(sim, "SOLVER3D_VERSION", None)}
-        k = self.key
-        if own_sim or k in ("scalar128", "fused", "combo", "direct128"):
-            kw = {}
-            if k == "direct128":
-                res, cfg = 128, make_config(sim.SolverConfig3D, ov)
-                rec["sim"] = "Solver3D(128, SolverConfig3D(**preset))  (full-quality config, as sandbox ref128)"
-            elif k == "reference":
-                res, cfg = 256, make_config(sim.SolverConfig3D, ov)
-                rec["sim"] = "Solver3D(256, SolverConfig3D(**preset)) UNGUIDED (cost proxy; guide cost not included)"
-            else:
-                res = 64
-                o = dict(ov)
-                if k in ("fused", "combo"):
-                    o["pressure_mode"] = "fused"
-                cfg = make_config(sim.runtime_config, o)
-                if k in ("scalar128", "combo"):
-                    kw["scalar_res"] = 128
-                rec["sim"] = f"Solver3D(64, runtime_config(**{o}){', scalar_res=128' if kw else ''})"
-            self.solver = sim.Solver3D(res, cfg, **kw)
+        rec = {"preset_overrides": ov, "solver_version": getattr(sim, "SOLVER3D_VERSION", None),
+               "solver_tag": _try(lambda: sim.solver_version_tag())[0] if hasattr(sim, "solver_version_tag") else None,
+               "matched_reference": row.get("matched", True)}
+        spec = row["sim"]
+        if isinstance(spec, dict) or own_sim:
+            if not isinstance(spec, dict):
+                spec = ({"res": 256, "cfg": "full", "extra": {}, "scalar_res": None} if spec == "hr"
+                        else {"res": 64, "cfg": "runtime", "extra": {}, "scalar_res": None})
+            cfg = _cfg(sim, spec["cfg"], ov, spec["extra"])
+            kw = {"scalar_res": spec["scalar_res"]} if spec.get("scalar_res") else {}
+            self.solver = sim.Solver3D(spec["res"], cfg, **kw)
             self.st = self.solver.reset(pre.obstacles)
-            rec["config"] = {f: getattr(cfg, f) for f in ("pressure_tol", "pressure_max_iters", "pressure_mode")
-                             if hasattr(cfg, f)}
+            rec["sim"] = (f"Solver3D({spec['res']}, {spec['cfg']}_config(**preset, **{spec['extra']})"
+                          f"{', scalar_res=%d' % spec['scalar_res'] if spec.get('scalar_res') else ''})"
+                          + (" UNGUIDED (cost proxy of the reference; guide excluded)" if row["sim"] == "hr" else ""))
+            rec["config"] = {f: getattr(cfg, f) for f in ("pressure_tol", "pressure_max_iters", "pressure_mode",
+                                                         "confinement_ref_res", "vorticity_eps") if hasattr(cfg, f)}
         else:
             rec["sim"] = ("vfx.datagen3d.sim.run_pair: guided Solver3D(256, SolverConfig3D(**preset)), DEFAULT_GUIDE"
-                          if k == "reference" else "vfx.datagen3d.sim.run_pair LR: Solver3D(64, runtime_config(**preset))")
-        if k == "unsharp":
+                          if spec == "hr" else "vfx.datagen3d.sim.run_pair LR: Solver3D(64, runtime_config(**preset))")
+        if row.get("post") == "unsharp":
             sh = _unsharp_params()
             self.us = (2.0 * sh["sigma"], sh["amount"])
             rec["unsharp"] = {"sigma_fullres": self.us[0], "amount": self.us[1], "source": sh["source"]}
-        if k.startswith("routeB:"):
+        if row.get("post") == "routeB":
             from vfx.runtime3d import ScreenDetail
             torch.manual_seed(0)
             self.sd = ScreenDetail(row["checkpoint"], device="cuda")
@@ -197,12 +218,17 @@ class Runner:
             rec["checkpoint"] = {"path": str(p), "mtime": time.strftime("%Y-%m-%d %H:%M", time.localtime(p.stat().st_mtime)),
                                  "note": row.get("checkpoint_note"), "process_scale": getattr(self.sd, "scale", None)}
             self.want_aux = True
-        if k in ("advected", "combo"):
+        if row.get("detail_q"):
             from vfx.detail3d import AdvectedDetail
-            self.det = AdvectedDetail(64, device="cuda")
+            self.det = AdvectedDetail(64, device="cuda", quality=row["detail_q"])
             self.det.reset()
-            rec["advected_detail"] = {"params": _jsonable(getattr(self.det, "params", None))}
-        if k == "trilinear":
+            rec["advected_detail"] = {"quality": row["detail_q"], "params": _jsonable(getattr(self.det, "params", None))}
+        if row["vol"] == "particles":
+            from vfx.particles3d import DetailParticles
+            self.dp = DetailParticles(1_000_000, 128, config=_cfg(sim, "runtime", ov, {}))
+            self.dp.reset()
+            rec["particles"] = "DetailParticles(1_000_000, 128, config=runtime_config(**preset)); defaults"
+        if row["vol"] == "tri":
             from vfx.runtime3d import classical_upscale_3d
             self._up = classical_upscale_3d
             rec["upscale"] = "runtime3d.classical_upscale_3d(state, 4, 'trilinear')"
@@ -217,15 +243,23 @@ class Runner:
         from vfx.core.fields3d import SIM_DT
         self.st = self.solver.step(self.st, forces, SIM_DT)
 
+    @property
+    def ticks(self) -> bool:
+        """Per-sim-step work that must run every step (detail coordinates, particles), even during warm-up."""
+        return self.det is not None or self.dp is not None
+
     def detail(self):
         from vfx.core.fields3d import SIM_DT, Volume
-        k = self.key
-        if k == "trilinear":
+        v = self.row["vol"]
+        if v == "tri":
             self.vol = self._up(self.st, 4, "trilinear")
             return
         if self.det is not None:
             self.det.step(self.st, SIM_DT)
-        if k in ("scalar128", "combo"):
+        if self.dp is not None:
+            self.dp.step(self.st, self.forces, SIM_DT)
+            self.vol = self.dp.volume()
+        elif v == "hires":
             self.vol = self.solver.hires_volume()
         else:
             self.vol = Volume(self.st.ch("density"), self.st.ch("temperature"))
@@ -254,7 +288,7 @@ class Runner:
                 a["transmittance"] = tr
             a["bbox"] = domain_bbox(cam, self.H, self.W)
             self.frame = self.sd.infer(self.frame, a)
-        elif self.key == "unsharp":
+        elif self.row.get("post") == "unsharp":
             from vfx.eval3d.metrics import unsharp
             self.frame = unsharp(self.frame, *self.us)
 
@@ -335,17 +369,16 @@ def quality_preset(pid: int, rows: list[dict], frames: int, warmup: int, size, m
                     rn.set_state(hr)
                 else:
                     rn.set_state(lr)
-                if rn.det is not None:
-                    rn.detail()                      # detail coordinates advect from step 0
+                if rn.ticks:
+                    rn.detail()                      # detail coordinates / particles advance from step 0
             if k < -10:
                 continue
             cam = cam_at(k)
             for key, rn in runners.items():
-                if rn.det is None:
+                if not rn.ticks:
                     rn.detail()
                 rn.render(cam)
-                if rn.sd is not None or key == "unsharp":
-                    rn.post(cam)
+                rn.post(cam)
             if k < 0:                                 # route B temporal state / camera history warm-up
                 continue
             a_raw = runners["raw"].aux["alpha"].float() if "raw" in runners else None
@@ -473,7 +506,8 @@ def cost_worker(key: str, presets: list[int], size, march_scale: float, warmup: 
     row = next((r for r in discover() if r.get("key") == key), None)
     if row is None and key.startswith("routeB:"):
         p = Path(key.split(":", 1)[1])
-        row = {"key": key, "label": f"route B {p.name}", "base": "raw64", "available": p.is_file(), "checkpoint": str(p)}
+        row = {"key": key, "label": f"route B {p.name}", "base": "raw64", "available": p.is_file(), "checkpoint": str(p),
+               "sim": "lr", "vol": "state", "detail_q": None, "post": "routeB"}
     if row is None or not row.get("available"):
         return {"key": key, "skipped": (row or {}).get("reason", "unknown approach")}
     torch.cuda.init()
@@ -493,7 +527,7 @@ def cost_worker(key: str, presets: list[int], size, march_scale: float, warmup: 
         with torch.no_grad():
             for i in range(n_warm):
                 rn.step(forces)
-                if rn.det is not None:
+                if rn.ticks:
                     rn.detail()
             for i in range(10):                                   # renderer / graph capture, camera history
                 cam = cam_at(i)
@@ -520,7 +554,7 @@ def cost_worker(key: str, presets: list[int], size, march_scale: float, warmup: 
         frame = [e[0].elapsed_time(e[3]) for e in evs]
         # render vs post split: time post alone on the last frame's input (screen-space work)
         post_ms = []
-        if rn.sd is not None or key == "unsharp":
+        if rn.sd is not None or rn.row.get("post") == "unsharp":
             for i in range(min(20, n_it)):
                 cam = cam_at(10 + n_it + i)
                 rn.render(cam)
@@ -537,7 +571,8 @@ def cost_worker(key: str, presets: list[int], size, march_scale: float, warmup: 
         peak_dev = max(peak_dev, (tot - f1) / 2 ** 20 - used0)
         res["presets"][pid] = {"sim": stats(sim), "detail": stats(detail), "render": stats(render),
                                "frame": stats(frame), "post_ms_median": post_med, "offline": offline,
-                               "detail_timings": _jsonable(dict(getattr(rn.det, "timings", {}) or {})) if rn.det else None}
+                               "detail_timings": _jsonable(dict(getattr(rn.det, "timings", {}) or {})) if rn.det else None,
+                               "particle_timings": _jsonable(dict(getattr(rn.dp, "timings", {}) or {})) if rn.dp else None}
         del rn
         torch.cuda.empty_cache()
     res["vram"] = {"torch_peak_allocated_mb": torch.cuda.max_memory_allocated() / 2 ** 20,
@@ -586,7 +621,8 @@ def summarize(rows, quality, cost, presets) -> list[dict]:
         if r["key"].startswith("_"):
             continue
         k = r["key"]
-        t = {"key": k, "label": r["label"], "available": r["available"], "reason": r.get("reason")}
+        t = {"key": k, "label": r["label"], "available": r["available"], "reason": r.get("reason"),
+             "matched": r.get("matched", True), "report_only": r.get("report_only", False)}
         if r["available"]:
             for c, _, _ in Q_COLS + T_COLS:
                 t[c] = _mean([quality.get(p, {}).get(k, {}).get(c) for p in presets])
@@ -643,13 +679,18 @@ def write_report(meta, rows, table, quality, cost, sheets, presets):
     for t in table:
         if not t["available"]:
             continue
-        cells = [f"**{t['label']}**" if t["key"] in ("reference", "raw") else t["label"]]
+        lab = t["label"] + ("" if t.get("matched", True) else " (unmatched: own 64^3 flow)")
+        cells = [f"**{lab}**" if t["key"] in ("reference", "raw") else lab]
         cells += [_f(t.get(c), nd) for c, _, nd in Q_COLS + T_COLS]
         cells += [_f(t.get(f"{s}_ms"), 2) for s in ("sim", "detail", "render", "frame")]
         cells += [_f(t.get("worst_frame_ms"), 1), _f(t.get("vram_mb"), 0)]
         if "within_budget" in t:
-            cells.append("offline" if t.get("offline") else ("yes" if t["within_budget"] else
-                                                             "over: " + ",".join(t["over_budget_stages"])))
+            verdict = "yes" if t["within_budget"] else "over: " + ",".join(t["over_budget_stages"])
+            if t.get("offline"):
+                verdict = "offline"
+            elif t.get("report_only"):
+                verdict = f"report-only ({verdict})"
+            cells.append(verdict)
         else:
             cells.append(t.get("cost_error", "-")[:40] if t.get("cost_error") else "-")
         L.append("| " + " | ".join(cells) + " |")

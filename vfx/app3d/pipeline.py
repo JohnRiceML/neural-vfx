@@ -17,7 +17,8 @@ from vfx.core.fields3d import CH3, LR_RES_3D, SIM_DT, Volume, rasterize_obstacle
 from vfx.render3d import VolumeRenderer, camera_basis
 
 MODES = ["raw", "trilinear", "neural_vol", "neural_screen", "ref128",
-         "detail", "detail_screen", "hires", "hires_detail"]          # sim-carried detail phase (additive)
+         "detail", "detail_screen", "hires", "hires_detail",          # sim-carried detail phase (additive)
+         "particles", "particles_detail", "raw_default"]
 LABELS = {
     "raw": "raw 64³",
     "trilinear": "classical trilinear ×4 (256³)",
@@ -28,8 +29,14 @@ LABELS = {
     "detail_screen": "64³ + advected detail + route B",
     "hires": "64³ velocity + 128³ density (hires)",
     "hires_detail": "hires 128³ density + advected detail",
+    "particles": "particles 1M → 128³ (vfx.particles3d)",
+    "particles_detail": "particles 128³ + advected detail",
+    "raw_default": "raw 64³, default solver (no opt-ins)",
 }
-DETAIL_MODES = {"detail", "detail_screen", "hires_detail"}
+DETAIL_MODES = {"detail", "detail_screen", "hires_detail", "particles_detail"}
+PARTICLE_MODES = {"particles", "particles_detail"}
+PARTICLE_COUNT, PARTICLE_RES = 1_000_000, 128     # particle engineer's recommended setting
+SIM_OPTIONS = ("fused", "confref")                # sandbox toggles for the solver's verified opt-ins
 HIRES_MODES = {"hires", "hires_detail"}
 SCREEN_MODES = {"neural_screen", "detail_screen"}
 HIRES_RES = 128
@@ -102,6 +109,11 @@ class Pipeline:
         self.hires_solver = None
         self.hires_state = None
         self.screen_detail2 = None        # second route B instance for detail_screen (own temporal state)
+        self.particles = None             # vfx.particles3d.DetailParticles (lazy)
+        self.particles_live = False
+        self.sim_opts = {k: False for k in SIM_OPTIONS}   # fused pressure / resolution-consistent confinement
+        self.base_solver = None           # raw_default: a 64^3 solver with NO opt-ins, for honest comparison
+        self.base_state = None
         self._check_detail_modes()
 
     def _check_detail_modes(self) -> None:
@@ -121,6 +133,57 @@ class Pipeline:
                 self.unavailable.setdefault(m, "sim3d has no Solver3D(scalar_res=...) / hires_volume() yet")
         if "neural_screen" in self.unavailable:
             self.unavailable.setdefault("detail_screen", self.unavailable["neural_screen"])
+        try:
+            import vfx.particles3d  # noqa: F401
+        except Exception as e:
+            for m in PARTICLE_MODES:
+                self.unavailable[m] = f"vfx.particles3d: {type(e).__name__}: {str(e)[:100]}"
+
+    # ------------------------------------------------------------------ solver opt-ins (default off)
+    def sim_option_available(self, name: str) -> str | None:
+        """None if the solver supports the option, else the reason."""
+        try:
+            import vfx.sim3d as S
+        except Exception as e:
+            return f"{type(e).__name__}"
+        if self.b.stubs:
+            return "stub solver"
+        if name == "fused":
+            return None if hasattr(S, "fused_config") else "sim3d has no fused_config()"
+        if name == "confref":
+            names = {f.name for f in dataclasses.fields(S.SolverConfig3D)}
+            return None if "confinement_ref_res" in names else "SolverConfig3D has no confinement_ref_res"
+        return "unknown option"
+
+    def set_sim_option(self, name: str, on: bool) -> bool:
+        if on and self.sim_option_available(name) is not None:
+            return False
+        self.sim_opts[name] = bool(on)
+        self.set_sim_config(self.sim_overrides)
+        return True
+
+    def sim_opts_label(self) -> str:
+        on = [{"fused": "fused-p", "confref": "conf@128"}[k] for k, v in self.sim_opts.items() if v]
+        return "+".join(on) if on else "default"
+
+    def runtime_cfg(self, overrides: dict | None = None):
+        """The 64^3 runtime config with the enabled opt-ins: fused pressure (vfx.sim3d.fused_config) instead
+        of the fixed 4-iteration PCG, and/or confinement_ref_res=128. Preset overrides on top."""
+        ov = dict(self.sim_overrides if overrides is None else overrides)
+        factory = self.b.runtime_config
+        if self.sim_opts.get("fused"):
+            from vfx.sim3d import fused_config
+            factory = fused_config
+        if self.sim_opts.get("confref"):
+            ov.setdefault("confinement_ref_res", 128)
+        return self._cfg(factory, ov)
+
+    def _ensure_particles(self):
+        if self.particles is None:
+            from vfx.particles3d import DetailParticles
+            self.particles = DetailParticles(PARTICLE_COUNT, PARTICLE_RES, device=str(self.device),
+                                             config=self.runtime_cfg())
+        return self.particles
 
     def detail(self, which: str = "lr"):
         d = self.details.get(which)
@@ -145,8 +208,8 @@ class Pipeline:
 
     def _ensure_hires(self) -> None:
         if self.hires_solver is None:
-            self.hires_solver = self.b.Solver(LR_RES_3D, self._cfg(self.b.runtime_config, self.sim_overrides),
-                                              device=str(self.device), scalar_res=HIRES_RES)
+            self.hires_solver = self.b.Solver(LR_RES_3D, self.runtime_cfg(), device=str(self.device),
+                                              scalar_res=HIRES_RES)
         if self.hires_state is None:
             self.hires_state = self.hires_solver.reset(self.obstacles)
             self.hires_state.data.copy_(self.state.data)
@@ -176,18 +239,24 @@ class Pipeline:
     def set_sim_config(self, overrides: dict) -> None:
         """Preset SolverConfig3D overrides (dissipation etc.) for the 64^3 sim AND the 128^3 reference."""
         self.sim_overrides = dict(overrides)
-        self._apply_config(self.solver, self._cfg(self.b.runtime_config, self.sim_overrides))
+        self._apply_config(self.solver, self.runtime_cfg())          # == runtime_config(**overrides) with no opt-ins
         if self.ref_solver is not None:
             self._apply_config(self.ref_solver, self._cfg(self.b.SolverConfig, self.sim_overrides))
         if self.hires_solver is not None:
-            self._apply_config(self.hires_solver, self._cfg(self.b.runtime_config, self.sim_overrides))
+            self._apply_config(self.hires_solver, self.runtime_cfg())
+        if self.base_solver is not None:
+            self._apply_config(self.base_solver, self._cfg(self.b.runtime_config, self.sim_overrides))
+        if self.particles is not None:
+            self.particles.cfg = self.runtime_cfg()       # same rates as the sim it rides on
 
     def reset(self, obstacles: list) -> None:
         self.obstacles = list(obstacles)
         self.state = self.solver.reset(self.obstacles)
         self.ref_state = None
         self.hires_state = None
+        self.base_state = None
         self.detail_live = {}
+        self.particles_live = False
         self.solid_render = rasterize_obstacles_3d(self.obstacles, SOLID_RENDER_RES, str(self.device)) \
             if self.obstacles else None
         self.vols.clear()
@@ -256,7 +325,7 @@ class Pipeline:
         if modes & {"detail", "detail_screen"} and self.available("detail"):
             self._step_detail("lr", st)
             self.vols["detail"] = self.vols["detail_screen"] = raw
-        else:
+        elif "particles_detail" not in modes:
             self.detail_live["lr"] = False
         if modes & HIRES_MODES and self.available("hires"):
             try:
@@ -275,6 +344,39 @@ class Pipeline:
         else:
             self.hires_state = None
             self.detail_live["hires"] = False
+        # --- particle study (vfx.particles3d), opt-in modes only
+        if modes & PARTICLE_MODES and self.available("particles"):
+            try:
+                dp = self._ensure_particles()
+                if not self.particles_live:
+                    dp.reset()                           # stale after a gap / preset change
+                t = self.timer.start("particles")
+                dp.step(st, forces, SIM_DT)              # after solver.step, same forces
+                self.timer.stop(t)
+                self.particles_live = True
+                self.vols["particles"] = self.vols["particles_detail"] = dp.volume()
+                if "particles_detail" in modes and not modes & {"detail", "detail_screen"}:
+                    self._step_detail("lr", st)          # (else already stepped above this tick)          # advected detail rides on the 64^3 velocity
+            except Exception as e:
+                for m in PARTICLE_MODES:
+                    self.unavailable[m] = f"{type(e).__name__}: {str(e)[:120]}"
+        else:
+            self.particles_live = False
+        # --- raw_default: the 64^3 sim WITHOUT the sandbox's solver opt-ins (honest baseline next to "best")
+        if "raw_default" in modes:
+            if self.base_solver is None:
+                self.base_solver = self.b.Solver(LR_RES_3D, self._cfg(self.b.runtime_config, self.sim_overrides),
+                                                 device=str(self.device))
+            if self.base_state is None:
+                self.base_state = self.base_solver.reset(self.obstacles)
+                self.base_state.data.copy_(st.data)
+            t = self.timer.start("sim_base")
+            self.base_state = self.base_solver.step(self.base_state, forces, SIM_DT)
+            self.timer.stop(t)
+            self.vols["raw_default"] = Volume(self.base_state.data[CH3["density"]],
+                                              self.base_state.data[CH3["temperature"]])
+        else:
+            self.base_state = None
 
     # ------------------------------------------------------------------ 60 Hz render
     def renderer(self, size, slot: int = 0) -> VolumeRenderer:

@@ -31,6 +31,9 @@ trilinear upscale, `ScreenDetail` returns the input frame (the last conv is zero
   (1.39 median), whole 1440p frame 2.95 ms; in `vfx.app3d.compare` (domain bbox at orbit distance 1.9, larger crop,
   guided 256³ sim on the same GPU) 2.2–2.3 ms median.
   Pass the raw bbox: ScreenDetail buckets it itself (callers need no size bucketing).
+  Candidates from the 2026-11-09 adversarial / s3d_v2 work (not promoted; train3d EXPERIMENTS.md): same 64×8 net with
+  `chroma_proj` (no new hues) measured on an idle GPU, 1/3-screen bbox at 1440p: 1.39 ms median (v1 1.32 ms). The optional
+  stride-2 `mid_width` 32 × 2 path costs ~+0.4 ms (1.79 ms p10, shared GPU); the 2.1M stride-2 teacher 6.6 ms (over budget).
 - `bench_selfcheck.py` — `.venv/Scripts/python -m vfx.runtime3d.bench_selfcheck [--quick] [--only ...]`.
   Runs correctness checks, then regenerates every table below. Writes `bench_results.json` (small) and prints markdown.
   About 5 min. `--only check,floor,recommended` takes about 30 s.

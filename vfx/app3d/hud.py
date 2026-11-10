@@ -14,6 +14,7 @@ HELP = [
     "N  main mode   B  right mode   V  side-by-side",
     "1-4 presets  O obstacle  R reset  T march scale",
     "Q detail quality   J temporal march",
+    "P fused pressure   K conf@128 (solver)",
     "Space pause  C auto-orbit  H hud  Esc quit",
 ]
 STAGE_COLORS = {"sim": (110, 170, 255), "detail": (150, 220, 150), "render": (255, 200, 110)}

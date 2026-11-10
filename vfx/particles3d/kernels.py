@@ -24,6 +24,20 @@ C_F = 5
 
 MAX_EMITTERS = 32
 EM_STRIDE = 12      # pos xyz, radius, density_rate, temperature, fuel_rate, k_begin, k_end, smoke m, fuel m, 0
+EM_SIZE = MAX_EMITTERS * EM_STRIDE
+
+# per-tick values the kernels read from a device array (`dyn`), so one captured CUDA graph serves every tick
+D_HEAD = 0          # ring slot of the first particle seeded this tick
+D_RSEED = 1         # seed RNG stream for this tick
+D_MEPS = 2          # cull threshold (smoke + fuel mass)
+D_NEM = 3           # number of emitters
+D_PHASE = 4         # sub-grid noise: lerp weight between keyframes A and B
+D_KA = 5            # channel base (0, 3 or 6) of keyframe A / B / the one being built
+D_KB = 6
+D_KC = 7
+D_Z0 = 8            # first z slab of keyframe C built this tick
+D_TC = 9            # noise time of keyframe C (s)
+DYN_SIZE = 16
 
 
 @wp.struct
@@ -48,7 +62,6 @@ class SimParams:
     sg_rms: float        # measured rms of the raw curl-noise sum (normalisation)
     sg_tfreq: float      # noise time evolution (1/s)
     sg_max: float        # cap on |u_sg| (m/s)
-    time: float
     seed: int
     rk3: int
     vres: int            # resolution of the per-tick velocity grid
@@ -121,12 +134,39 @@ def trace(vel: wp.array4d(dtype=float), p: wp.vec3, dt: float, sp: SimParams) ->
 
 
 @wp.kernel
-def vel_field(data: wp.array4d(dtype=float), wmag: wp.array3d(dtype=float), sp: SimParams,
-              out: wp.array4d(dtype=float)):
-    """Velocity the particles follow this tick, on a vres^3 grid: trilinear coarse velocity + sub-grid curl noise
-    u_sg = sg_amp * |curl u|_coarse * dx * curlnoise(4D: x * freq, t * tfreq) / rms   (capped at sg_max).
-    Evaluating the noise once per grid cell (not per particle and RK stage) keeps the cost independent of the
-    particle count."""
+def noise_build(noise: wp.array4d(dtype=float), dyn: wp.array(dtype=float), sp: SimParams, use_dyn: int,
+                z0_arg: int, base_arg: int, t_arg: float):
+    """Unit curl-noise keyframe N(x, t) = curlnoise(4D: x * freq, t * tfreq) / rms on the vres^3 grid, channels
+    base..base+2 of `noise`, z slab [z0, z0 + launch depth). use_dyn = 1: z0, base and t come from dyn (the
+    captured per-tick path builds 1/sg_every of the next-but-one keyframe per tick, so the cost is spread evenly)."""
+    k, y, x = wp.tid()
+    z0 = z0_arg
+    base = base_arg
+    t = t_arg
+    if use_dyn != 0:
+        z0 = int(dyn[D_Z0])
+        base = int(dyn[D_KC])
+        t = dyn[D_TC]
+    z = z0 + k
+    if z >= sp.vres:
+        return
+    h = 1.0 / float(sp.vres)
+    p = wp.vec3((float(x) + 0.5) * h, (float(y) + 0.5) * h, (float(z) + 0.5) * h)
+    q = wp.vec4(p[0] * sp.sg_freq, p[1] * sp.sg_freq, p[2] * sp.sg_freq, t * sp.sg_tfreq)
+    v = wp.curlnoise(wp.rand_init(sp.seed), q, wp.uint32(sp.sg_oct), sp.sg_lac, sp.sg_gain) / sp.sg_rms
+    noise[base + 0, z, y, x] = v[0]
+    noise[base + 1, z, y, x] = v[1]
+    noise[base + 2, z, y, x] = v[2]
+
+
+@wp.kernel
+def vel_field(data: wp.array4d(dtype=float), wmag: wp.array3d(dtype=float), noise: wp.array4d(dtype=float),
+              dyn: wp.array(dtype=float), sp: SimParams, out: wp.array4d(dtype=float)):
+    """Velocity the particles follow this tick, on a vres^3 grid: trilinear coarse velocity + sub-grid velocity
+    u_sg = sg_amp * |curl u|_coarse * dx * N(x, t)   (capped at sg_max), N = the unit curl noise, linearly
+    interpolated in time between two keyframes (A, B) built ahead of time by noise_build. With sg_every = 1 the
+    phase is 0 and A is the noise at this tick's time: identical to evaluating the noise here. The grid makes the
+    noise cost independent of the particle count; the keyframes make it independent of the tick."""
     z, y, x = wp.tid()
     h = 1.0 / float(sp.vres)
     p = wp.vec3((float(x) + 0.5) * h, (float(y) + 0.5) * h, (float(z) + 0.5) * h)
@@ -135,10 +175,14 @@ def vel_field(data: wp.array4d(dtype=float), wmag: wp.array3d(dtype=float), sp: 
                 sample_ch(data, C_VZ, p, inv, sp.res))
     if sp.sg_amp > 0.0:
         w = sample3(wmag, p, inv, sp.res)
-        a = sp.sg_amp * w * sp.dx / sp.sg_rms
-        if a > 1.0e-5:
-            q = wp.vec4(p[0] * sp.sg_freq, p[1] * sp.sg_freq, p[2] * sp.sg_freq, sp.time * sp.sg_tfreq)
-            v = wp.curlnoise(wp.rand_init(sp.seed), q, wp.uint32(sp.sg_oct), sp.sg_lac, sp.sg_gain) * a
+        a = sp.sg_amp * w * sp.dx
+        if a > 1.0e-5 * sp.sg_rms:
+            ka = int(dyn[D_KA])
+            kb = int(dyn[D_KB])
+            ph = dyn[D_PHASE]
+            v = wp.vec3(wp.lerp(noise[ka + 0, z, y, x], noise[kb + 0, z, y, x], ph),
+                        wp.lerp(noise[ka + 1, z, y, x], noise[kb + 1, z, y, x], ph),
+                        wp.lerp(noise[ka + 2, z, y, x], noise[kb + 2, z, y, x], ph)) * a
             m = wp.length(v)
             if m > sp.sg_max:
                 v = v * (sp.sg_max / m)
@@ -232,15 +276,19 @@ def vort_mag(data: wp.array4d(dtype=float), res: int, inv2dx: float, out: wp.arr
 
 
 @wp.kernel
-def update(pos: wp.array(dtype=wp.vec3), q: wp.array(dtype=wp.vec4), n: int, head: int, k_new: int,
+def update(pos: wp.array(dtype=wp.vec3), q: wp.array(dtype=wp.vec4), n: int, k_new: int,
            vel: wp.array4d(dtype=float), solid: wp.array3d(dtype=float),
-           em: wp.array(dtype=float), n_em: int, sp: SimParams, m_eps: float,
+           em: wp.array(dtype=float), dyn: wp.array(dtype=float), sp: SimParams,
            inv_fdx: float, nf: int,
            dep_m: wp.array3d(dtype=float), dep_h: wp.array3d(dtype=float), dep_n: wp.array3d(dtype=float),
            splat_on: int):
-    """Advance every live particle (except the ring slots being re-seeded this tick): advect (RK2/RK3 of
-    coarse + sub-grid velocity), keep out of solids, cull out-of-box / faded, run the source ODE, deposit."""
+    """Advance every live particle (except the k_new ring slots being re-seeded this tick): advect (RK2/RK3 of
+    coarse + sub-grid velocity), keep out of solids, cull out-of-box / faded, run the source ODE, deposit.
+    Per-tick values (ring head, cull threshold, emitter count) come from dyn."""
     i = wp.tid()
+    head = int(dyn[D_HEAD])
+    n_em = int(dyn[D_NEM])
+    m_eps = dyn[D_MEPS]
     if (i - head + n) % n < k_new:
         return
     qi = q[i]
@@ -265,23 +313,28 @@ def update(pos: wp.array(dtype=wp.vec3), q: wp.array(dtype=wp.vec4), n: int, hea
 
 
 @wp.kernel
-def seed(pos: wp.array(dtype=wp.vec3), q: wp.array(dtype=wp.vec4), n: int, head: int, k_new: int,
+def seed(pos: wp.array(dtype=wp.vec3), q: wp.array(dtype=wp.vec4), n: int,
          data: wp.array4d(dtype=float), vel: wp.array4d(dtype=float), solid: wp.array3d(dtype=float),
-         em: wp.array(dtype=float), n_em: int, sp: SimParams, rseed: int,
+         em: wp.array(dtype=float), dyn: wp.array(dtype=float), sp: SimParams,
          inv_fdx: float, nf: int,
          dep_m: wp.array3d(dtype=float), dep_h: wp.array3d(dtype=float), dep_n: wp.array3d(dtype=float),
          splat_on: int):
-    """Seed k_new particles into ring slots head..head+k_new. Emitter e owns thread range [k_begin, k_end)
-    (host-computed in proportion to the smoke it will inject, density + smoke_from_fuel * fuel). Positions
-    are drawn with pdf ~ the emitter falloff (1-r^2/R^2)^2 (rejection), so equal-mass particles reproduce the
-    injected density profile. Each particle is then advanced by a random fraction of dt (no seeding bands)."""
+    """Recycle the k_new (= launch size) oldest ring slots head..head+k_new: thread j seeds a particle for the
+    emitter whose range [k_begin, k_end) contains j (host-computed in proportion to the smoke it will inject,
+    density + smoke_from_fuel * fuel), or clears the slot. Positions are drawn with pdf ~ the emitter falloff
+    (1-r^2/R^2)^2 (rejection), so equal-mass particles reproduce the injected density profile. Each particle is
+    then advanced by a random fraction of dt (no seeding bands)."""
     j = wp.tid()
+    head = int(dyn[D_HEAD])
+    n_em = int(dyn[D_NEM])
+    rseed = int(dyn[D_RSEED])
     e = int(-1)
     for i in range(n_em):
         b = i * EM_STRIDE
         if j >= int(em[b + 8]) and j < int(em[b + 9]):
             e = i
     if e < 0:
+        q[(head + j) % n] = wp.vec4(0.0, 0.0, 0.0, 0.0)
         return
     b = e * EM_STRIDE
     c = wp.vec3(em[b + 0], em[b + 1], em[b + 2])

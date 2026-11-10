@@ -32,7 +32,9 @@ STAGE_BUDGET = {"sim": 2.0, "detail": 2.5, "render": 1.5}     # spec, per 60 Hz 
 MARCH_SCALES = [1.0, 0.5, 0.25]
 SHORT = {"raw": "raw 64³", "trilinear": "trilinear 256³", "neural_vol": "neural vol (A)",
          "neural_screen": "neural screen (B)", "ref128": "ref 128³ sim",
-         "detail": "64³ + detail", "detail_screen": "detail + B", "hires": "hires 128³", "hires_detail": "hires + detail"}
+         "detail": "64³ + detail", "detail_screen": "detail + B", "hires": "hires 128³", "hires_detail": "hires + detail",
+         "particles": "particles 128³", "particles_detail": "particles + detail", "raw_default": "raw 64³ (default sim)"}
+DETAILED = ("detail", "detail_screen", "hires_detail", "particles_detail")     # render row includes detail sampling
 DETAIL_QUALITIES = ["low", "medium", "high"]
 DETAIL_BENCH_JSON = Path(__file__).resolve().parents[1] / "detail3d" / "bench_latest.json"
 
@@ -148,6 +150,10 @@ class App:
         self.pipe = Pipeline(self.b, march_scale=args.march_scale, steps=args.steps)
         self.pipe.set_detail_quality(args.detail_quality)
         self.pipe.set_temporal(args.temporal)
+        for name in ("fused", "confref"):
+            if getattr(args, f"sim_{name}"):
+                if not self.pipe.set_sim_option(name, True):
+                    print(f"solver option {name}: unavailable ({self.pipe.sim_option_available(name)})")
         self.detail_delta = detail_march_delta()
         self.ctl = Controls()
         self.orbit = Orbit()
@@ -181,6 +187,9 @@ class App:
     def cycle(self, which: str):
         cur = getattr(self, which)
         setattr(self, which, MODES[(MODES.index(cur) + 1) % len(MODES)])
+
+    def toggle_sim_option(self, name):
+        self.pipe.set_sim_option(name, not self.pipe.sim_opts[name])
 
     def cycle_detail_quality(self):
         q = self.pipe.detail_quality
@@ -248,7 +257,7 @@ class App:
         sim / volume upscale / volume prep run every other frame, screen-space detail every frame)."""
         t = self.pipe.timer
         sim = t.last("sim_ref") if mode == "ref128" else t.last("sim_hires") if mode in ("hires", "hires_detail") \
-            else t.last("sim")
+            else t.last("sim_base") if mode == "raw_default" else t.last("sim")
         if mode == "trilinear":
             det_tick, det_frame, det_lab = t.last("upscale"), 0.5 * t.last("upscale"), "detail  upscale@30"
         elif mode == "neural_vol":
@@ -256,6 +265,14 @@ class App:
         elif mode == "neural_screen":
             d = t.last(f"detail.{slot}")
             det_tick, det_frame, det_lab = d, d, "detail  net @60Hz"
+        elif mode in ("particles", "particles_detail"):
+            # 1M particles advected + deposited to 128³ every tick (amortized /2 per 60 Hz frame); shown honestly
+            # against the detail budget line even when it is over it (quiet-card: 3.2 ms/tick)
+            pt = t.last("particles")
+            det_tick, det_frame, det_lab = pt, 0.5 * pt, "detail  particles@30"
+            if mode == "particles_detail":
+                st_ = t.last("detail_step.lr")
+                det_tick, det_frame, det_lab = pt + st_, 0.5 * (pt + st_), "detail  part+adv@30"
         elif mode in ("detail", "detail_screen", "hires_detail"):
             # advected-detail step per tick (amortized /2); its march sampling is inside the render row
             st_ = t.last("detail_step.hires" if mode == "hires_detail" else "detail_step.lr")
@@ -269,10 +286,12 @@ class App:
             det_lab = "detail  (none)"
         rn, rv = t.last(f"render.{slot}"), t.last(f"render_view.{slot}")
         res = f"{_pipeline.REF_RES}³" if mode == "ref128" else "64³+128³ρ" if mode in ("hires", "hires_detail") else "64³"
+        if mode not in ("ref128", "raw_default") and self.pipe.sim_opts_label() != "default":
+            res += " " + self.pipe.sim_opts_label()
         return {
             "rows": [("sim", f"sim {res}  @30Hz", f"{sim:5.2f}", 0.5 * sim, STAGE_BUDGET["sim"]),
                      ("detail", det_lab, f"{det_tick:5.2f}", det_frame, STAGE_BUDGET["detail"]),
-                     ("render", "render+det new|reuse" if mode in ("detail", "detail_screen", "hires_detail")
+                     ("render", "render+det new|reuse" if mode in DETAILED
                       else "render  new|reuse", f"{rn:4.2f}|{rv:4.2f}", 0.5 * (rn + rv), STAGE_BUDGET["render"])],
             "tick_ms": {"sim": sim, "detail": det_tick, "render": rn},
             "tick_total": sim + det_tick + rn,
@@ -293,7 +312,7 @@ class App:
         if ref and self.mode != "ref128" and b["tick_total"] > 0:
             extra.append((f"direct 256³ sim {ref:4.1f} ms/step (bench3d {scene}) = "
                           f"{ref / b['tick_total']:4.1f}x this tick", (190, 200, 255)))
-        if self.mode in ("detail", "detail_screen", "hires_detail"):
+        if self.mode in DETAILED:
             q = self.pipe.detail_quality
             dd = self.detail_delta.get(q)
             extra.append((f"detail {q} (Q): in render row; 1440p bench "
@@ -318,6 +337,8 @@ class App:
             (f"preset {self.preset_id}: {self.preset.name}" + ("  [PAUSED]" if self.paused else ""), W),
             (f"fps {fps:5.1f}   1% low {low:5.1f}", G if low >= 50 else R),
             (f"march {rr}" + ("  TEMPORAL" if self.pipe.temporal else ""), DIM_TXT),
+            (f"solver opt-ins: {self.pipe.sim_opts_label()}  (P fused, K conf@128)",
+             (150, 220, 150) if self.pipe.sim_opts_label() != "default" else DIM_TXT),
             (f"VRAM torch peak {peak:4.0f} MB  dev {(total - free) / 2**20:5.0f}", W),
             (f"sim step {self.pipe.sim_steps}  fires {len(self.ctl.fires)}" + ("  TORCH" if self.ctl.torch_on else ""), W),
             (f"dissipation {self.pipe.sim_overrides.get('density_dissipation', '-')}/s  "
@@ -341,6 +362,9 @@ class App:
                           sub_color=(140, 220, 140))
             elif mode in UNTRAINED:
                 hud.label(surf, name, (x + 12, y + 12), sub="UNTRAINED - timing only, not a result")
+            elif mode not in ("ref128", "raw_default") and self.pipe.sim_opts_label() != "default":
+                hud.label(surf, name, (x + 12, y + 12), sub=f"solver opt-ins: {self.pipe.sim_opts_label()}",
+                          sub_color=(140, 220, 140))
             else:
                 hud.label(surf, name, (x + 12, y + 12))
         if not self.hud_on:
@@ -372,7 +396,8 @@ class App:
             "frame_ms": {"mean": float(ft.mean()), "p99": float(np.percentile(ft, 99))},
             "gpu_ms": {k: agg(k) for k in ("sim", "sim_ref", "upscale", "neural_vol", "detail.0", "render.0",
                                            "render_view.0", "detail.1", "render.1", "render_view.1",
-                                           "detail_step.lr", "detail_step.hires", "sim_hires")},
+                                           "detail_step.lr", "detail_step.hires", "sim_hires", "particles", "sim_base")},
+            "sim_opts": dict(self.pipe.sim_opts),
             "detail_quality": self.pipe.detail_quality, "temporal": self.pipe.temporal,
             "budget_main_view": {k: self.stage_ms(self.mode, 0)[k] for k in ("tick_total", "frame_ms")},
             "sim_config": self.pipe.sim_overrides,
@@ -482,6 +507,10 @@ def run_window(args):
                     app.cycle_detail_quality()
                 elif k == pygame.K_j:
                     app.pipe.set_temporal(not app.pipe.temporal)
+                elif k == pygame.K_p:
+                    app.toggle_sim_option("fused")
+                elif k == pygame.K_k:
+                    app.toggle_sim_option("confref")
                 elif k == pygame.K_o:
                     app.toggle_obstacle()
                 elif k == pygame.K_r:
@@ -563,6 +592,15 @@ def parse_args(argv=None):
     ap.add_argument("--ref-res", type=int, default=128,
                     help="resolution of the direct-sim reference mode (128 default; 192 or 256 cost far more GPU time and VRAM)")
     ap.add_argument("--window", default="1600x900", help="window size WxH")
+    ap.add_argument("--sim-fused", action="store_true",
+                    help="solver opt-in: fused multigrid pressure (vfx.sim3d.fused_config) instead of 4-iteration PCG; P toggles")
+    ap.add_argument("--sim-confref", action="store_true",
+                    help="solver opt-in: confinement_ref_res=128 (resolution-consistent swirl); K toggles")
+    ap.add_argument("--best", action="store_true",
+                    help="what the evidence favours so far: advected detail (medium) + conf@128 + fused pressure, "
+                         "side by side with raw 64³ from the default solver (raw_default); --best-particles uses "
+                         "particles_detail instead of detail")
+    ap.add_argument("--best-particles", action="store_true")
     ap.add_argument("--temporal", action="store_true",
                     help="temporally amortized ray-march (jittered starts + camera-reprojected history); J toggles")
     ap.add_argument("--detail-quality", default="medium", choices=DETAIL_QUALITIES,
@@ -570,8 +608,19 @@ def parse_args(argv=None):
     return ap.parse_args(argv)
 
 
+def apply_best(args) -> None:
+    """--best: one launch for the current state of the art next to the honest baseline."""
+    if args.best or args.best_particles:
+        args.mode = "particles_detail" if args.best_particles else "detail"
+        args.mode2 = "raw_default"
+        args.side_by_side = True
+        args.sim_fused = args.sim_confref = True
+        args.detail_quality = "medium"
+
+
 def main(argv=None):
     args = parse_args(argv)
+    apply_best(args)
     global WIN_W, WIN_H
     WIN_W, WIN_H = (int(v) for v in args.window.lower().split("x"))
     _pipeline.REF_RES = args.ref_res

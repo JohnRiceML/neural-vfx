@@ -17,6 +17,10 @@ reference moves to the right and these panels are inserted before it:
   5. detail + route B      ScreenDetail (own instance, own temporal state) on panel 4's render + its aux
   6. hires + detail        Solver3D(64, scalar_res=128).hires_volume() + its own AdvectedDetail; only if
                            vfx.sim3d supports it (else skipped with a note)
+With --particles (off by default) two more panels go before the reference:
+  particles 128³ 1M        vfx.particles3d.DetailParticles(1M, 128, config = the 64³ run's config), stepped
+                           after every 64³ step with the same forces (warm-up included), its volume() rendered
+  particles + detail       the same particle volume drawn with its own AdvectedDetail (64³ velocity)
 One frame = one sim step (SIM_DT). Writes frame_XXXX.png (labelled strip, per-panel GPU ms),
 contact_sheet.png (up to 8 frames x panels) and timings.json. ms are CUDA-event GPU times of the panel's
 own work (render [+ upscale or + detail]); the guided 256³ sim cost is reported but is an offline reference.
@@ -127,6 +131,47 @@ class Timer:
         return last
 
 
+class ParticlePanels:
+    """--particles: the particle study as panels (vfx.particles3d; its README for the method)."""
+
+    def __init__(self, a, pre, backends, W, H):
+        from vfx.detail3d import AdvectedDetail
+        from vfx.particles3d import DetailParticles
+        from vfx.render3d import VolumeRenderer
+        cfg = backends.runtime_config(**pre.sim) if pre.sim else backends.runtime_config()   # == run_pair's LR config
+        self.dp = DetailParticles(1_000_000, 128, config=cfg)
+        self.det = AdvectedDetail(64, quality=a.detail_quality)
+        self.rend = {k: VolumeRenderer((H, W), march_scale=a.march_scale) for k in ("p", "pd")}
+        self.names = ["particles 128³ 1M", f"particles + detail ({a.detail_quality})"]
+        self.pre = pre
+        self.imgs = {}
+
+    def _forces(self):
+        from vfx.core.fields3d import Forces3D
+        return Forces3D(emitters=list(self.pre.emitters), wind=tuple(self.pre.wind))
+
+    def warm(self, lr):
+        self.dp.step(lr, self._forces(), SIM_DT)
+        self.det.step(lr, SIM_DT)
+
+    def tick(self, tm, lr, cam, solid):
+        tm.run("particles step", lambda: self.dp.step(lr, self._forces(), SIM_DT))
+        tm.run("particles detail step", lambda: self.det.step(lr, SIM_DT))
+        v = self.dp.volume()
+        self.imgs["p"] = tm.run("particles render", lambda: self.rend["p"].draw(v, cam, solid)).clone()
+        self.imgs["pd"] = tm.run("particles+detail render",
+                                 lambda: self.rend["pd"].draw(v, cam, solid, detail=self.det)).clone()
+
+    def panels(self, ms):
+        ps = ms.get("particles step", 0)
+        return ([self.imgs.get("p"), self.imgs.get("pd")],
+                [ps + ms.get("particles render", 0),
+                 ps + ms.get("particles detail step", 0) + ms.get("particles+detail render", 0)],
+                [f"particles {ps:.2f} + render {ms.get('particles render', 0):.2f} ms",
+                 f"particles {ps:.2f} + detail {ms.get('particles detail step', 0):.2f} + render "
+                 f"{ms.get('particles+detail render', 0):.2f}"])
+
+
 class DetailPanels:
     """--detail: advected-detail panels (sim-carried detail phase). Stepped every sim step (warm-up
     included) so the detail coordinates are as old as in the sandbox."""
@@ -232,6 +277,7 @@ def main(argv=None):
     ap.add_argument("--detail", action="store_true", help="add the advected-detail panels (see module doc)")
     ap.add_argument("--detail-quality", default="medium", choices=["low", "medium", "high"])
     ap.add_argument("--no-route-b-detail", action="store_true", help="with --detail: skip the detail + route B panel")
+    ap.add_argument("--particles", action="store_true", help="add the particle-study panels (see module doc)")
     a = ap.parse_args(argv)
 
     os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
@@ -264,6 +310,10 @@ def main(argv=None):
     if a.detail:
         dx = DetailPanels(a, pre, b, W, H, rb_label)
         names = names[:3] + dx.names + names[3:]
+    px = None
+    if a.particles:
+        px = ParticlePanels(a, pre, b, W, H)
+        names = names[:-1] + px.names + names[-1:]
     sheet_frames: list = []
     prev_cam = None
     has_hr = False
@@ -273,6 +323,8 @@ def main(argv=None):
         if k < 0:
             if dx is not None:
                 dx.warm(lr)
+            if px is not None:
+                px.warm(lr)
             continue
         cam = orbit_cam(a.start_deg + a.orbit_deg * k, a.dist)
         save = k % a.every == 0 or k in pick
@@ -287,6 +339,8 @@ def main(argv=None):
         img_rb = tm.run("route B detail", lambda: sd.infer(img_raw, aux))
         if dx is not None:
             dx.tick(tm, lr, cam, prev_cam, solid, step)
+        if px is not None:
+            px.tick(tm, lr, cam, solid)
         prev_cam = cam
         if not save:
             tm.resolve()
@@ -311,6 +365,11 @@ def main(argv=None):
             panels = panels[:3] + p_ + panels[3:]
             pms = pms[:3] + m_ + pms[3:]
             subs = subs[:3] + s_ + subs[3:]
+        if px is not None:
+            p_, m_, s_ = px.panels(ms)
+            panels = panels[:-1] + p_ + panels[-1:]
+            pms = pms[:-1] + m_ + pms[-1:]
+            subs = subs[:-1] + s_ + subs[-1:]
         n = len(names) if has_hr else len(names) - 1
         strip = pygame.Surface((n * W, H))
         for i in range(n):
@@ -346,6 +405,8 @@ def main(argv=None):
             "route_b": ck_name or "untrained", "hr": hr_note, "stubs": b.stubs, "ms": summary}
     if dx is not None:
         meta["detail"] = {"quality": a.detail_quality, "panels": dx.names, "notes": dx.notes}
+    if px is not None:
+        meta["particles"] = {"count": 1_000_000, "out_res": 128, "panels": px.names}
     (out / "timings.json").write_text(json.dumps(meta, indent=2))
     from vfx.render3d.bench import gpu_note
     meta["gpu"] = gpu_note()

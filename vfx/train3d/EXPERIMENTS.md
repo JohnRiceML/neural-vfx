@@ -235,4 +235,37 @@ detail gate); key = |mid-band log ratio| (closest to hr's 5-25 px power). Pictur
 - config: `vfx/train3d/configs/hiB_final1_ft.json`  dataset: `s3d_hi`  init: `C:/Users/ricej/AppData/Local/neural-vfx/checkpoints/screen3d/final1_v2_reg_20261109_210028.pt`
 - hypothesis: Lead item B (15 min): fine-tune the budget final 1 (the teacher was not worth it, item A) on s3d_hi train (48 scenarios x 2 cameras; hr = guided 320^3 instead of 256^3; same seeds as a v2 subset, lr inputs NOT identical to v2's for the same scene - up to ~10 codes mean difference, re-simulated), same regression objective, original rule 1 on 6 held-out hi scenarios. Question: does a sharper target give a visibly or measurably better result, or more hallucination / instability (flicker, swim, speckle)? Compared with final 1 on s3d_hi test (320^3 reference) and on s3d_v2 test.
 - result: {"steps": 14411, "selected_step": 5600, "selection_failed": false, "minutes": 15.0, "params": 731315, "test": {"model": {"l1": 0.03745, "spectrum_error": 0.13219, "ms_dssim": 0.17646, "flicker_ratio": 0.55612, "jerk_ratio": 0.49203, "swim_ratio_moving": 0.36582}, "lr": {"l1": 0.03814, "spectrum_error": 0.35449, "ms_dssim": 0.17693, "flicker_ratio": 0.4449, "jerk_ratio": 0.40644, "swim_ratio_moving": 0.0}, "sharpen": {"l1": 0.03887, "spectrum_error": 0.3073, "ms_dssim": 0.18253, "flicker_ratio": 0.54802, "jerk_ratio": 0.49474, "swim_ratio_moving": 0.12063}}, "ood": {}, "beats_both_baselines_test": true, "val_last": {"step": 14400, "hold": {"l1": 0.033366349008348256, "spectrum_error": 0.11347489331562735, "ms_dssim": 0.14950555894109938, "speckle": 4.708333333333333, "midband": -0.08330931075001305, "chroma_speckle": 2.5, "jerk_ratio": 0.5001841389420255, "l1_rel": 0.9911905441825806, "spectrum_error_rel": 0.48232015436415, "ms_dssim_rel": 1.006646531432265, "speckle_rel_hr": 0.8582278481012658, "chroma_speckle_rel_hr": 0.7072691552062869, "elapsed_min": 14.971, "ok": false}}, "selected_hold": {"l1": 0.03311940096318722, "spectrum_error": 0.11152607986371994, "ms_dssim": 0.1480349606937832, "speckle": 4.857638888888889, "midband": -0.05468002164311925, "chroma_speckle": 2.576388888888889, "jerk_ratio": 0.492866505825772, "l1_rel": 0.9838546331661624, "spectrum_error_rel": 0.4740368065901498, "ms_dssim_rel": 0.9967447415906283, "speckle_rel_hr": 0.8854430379746837, "chroma_speckle_rel_hr": 0.7288801571709234, "elapsed_min": 4.956, "ok": true}}
-- decision: (to be filled in by the ML engineer)
+- decision: LEAD ITEM B - VERDICT: a sharper target gives a SMALL MEASURABLE gain against its own reference and NO visible change; no extra instability. Selected step 5600 (hold spectrum 0.112 vs 0.121 at init; l1 0.984x vs 0.966x, ms_dssim 0.997x vs 0.971x lr). s3d_hi test (60 seqs, 320^3 reference), final 1 -> this model: spectrum 0.154 -> 0.132, band 0.145 -> 0.123, grad_hist 0.206 -> 0.196, patch_swd 0.197 -> 0.187, tlp 0.485 -> 0.474; l1 0.0372 -> 0.0375, ms_dssim 0.1737 -> 0.1765; flicker 0.53 -> 0.56, jerk 0.48 -> 0.49, swim 0.33 -> 0.37 (gates 1.2); no speckle or colour growth. PICTURES (s3d_hi test strips, lr | final 1 | this | 320^3 hr): indistinguishable from final 1. Note: the 320^3 build (not 384^3) has lr inputs that differ from v2's for the same scene (re-simulated, mean |d| up to ~10 codes), so the comparison is per dataset, not frame-identical. Not the lever for this model / objective.
+
+## SUMMARY of the adversarial / data / teacher / hi-res work (2026-11-09 ~23:00)
+- Nothing promoted (lead's instruction until the corrected eval metrics are agreed). latest.pt = v1 (= v1_reg_backup.pt).
+  Candidates kept: final1_v2_reg_20261109_210028.pt (regression, clean), final2_v2_gan_20261109_212544.pt (adversarial).
+- s3d_v2 test, through the runtime (scratchpad eval_final.py; band / grad / swd / tlp = vfx.eval3d fair_detail_scores):
+
+  | method | l1 | spectrum | ms_dssim | band | grad_hist | patch_swd | tLP | flicker | jerk | swim(mov) |
+  |---|---|---|---|---|---|---|---|---|---|---|
+  | lr | 0.0372 | 0.294 | 0.1662 | 0.310 | 0.202 | 0.225 | 0.513 | 0.49 | 0.45 | 0 |
+  | unsharp | 0.0376 | 0.255 | 0.1702 | 0.259 | 0.169 | 0.192 | 0.467 | 0.56 | 0.51 | 0.08 |
+  | v1 (latest.pt) | 0.0364 | 0.164 | 0.1633 | 0.182 | 0.191 | 0.194 | 0.460 | 0.57 | 0.50 | 0.36 |
+  | final 1 | 0.0362 | 0.114 | 0.1634 | 0.113 | 0.179 | 0.174 | 0.438 | 0.60 | 0.54 | 0.36 |
+  | final 2 (GAN) | 0.0384 | 0.118 | 0.1828 | 0.113 | 0.130 | 0.122 | 0.320 | 0.76 | 0.69 | 0.57 |
+  | teacher (2.1M) | 0.0365 | 0.129 | 0.1649 | 0.140 | 0.186 | 0.174 | 0.445 | 0.57 | 0.53 | 0.29 |
+
+  ood: final 1 l1 0.0255 / ms 0.1123 / grad 0.175 (lr 0.0257 / 0.1098 / 0.192; v1 0.0284 / 0.1212 / 0.265); final 2
+  0.0288 / 0.1324 / 0.122. Large-fire close-ups (ood, 19 seqs): v1 grad 0.442 (badly broken), final 1 0.165, final 2 0.137.
+- Runtime (1440p, 1/3-screen bbox, idle GPU, median): v1 1.32 ms, final 1 / 2 1.39-1.40 ms (chroma_proj +0.07), teacher 6.6.
+- Pictures: final 1 = crisper edges, no purple dots, faint horizontal streaks inherited from the raw render; final 2 = more
+  texture at a distance but at 1:1 a cellular blob pattern with yellow / blue rims, orange cracks on obstacles; neither has
+  the reference's thin filaments. No boiling in 3 consecutive 1440p frames for either.
+- Levers: not capacity (teacher, teacher+GAN), not target resolution (s3d_hi). Data helped the regression model a lot (v1 ->
+  final 1, especially ood / large fires). The filament detail is not predictable from one blurred frame; the remaining
+  options are temporal / sim-carried detail (detail that lives in the volume and is advected, CLAUDE.md "sim-carried detail
+  phase") or a much larger adversarial data regime with stronger anti-artifact constraints.
+- Gate tests (`pytest tests3d/test_screen_layer4.py tests3d/test_runtime3d.py`, VFX_SCREEN_CKPT=candidate, dataset s3d_v1,
+  test file as updated by the test engineer with the shift-tolerant DETAIL_GATE_METRICS):
+  final 1: 36 / 37 - fails `grad_hist` vs unsharp (0.1884 vs 0.1846; beats lr 0.2113); first live run failed the budget at
+  3.27 ms with the GPU flagged shared (96% busy), re-run `-k live` passes (1.93-2.23 ms). Rule 2(c) therefore NOT met.
+  final 2: 37 / 37 (spectrum_error_bl 0.119, band 0.098, grad_hist 0.143, patch_swd 0.124, tlp 0.293 vs unsharp 0.342 /
+  0.250 / 0.185 / 0.201 / 0.460; OOD ratios 0.83-1.10; live 2.00-2.20 ms, GPU shared). It was not feasible under the original
+  rule 1 (l1 / ms_dssim > lr) and its 1:1 pictures show cellular blob texture with coloured rims and orange cracks on
+  obstacles, which the visual veto (rule 3) rejects. Outcome: no promotion (also the lead's instruction).
