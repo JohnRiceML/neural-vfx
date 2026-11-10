@@ -3,8 +3,19 @@
 This is a port of `vfx/render3d` `VolumeRenderer` (the look pass and the route B aux buffers) to C++20 and HLSL compute
 shaders inside `nvfx.dll`. It reads the native solver's state textures directly on the GPU.
 
-> **Status (2026-11-09): written and compiled, NOT RUN.** A GPU pause was in effect, so nothing here has created a
-> D3D12 device yet: no pipeline creation, no draw, no parity number, no timing. See "Not yet run" below.
+> **Status (2026-11-09, second session):** the renderer creates, draws and downloads on the RTX 5080.
+> `nvfx_render_selfcheck` passes:
+> - determinism;
+> - aux on/off colour bit-identical;
+> - REUSE_VOLUME == full draw;
+> - hosted `record_draw` == `draw`;
+>
+> on campfire and plume + sphere, 3 cameras each. Python parity (`compare.py`) and timings are **not run yet**:
+> the card was at 15.5 GB from other processes, so the run was stopped.
+>
+> First bring-up bug: on this NVIDIA driver, any `log2`, and therefore any `pow`, compiled with dxc
+> `-denorm preserve` makes `CreateComputePipelineState` return E_OUTOFMEMORY. That hit `march_*` and `composite_*`.
+> The fix is that the renderer's shaders are compiled without that flag.
 
 ## Files
 - `nvfx_render.h`: the proposed C API, for the lead to merge into `include/nvfx.h`.

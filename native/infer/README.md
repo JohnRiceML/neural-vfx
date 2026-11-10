@@ -78,7 +78,13 @@ driver's float->half conversion. UNORM->float input is re-quantized with `round(
 Everything is created in `nvfx_detail_create`: 36 compiled graphs at 1440p (~1.1-2.4 s total), each with its own small
 persistent resource (weights in DML's layout); **one temporary resource shared by all buckets** (only one bucket runs at
 a time on the queue) and one set of network buffers sized for the largest bucket. A bbox change only selects another
-pre-built graph: no compile, no allocation, no hitch. Descriptors for the caller's textures are written per frame into an
+pre-built graph: no compile, no allocation, no hitch. Create also records and executes every bucket's graph once:
+DirectML does 0.2-2.6 ms of lazy CPU work inside the FIRST `RecordDispatch` of each compiled graph (found by the
+independent Gate 2 suite, D4; attributed with `NVFX_DETAIL_TRACE=1`, which prints the per-call CPU split
+slot_wait / prepare / begin / record to stderr). After the warm-up, first use of each of the 36 buckets costs
+0.18 ms median / 0.38 ms max of CPU vs 0.09 / 0.16 ms for the second call (`nvfx_detail_bench --mode firstuse`).
+`nvfx_detail_run` blocks only when 8 of its frames are still in flight (back-pressure, a GPU wait by design): a caller
+submitting hundreds of frames back to back on a GPU slowed by another process will see ~10 ms waits. Descriptors for the caller's textures are written per frame into an
 8-slot ring; timings use timestamp queries in the frame's own list, resolved to a readback ring with a
 `WriteBufferImmediate` marker, read without blocking (also for host-recorded frames, which the runner cannot fence).
 
@@ -182,8 +188,10 @@ re-run is the lead's.
 
 Anomaly, unresolved: the hosted-record row "third" in round 1 measured median 162 ms / min 53 ms, while the same
 config gave p10 0.719 in round 2 and every neighbouring row (same process, same bucket via `run`) was normal; the
-GPU was at 99 % with a training job. Most likely contention (long non-preemptible foreign work), but a re-run on a
-quieter GPU is **owed** before that row is trusted.
+GPU was at 99 % with a training job. It was GPU-side, not a block in the API: `nvfx_detail_record` has
+no fence wait, no allocator acquire and no `ExecuteCommandLists` (CPU per call in that same round: median 0.28 ms),
+and a later 100-frame check (GPU 99 % busy) gave network median 0.626 / p10 0.624 ms. An idle-GPU timing re-run is
+still owed.
 
 Summary (p10, GPU ms): **1/3 screen 0.72 native vs 1.29 PyTorch; full frame 1.25 native vs 3.20 PyTorch**.
 The 2.5 ms budget is met at the 1/3 bbox by 3.5x, and the whole 1440p frame fits too. Peak VRAM: native 269 MB
@@ -266,7 +274,7 @@ and nothing is transitioned by the runner.
 ## Measurements still owed (GPU paused by the lead mid-session)
 - `pytest native/tests` (Gate 1) after the infer build changes: started, then stopped unfinished when the lead paused
   GPU work. My changes add sources/targets only (nothing in core/ or sim/ changed), but the run is owed.
-- Re-run of the hosted-record "third" row (round-1 anomaly above) and an idle-GPU timing run (`detail_bench.py time`).
+- An idle-GPU timing run (`detail_bench.py time`).
 
 ## Contract notes for the lead
 - `vfx/runtime3d/README.md` "How route B works" still describes the old net (1x1 HR head, previous output warped);

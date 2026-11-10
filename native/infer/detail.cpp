@@ -397,6 +397,7 @@ struct NvfxDetail {
     float scale = 0.5f;
     int flags = 0;
     bool use_ort = false, ort_held = false;
+    bool trace = GetEnvironmentVariableA("NVFX_DETAIL_TRACE", nullptr, 0) > 0;   // per-call CPU split on stderr (diagnostics)
     std::vector<int> hs, ws;
     std::vector<Bucket> buckets;     // hs.size() * ws.size(), row-major in (h index, w index)
     std::vector<char> model;         // ONNX bytes
@@ -683,7 +684,19 @@ bool NvfxDetail::init_dml_all() {
         if (b.persist.res) b.bt->BindPersistentResource(&pd);
         b.ready = true;
     }
-    return true;
+    // Warm-up: record + execute every bucket's graph once now. DirectML does ~0.2-2.6 ms of CPU work inside the
+    // FIRST IDMLCommandRecorder::RecordDispatch of each compiled graph (measured with NVFX_DETAIL_TRACE: the spike is
+    // in the record step, with no GPU wait); doing it here keeps it out of the first frame that uses a bucket.
+    // The network buffers are zero-initialised committed resources, so the dispatches read defined data.
+    l = ctx->begin();
+    if (!l) return false;
+    ID3D12DescriptorHeap* hp = heap.Get();
+    l->SetDescriptorHeaps(1, &hp);
+    for (auto& b : buckets) {
+        recorder->RecordDispatch(l, b.op.Get(), b.bt.Get());
+        uav_barrier(l);   // the temporary resource is shared between buckets
+    }
+    return ctx->submit() && ctx->wait_idle();
 }
 
 // ------------------------------------------------------------------ ORT backend: one session per bucket
@@ -1045,13 +1058,22 @@ NVFX_API NvfxResult nvfx_detail_run(NvfxDetail* d, const NvfxDetailFrame* f) {
     NvfxContext* ctx = d->ctx;
     int si = int(d->frame % kFrames);
     if (d->slots[si].fence && !ctx->wait(d->slots[si].fence)) return NVFX_ERR_DEVICE;   // only with kFrames in flight
+    auto t1 = std::chrono::steady_clock::now();
     Bucket* b = nullptr;
     Consts c;
     if (!d->prepare(f, si, b, c)) return NVFX_ERR_DEVICE;
-    ID3D12GraphicsCommandList2* l = ctx->begin();
+    auto t2 = std::chrono::steady_clock::now();
+    ID3D12GraphicsCommandList2* l = ctx->begin();   // waits only if the context's 16-allocator ring is full
     if (!l) return NVFX_ERR_DEVICE;
+    auto t3 = std::chrono::steady_clock::now();
     if (!d->use_ort) {
         d->record(l, si, *b, c);
+        if (d->trace) {
+            auto ms = [](auto a, auto z) { return std::chrono::duration<double, std::milli>(z - a).count(); };
+            auto t4 = std::chrono::steady_clock::now();
+            fprintf(stderr, "nvfx_detail trace: frame %llu crop %dx%d slot_wait %.3f prepare %.3f begin %.3f record %.3f ms\n",
+                    static_cast<unsigned long long>(d->frame + 1), b->cw, b->ch, ms(t0, t1), ms(t1, t2), ms(t2, t3), ms(t3, t4));
+        }
     } else {
         // pre list -> ORT (its own command lists, same queue) -> post list
         UINT q0 = UINT(si * 4);

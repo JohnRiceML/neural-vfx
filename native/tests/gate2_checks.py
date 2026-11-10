@@ -35,6 +35,7 @@ ONE_THIRD_WH = (1536, 832)
 ONE_THIRD_CROP = (1600, 960)
 D3_N, D3_SAMPLE, D3_CPU_MS, D3_SEED = 200, 10, 10.0, 0
 D4_RETURN_MS, D4_QUEUED_MS, D4_TRIALS = 1.0, 20.0, 5
+D4_MAX_STEPS, D4_MAX_ATTEMPTS = 2000, 4     # bounds on the queued solver load (precondition only, not a threshold)
 T3_BUDGET_MS, T3_N, T3_WARM = 2.5, 300, 30
 NC_SHIFT_PX = 64
 
@@ -445,35 +446,54 @@ def check_d4(nd, inp) -> dict:
         q.submit(8)
         nd.wait_idle()
         per_step = (time.perf_counter() - t0) * 1e3 / 8
-        n = int(min(2000, max(10, math.ceil(2.0 * (D4_QUEUED_MS + T3_BUDGET_MS) / max(per_step, 1e-3)))))
-        trials = []
+        # Target >= 2x the requirement (incl. the detail run's own budget). The per-step cost drifts with load on a
+        # shared card, so each call's queued-ahead work is measured after the fact; a call that fell short is re-run
+        # with the step count rescaled from what was actually observed (bounded), and n carries forward.
+        target = 2.0 * (D4_QUEUED_MS + T3_BUDGET_MS)
+        n = int(min(D4_MAX_STEPS, max(10, math.ceil(target / max(per_step, 1e-3)))))
+        n_first = n
+        trials, attempts = [], []
         for k in range(D4_TRIALS):
             for label, bbox in (("one_third_1536x832", one_third_bbox(inp)), ("full_frame_none", None)):
-                nd.wait_idle()
-                ts = time.perf_counter()
-                q.submit(n)
-                t0 = time.perf_counter()
-                ms = nd.run(inset, out, bbox)
-                t1 = time.perf_counter()
-                nd.wait_idle()
-                t2 = time.perf_counter()
-                t = nd.timings()
-                det = t["total"] if t is not None and t["frame_index"] == nd.n_runs else float("nan")
-                backlog = (t2 - t1) * 1e3
-                queued_ahead = backlog - (det if math.isfinite(det) else T3_BUDGET_MS)
-                trials.append(dict(trial=k, label=label, steps_queued=n, submit_ms=(t0 - ts) * 1e3, run_return_ms=ms,
-                                   backlog_after_return_ms=backlog, detail_gpu_ms=det,
-                                   queued_ahead_ms=queued_ahead, valid=queued_ahead >= D4_QUEUED_MS))
+                for a in range(D4_MAX_ATTEMPTS):
+                    nd.wait_idle()
+                    ts = time.perf_counter()
+                    q.submit(n)
+                    t0 = time.perf_counter()
+                    ms = nd.run(inset, out, bbox)
+                    t1 = time.perf_counter()
+                    nd.wait_idle()
+                    t2 = time.perf_counter()
+                    t = nd.timings()
+                    det = t["total"] if t is not None and t["frame_index"] == nd.n_runs else float("nan")
+                    backlog = (t2 - t1) * 1e3
+                    queued_ahead = backlog - (det if math.isfinite(det) else T3_BUDGET_MS)
+                    row = dict(trial=k, label=label, attempt=a, steps_queued=n, submit_ms=(t0 - ts) * 1e3,
+                               run_return_ms=ms, backlog_after_return_ms=backlog, detail_gpu_ms=det,
+                               queued_ahead_ms=queued_ahead, valid=queued_ahead >= D4_QUEUED_MS)
+                    attempts.append(row)
+                    if queued_ahead < target:   # re-aim the next call from the observed queue depth
+                        # at most 2x per re-aim: an oversized queue can fill the driver's launch queue and block
+                        n = int(min(D4_MAX_STEPS, 2 * n, max(n + 1, math.ceil(n * target / max(queued_ahead, 1.0)))))
+                    if row["valid"]:
+                        break
+                trials.append(row)
     finally:
         q.close()
     valid = all(t["valid"] for t in trials)
-    mx = max(t["run_return_ms"] for t in trials)
+    mx = max(t["run_return_ms"] for t in attempts)      # every call counts toward the < 1 ms bound
     ok = valid and mx < D4_RETURN_MS
+    retries = len(attempts) - len(trials)
     summ = (f"D4: nvfx_detail_run returned in max {mx:.3f} ms (median "
-            f"{float(np.median([t['run_return_ms'] for t in trials])):.3f}) over {len(trials)} calls with "
-            f">= {min(t['queued_ahead_ms'] for t in trials):.1f} ms of GPU work still queued ahead "
-            f"({n} solver steps of ~{per_step:.2f} ms each){'' if valid else '; PRECONDITION NOT MET (< 20 ms queued)'}")
-    return {"pass": bool(ok), "summary": summ, "per_step_ms": per_step, "trials": trials, "precondition_met": valid}
+            f"{float(np.median([t['run_return_ms'] for t in attempts])):.3f}) over {len(attempts)} calls; "
+            f"{sum(t['valid'] for t in trials)}/{len(trials)} trials with >= {D4_QUEUED_MS:.0f} ms queued ahead "
+            f"(min {min(t['queued_ahead_ms'] for t in trials):.1f}, median "
+            f"{float(np.median([t['queued_ahead_ms'] for t in trials])):.1f} ms; target {target:.0f} ms; "
+            f"{min(t['steps_queued'] for t in trials)}-{max(t['steps_queued'] for t in trials)} solver steps, "
+            f"calibrated ~{per_step:.2f} ms/step -> {n_first}; {retries} re-aimed call(s))"
+            f"{'' if valid else '; PRECONDITION NOT MET (< 20 ms queued)'}")
+    return {"pass": bool(ok), "summary": summ, "per_step_ms": per_step, "target_queued_ms": target,
+            "trials": trials, "attempts": attempts, "precondition_met": valid}
 
 
 def native_timing(nd, inset, out, bbox, n=T3_N, warm=T3_WARM) -> dict:

@@ -12,8 +12,10 @@ set(RENDER_SHADERS
   post:r_composite:composite_d:DBL=1 post:r_composite:composite_f:DBL=0)
 
 # -Gis: IEEE strictness (no reassociation / contraction, so the AUX and colour-only march variants share the colour
-# arithmetic bit for bit); -denorm preserve: like CUDA without ftz (Warp default)
-set(RENDER_DXC_FLAGS -nologo -T cs_6_6 -HV 2021 -O3 -Gis -denorm preserve -WX)
+# arithmetic bit for bit). NOT -denorm preserve (unlike native/sim): on this NVIDIA driver any log2 (so any pow)
+# compiled with it makes CreateComputePipelineState fail with E_OUTOFMEMORY (minimal repro: one log2 in a 64-thread
+# kernel). Denormals cannot matter at 8-bit / fp16 output precision.
+set(RENDER_DXC_FLAGS -nologo -T cs_6_6 -HV 2021 -O3 -Gis -WX)
 set(RENDER_DEPS ${RENDER_HLSL_DIR}/render_common.hlsli ${CMAKE_CURRENT_SOURCE_DIR}/rslots.h)
 
 set(render_headers "")

@@ -358,6 +358,48 @@ int main(int argc, char** argv) {
                    wall, vram_mb(g.dev));
             fflush(stdout);
         }
+    } else if (mode == "firstuse") {
+        // Every crop bucket: with ~20+ ms of copies queued ahead, CPU ms of the first call that uses the bucket vs the
+        // second and third. A lazy per-bucket init shows as first >> second; a GPU wait shows as ~the queued ms.
+        uint64_t sz = 256ull << 20;
+        auto a = g.buffer(sz, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON);
+        auto bb = g.buffer(sz, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON);
+        set_box({0, 0, 0, 0});
+        for (int w = 0; w < 10; ++w) CHECK(run_frame());
+        CHECK(nvfx_context_wait_idle(ctx));
+        g.wait(last);
+        const double fr6[6] = {0.25, 0.375, 0.5, 0.625, 0.75, 1.0};
+        auto sizes = [](int L, const double* f) {
+            std::vector<int> v;
+            for (int i = 0; i < 6; ++i) v.push_back(std::min(L, (std::max(int(L * f[i]), 1) + 63) / 64 * 64));
+            std::sort(v.begin(), v.end());
+            v.erase(std::unique(v.begin(), v.end()), v.end());
+            return v;
+        };
+        for (int hh : sizes(H, fr6))
+            for (int ww : sizes(W, fr6)) {
+                std::array<int, 4> box = {(W - ww) / 2, (H - hh) / 2, (W - ww) / 2 + ww, (H - hh) / 2 + hh};
+                if (ww == W && hh == H) box = {1, 1, W, H};   // whole frame, but not the warm-up call's exact bbox
+                set_box(box);
+                auto* l = g.begin();
+                for (int c = 0; c < 16; ++c) l->CopyBufferRegion(c % 2 ? a.Get() : bb.Get(), 0, c % 2 ? bb.Get() : a.Get(), 0, sz);
+                auto s0 = std::chrono::steady_clock::now();
+                uint64_t v = g.submit();
+                double ms[3];
+                for (int k = 0; k < 3; ++k) {
+                    auto k0 = std::chrono::steady_clock::now();
+                    CHECK(nvfx_detail_run(det, &fr));
+                    ms[k] = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - k0).count();
+                }
+                g.wait(v);
+                double busy = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - s0).count();
+                CHECK(nvfx_context_wait_idle(ctx));
+                int32_t reg[6];
+                CHECK(nvfx_detail_region(det, fr.bbox, reg));
+                printf("{\"event\":\"firstuse\",\"crop\":[%d,%d],\"first_ms\":%.3f,\"second_ms\":%.3f,\"third_ms\":%.3f,\"queued_ms\":%.1f}\n",
+                       reg[4], reg[5], ms[0], ms[1], ms[2], busy);
+                fflush(stdout);
+            }
     } else if (mode == "sync") {
         // Queue ~N ms of copy work, then call nvfx_detail_run: if the runtime waited for the GPU, the call takes ~N ms.
         uint64_t sz = 256ull << 20;
