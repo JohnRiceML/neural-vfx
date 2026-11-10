@@ -74,6 +74,17 @@ Error measures per channel c at one step: `rel_l2 = ‖n − p‖₂ / (‖p −
 | S4 | Stress: 1000 steps of the `selfcheck.py` stress scenario | no NaN/Inf, max\|u\| and Tmax bounded as in Python |
 | T1 | Step time at 64³, GPU timestamp queries, both scenes, default and runtime config, median of ≥ 200 steps after warm-up, split by stage, Python `step_profiled` measured in the same session | ≤ 2.0 ms (budget); the Python figure is reported alongside, not gated |
 
+Clarifications (lead, after the test engineer's contract review; no threshold changed):
+- ε in rel_l2 is 1e-12. Where the reference channel is exactly ambient everywhere (e.g. fuel in `plume`),
+  abs/peak is undefined and the native channel must match exactly.
+- P1 trajectory states x_k come from a default-config Python run; the one-step comparison uses the P1 config.
+  P2 `project` uses the P1 pressure config.
+- `pressure_tol 0` is "run `pressure_max_iters`" **with Python's remaining stops still active** (1e-6 float32
+  floor, stagnation at residual > 4× the best seen, rz = 0). The native loop implements the same stops.
+- S4 bound: Tmax ≤ `max_temperature`, and max|u| ≤ 1.5× the Python max|u| measured in the same session.
+- `step_index` counts completed `nvfx_solver_step` calls since create/reset (first step = 1).
+  `nvfx_solver_get_timings` before any step has finished returns zeros with `step_index` 0.
+
 The thresholds are set before any native code exists. If one turns out to be wrong for a reason that is
 not a bug (for example a discontinuous limiter amplifying rounding), the test engineer reports the numbers
 and the lead decides; nobody edits a threshold to make a test pass.

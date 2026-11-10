@@ -95,7 +95,8 @@ typedef struct NvfxSolverConfig {
     float   burn_heat;             /* 4000   */
     float   smoke_from_fuel;       /* 0.35   */
     float   pressure_tol;          /* 2e-5; 0 = always run pressure_max_iters */
-    int32_t pressure_max_iters;    /* 40     */
+    int32_t pressure_max_iters;    /* 40 (capped at 256). On D3D12 every unused iteration slot still costs
+                                      ~10 us, so a host that wants the adaptive stop should set ~12. */
     int32_t pressure_warm_start;   /* 1      */
     float   max_temperature;       /* 3000   */
     float   wind_marker_temp;      /* 300    */
@@ -126,7 +127,9 @@ typedef struct NvfxSolverTimings {
     float   projection_ms;
     float   total_ms;
     int32_t pcg_iters;      /* iterations the projection actually ran */
-    uint64_t step_index;    /* which step these numbers belong to */
+    uint64_t step_index;    /* which step these numbers belong to: steps completed since create/reset
+                               (first step = 1); all fields are 0 until a step has finished.
+                               nvfx_solver_project writes no timings. */
 } NvfxSolverTimings;
 
 NVFX_API void       nvfx_solver_config_default(NvfxSolverConfig* cfg);   /* SolverConfig3D() */
@@ -146,7 +149,10 @@ NVFX_API NvfxResult nvfx_solver_reset(NvfxSolver* s, const NvfxObstacle* obstacl
  * without waiting. forces NULL = none. Deterministic: identical inputs give bit-identical state. */
 NVFX_API NvfxResult nvfx_solver_step(NvfxSolver* s, const NvfxForces* forces, float dt);
 /* Hosted path: records the same step into the host's ID3D12GraphicsCommandList* instead of submitting.
- * The host executes the list on the queue the context was created with. */
+ * The host executes the list on the queue the context was created with.
+ * record_step sets its own descriptor heap, compute root signature and pipeline state on the list: the host
+ * must re-bind its own afterwards. Recorded steps must be executed: at most 16 may be outstanding (the 17th
+ * waits up to 20 s for the GPU, then fails). */
 NVFX_API NvfxResult nvfx_solver_record_step(NvfxSolver* s, void* d3d12_command_list, const NvfxForces* forces, float dt);
 /* Pressure projection only (Solver3D.project()). */
 NVFX_API NvfxResult nvfx_solver_project(NvfxSolver* s);
