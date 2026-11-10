@@ -1,48 +1,69 @@
 # vfx/correct3d — learned large-scale velocity correction for the 64³ solver (feasibility study)
 
-Shortlist item 5 (solver-in-the-loop). The question is whether a cheap correction applied inside the 64³ solver loop can
-make its large-scale motion track a finer sim (restricted 128³), within about 0.5 ms per step, stably.
-**Status: in progress.** The characterization (E0) and the classical baseline (E1) are done. The learned corrector
-(E2/E3) is written but has not been trained yet, because GPU work is on hold. See `EXPERIMENTS.md`.
+Shortlist item 5 (solver-in-the-loop). The question: can a cheap correction applied inside the 64³ solver loop
+make the 64³ sim's large-scale motion track a finer sim (128³ shrunk to 64³ by box-averaging), in about
+0.5 ms/step, stably?
 
-This module does not edit `vfx/sim3d`. It uses only the public `Solver3D` interface and edits `state.data` in place
-between steps, as `datagen3d/guide3d` does. It reads `datagen3d` (the scenario sampler and the guide) without modifying it.
+**Answer: feasible on cost and stability, but the gain over the classical fix is small. Not worth adopting now.**
+The full log is in `EXPERIMENTS.md`. Every timing was taken on a shared RTX 5080.
+
+This module does not modify `vfx/sim3d`. It uses only the public `Solver3D` interface and edits `state.data` in place
+between steps, the same way `datagen3d/guide3d` does. It reads `datagen3d` (scenario sampler, guide) without changing it.
 
 ## Interface
 ```python
 from vfx.correct3d import VelocityCorrector
-corr = VelocityCorrector(checkpoint_path)    # None -> identity (apply() is a no-op)
+corr = VelocityCorrector(ckpt, gain=0.5)     # None -> identity (apply() is a no-op)
 corr.apply(state, dt)                        # BEFORE solver.step(state, forces, dt): u += c(state), in place
 solver.step(state, forces, dt)               # that step's projection removes the divergent part of c
 corr.timings, corr.last_stats                # last_stats: GPU (3,) [rms c, rms u, fallback flag]
 ```
-The corrector expects the 64³ solver to run with the tuned-classical config it was trained on (`vorticity_eps=3.0`).
-Limiter (on the GPU, no host sync):
-- each cell's correction is capped at `cell_cap` m/s;
-- if rms(c) is greater than `max_ratio`·rms(u) + `abs_floor`, or c is not finite, the whole step's correction is dropped (identity fallback).
+- **Checkpoint:** `D:\neural-vfx-data\checkpoints\corr3d\e3.pt`. It was trained for a 64³ solver running
+  `SolverConfig3D(confinement_ref_res=128)` (PCG). It also works with `fused_config(confinement_ref_res=128)`.
+  Use gain 0.5.
+- **Limiter (GPU only, no host sync):**
+  - each cell is capped at |c| ≤ `cell_cap` = 0.15 m/s;
+  - if rms(c) > 0.2·rms(u) + 0.01, or the value is non-finite, that step falls back to identity.
+- The whole call is one captured CUDA graph per state buffer.
 
-The call is captured as one CUDA graph per state buffer.
+## Results (13 held-out scenes: 6 hand-made including an OOD box + strong-wind scene, 4 test, 3 OOD; 300 steps; against free-running 128³)
+| | combined score ↓ | plume centroid err | KE-spectrum err k1–8 | time-mean velocity err | cost/step |
+|---|---|---|---|---|---|
+| 64³ default | 4.61 | 0.056 m | 0.73 | 0.91 | 0.88–1.01 ms (PCG) |
+| tuned classical (`confinement_ref_res=128`) | 1.75 | 0.020 m | 0.34 | 0.51 | same |
+| + learned corrector (E3, gain 0.5) | **1.56** | 0.019 m | **0.20** | **0.44** | **+0.22 ms** |
+| chaos floor (128³ vs a perturbed 128³) | 0.45 | 0.004 m | 0.03 | 0.25 | — |
+
+- **Stability:** 3000 steps with pushes, emitters switched off/on, a box obstacle toggled and a wind gust. 5/5 scenes stayed
+  finite. Kinetic energy shows no drift, divergence is ≤ 2.6e-5 (≤ 7.0e-5 with the fused solver), and the limiter never triggered.
+- **The gap:** the 64³ sim is over-stirred, not under-energetic. Vorticity confinement scales with ε·dx, so 64³
+  confines twice as hard as 128³. That gives 4–8× the restricted fine power at k = 5–16, a bushy column, and a lower plume.
+
+## What adoption would cost downstream
+These costs apply to the classical `confinement_ref_res` fix as well as the learned corrector, because both change the 64³ flow.
+- **Route-B dataset and ScreenDetail:** `s3d_v1/v2` pair renders of the default 64³ sim with a 256³ sim steered to follow it. They
+  would have to be regenerated with the new 64³ flow (the guide would steer toward it), and ScreenDetail retrained. That
+  steered reference is also why corrected runs score slightly worse there: it is not a matched twin for a different flow.
+- **Other tuning against the 64³ velocity:** detail3d / particles3d parameters tuned on it should be re-checked.
+- **The corrector's own dependencies:** its checkpoint is tied to the solver config and version (`solver_version_tag` + corrector id). Any solver change
+  other than the fused pressure solve means re-collecting data (about 3 min of GPU) and retraining (≤ 20 min).
 
 ## Files
 | file | content |
 |---|---|
-| `common.py` | scenes (6 named and held out; sampler scenes), restriction, diagnostics (centroid, 95 % height, KE, …), KE spectrum, MIP, PNG writer, `CORR_DATA` (D:) |
-| `rollout.py` | instrumented rollout (any resolution, optional corrector, perturbation events) and `summarize` against a reference |
-| `characterize.py` | E0: 64³ vs 128³ (vs 256³) on the named scenes |
-| `tune_classical.py` | E1: 64³ config sweep against 128³ on train scenes; `--noise_floor` gives the 128³-vs-perturbed-128³ spread |
-| `model.py` | `CorrNet` (37k params, works at 32³ and is upsampled ×2), `features`, symmetry augmentation |
-| `collect.py` | training pairs: `pre` (one-step from the restricted fine state) and `dagger` (on the corrected coarse trajectory, with 128³ nudged to follow it) |
-| `train.py` | training of at most 15 min (MSE; R² on validation scenes) |
-| `evaluate.py` | `compare` (held-out scenes, images), `stability` (3000 steps of user perturbations), `timing` |
+| `common.py` | scenes, restriction, diagnostics, KE spectrum, MIP / PNG, data paths (`D:\neural-vfx-data`, set by the lead because C: is full) |
+| `rollout.py` | instrumented rollout (any resolution, optional corrector, perturbation events) and `summarize` |
+| `characterize.py` | E0: 64³ vs 128³ / 256³ |
+| `tune_classical.py` | E1 parameter sweep; `--noise_floor` |
+| `model.py` | `CorrNet` (37k params, works at 32³, ×2 trilinear), `features`, symmetry augmentation |
+| `collect.py` | `pre` (one-step) and `dagger` (on the corrected trajectory, with 128³ nudged via guide3d) pairs |
+| `train.py` | ≤ 15 min training, R² validation |
+| `evaluate.py` | `compare` (images `cmp_*.png`: raw \| classical \| learned \| ref128), `stability`, `timing` |
 
-Datasets and checkpoints are kept on D: (`D:\neural-vfx-data\datasets\corr3d_*`, `...\checkpoints\corr3d`), as the lead instructed, because C: is full.
-
-## Findings so far
-- **The gap is not missing energy.** Mass and heat match within 5 %, and the 64³ plume sits 0.05–0.14 m lower. But 64³
-  carries 1.5–3× the kinetic energy of 128³, with 4–8× the power at k = 5–16 cycles/domain. The coarse column breaks
-  up into a wide, bushy cloud near the source, and that stirring slows the rise.
-- **Most of the gap comes from one parameter.** With `vorticity_eps` 6 → 3 (the same eps·dx as 128³), the combined score drops 63 %,
-  the centroid error falls from 0.069 to 0.022 m, and total KE comes to 0.98×. The learned model has to beat this baseline.
-- **What is left is structural and depends on scale.** k5–8 stays 1.6× too energetic at every eps, while k1–4 swings from
-  too weak to too strong as eps changes. A scale-selective forcing could fix this; a global parameter cannot.
-- **128³ is not converged either.** At 256³ the plume rises another 0.04–0.07 m.
+```
+python -m vfx.correct3d.collect --name r0 --mode pre --seeds 0-23 --coarse_cfg '{"confinement_ref_res":128}'
+python -m vfx.correct3d.train --data r0 --out D:\neural-vfx-data\checkpoints\corr3d\e2.pt --minutes 10
+python -m vfx.correct3d.collect --name r1 --mode dagger --ckpt ...e2.pt --seeds 0-23 --coarse_cfg '{"confinement_ref_res":128}'
+python -m vfx.correct3d.train --data r0,r1 --init ...e2.pt --out ...e3.pt --minutes 10
+python -m vfx.correct3d.evaluate compare|stability|timing --ckpt ...e3.pt --gain 0.5 --classical '{"confinement_ref_res":128}' --learned_cfg '{"confinement_ref_res":128}'
+```

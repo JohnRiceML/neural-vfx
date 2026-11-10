@@ -1,5 +1,5 @@
 {
-  "gpu_before": "util,mem: 36 %, 2217 MiB; GPU processes: ChatGPT.exe, CrossDeviceResume.exe, Discord.exe, SearchHost.exe, ShellExperienceHost.exe, ShellHost.exe, StartMenuExperienceHost.exe, TextInputHost.exe, claude.exe, codex-computer-use-swift.exe, explorer.exe, msedgewebview2.exe, python.exe, steamwebhelper.exe",
+  "gpu_before": "util,mem: 1 %, 1162 MiB; GPU processes: ChatGPT.exe, CrossDeviceResume.exe, Discord.exe, SearchHost.exe, ShellExperienceHost.exe, ShellHost.exe, StartMenuExperienceHost.exe, TextInputHost.exe, claude.exe, codex-computer-use-swift.exe, explorer.exe, msedgewebview2.exe, python.exe, steamwebhelper.exe",
   "size": [
     2560,
     1440
@@ -7,95 +7,117 @@
   "preset": 1,
   "step_ms": {
     "low": [
-      0.11620160341262817,
-      0.11786400079727173
+      0.08403840065002441,
+      0.10793600082397461
     ],
     "medium": [
-      0.09267359972000122,
-      0.11462719440460205
+      0.08527200222015381,
+      0.11112960577011108
     ],
     "high": [
-      0.113811194896698,
-      0.11600799560546875
+      0.07980639934539795,
+      0.08085439801216125
+    ],
+    "calibrated": [
+      0.07864320278167725,
+      0.0843455970287323
     ]
   },
   "sim_step_ms": [
-    0.769808006286621,
-    0.7905600070953369
+    0.7631167888641357,
+    0.7680511951446534
   ],
   "render": [
     {
       "march_scale": 0.5,
       "detail": "none",
-      "full": 0.8272704124450684,
-      "view": 0.6448575973510742,
-      "avg60": 0.7360640048980713,
+      "full": 0.8331423759460449,
+      "view": 0.6374048233032227,
+      "avg60": 0.7352735996246338,
       "added_full": 0.0,
       "added_view": 0.0
     },
     {
       "march_scale": 0.5,
       "detail": "low",
-      "full": 1.3035648345947266,
-      "view": 0.8093631744384766,
-      "avg60": 1.0564640045166016,
-      "added_full": 0.4762944221496582,
-      "added_view": 0.16450557708740243
+      "full": 1.3224991798400878,
+      "view": 0.8389727592468261,
+      "avg60": 1.0807359695434569,
+      "added_full": 0.4893568038940429,
+      "added_view": 0.20156793594360345
     },
     {
       "march_scale": 0.5,
       "detail": "medium",
-      "full": 1.3527008056640626,
-      "view": 0.8473407745361328,
-      "avg60": 1.1000207901000976,
-      "added_full": 0.5254303932189942,
-      "added_view": 0.2024831771850586
+      "full": 1.376476764678955,
+      "view": 0.8897631645202637,
+      "avg60": 1.1331199645996093,
+      "added_full": 0.5433343887329102,
+      "added_view": 0.25235834121704104
     },
     {
       "march_scale": 0.5,
       "detail": "high",
-      "full": 1.6271039962768554,
-      "view": 0.9942912101745606,
-      "avg60": 1.310697603225708,
-      "added_full": 0.799833583831787,
-      "added_view": 0.3494336128234864
+      "full": 1.483071994781494,
+      "view": 0.9965632438659668,
+      "avg60": 1.2398176193237305,
+      "added_full": 0.6499296188354492,
+      "added_view": 0.35915842056274416
+    },
+    {
+      "march_scale": 0.5,
+      "detail": "calibrated",
+      "full": 1.3167967796325684,
+      "view": 0.8458784103393555,
+      "avg60": 1.0813375949859618,
+      "added_full": 0.48365440368652346,
+      "added_view": 0.20847358703613283
     },
     {
       "march_scale": 0.25,
       "detail": "none",
-      "full": 0.7983776092529297,
-      "view": 0.5896543979644775,
-      "avg60": 0.6940160036087035,
+      "full": 0.6053567886352539,
+      "view": 0.43181757926940917,
+      "avg60": 0.5185871839523315,
       "added_full": 0.0,
       "added_view": 0.0
     },
     {
       "march_scale": 0.25,
       "detail": "low",
-      "full": 1.0197919845581054,
-      "view": 0.7855072021484375,
-      "avg60": 0.9026495933532714,
-      "added_full": 0.22141437530517571,
-      "added_view": 0.19585280418396
+      "full": 0.9949631690979004,
+      "view": 0.5099487781524659,
+      "avg60": 0.7524559736251831,
+      "added_full": 0.3896063804626465,
+      "added_view": 0.0781311988830567
     },
     {
       "march_scale": 0.25,
       "detail": "medium",
-      "full": 1.0358592033386231,
-      "view": 0.6043615818023682,
-      "avg60": 0.8201103925704957,
-      "added_full": 0.23748159408569347,
-      "added_view": 0.014707183837890714
+      "full": 1.014083194732666,
+      "view": 0.5229856014251709,
+      "avg60": 0.7685343980789185,
+      "added_full": 0.4087264060974122,
+      "added_view": 0.09116802215576175
     },
     {
       "march_scale": 0.25,
       "detail": "high",
-      "full": 1.677497673034668,
-      "view": 0.6107327938079834,
-      "avg60": 1.1441152334213256,
-      "added_full": 0.8791200637817383,
-      "added_view": 0.021078395843505904
+      "full": 1.0579423904418945,
+      "view": 0.5691520214080811,
+      "avg60": 0.8135472059249877,
+      "added_full": 0.45258560180664065,
+      "added_view": 0.1373344421386719
+    },
+    {
+      "march_scale": 0.25,
+      "detail": "calibrated",
+      "full": 0.9908927917480469,
+      "view": 0.5083775997161866,
+      "avg60": 0.7496351957321168,
+      "added_full": 0.385536003112793,
+      "added_view": 0.0765600204467774
     }
   ],
-  "gpu_after": "util,mem: 99 %, 5971 MiB; GPU processes: ChatGPT.exe, CrossDeviceResume.exe, Discord.exe, SearchHost.exe, ShellExperienceHost.exe, ShellHost.exe, StartMenuExperienceHost.exe, TextInputHost.exe, claude.exe, codex-computer-use-swift.exe, explorer.exe, msedgewebview2.exe, python.exe, steamwebhelper.exe"
+  "gpu_after": "util,mem: 96 %, 1432 MiB; GPU processes: ChatGPT.exe, CrossDeviceResume.exe, Discord.exe, SearchHost.exe, ShellExperienceHost.exe, ShellHost.exe, StartMenuExperienceHost.exe, TextInputHost.exe, claude.exe, codex-computer-use-swift.exe, explorer.exe, msedgewebview2.exe, python.exe, steamwebhelper.exe"
 }

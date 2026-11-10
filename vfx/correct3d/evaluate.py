@@ -33,9 +33,9 @@ def scenes_for(a):
     named = named_scenes()
     for n in [x for x in a.named.split(",") if x]:
         out.append(named[n])
-    for s in parse_seeds(a.test) if a.test else []:
+    for s in parse_seeds(a.test) if a.test not in ("", "none") else []:
         out.append(sampled_scene(s, "test"))
-    for s in parse_seeds(a.ood) if a.ood else []:
+    for s in parse_seeds(a.ood) if a.ood not in ("", "none") else []:
         out.append(sampled_scene(s, "ood"))
     return out
 

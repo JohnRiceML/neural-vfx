@@ -28,7 +28,8 @@ class VelocityCorrector:
     """
 
     def __init__(self, checkpoint_path=None, device="cuda", cell_cap: float = 0.15, max_ratio: float = 0.2,
-                 abs_floor: float = 0.01, use_graph: bool = True, gain: float = 1.0):
+                 abs_floor: float = 0.01, use_graph: bool = True, gain: float = 0.5):
+        # gain 0.5 = the evaluated setting for checkpoint e3 (EXPERIMENTS.md, E4)
         self.device = device
         self.net = None
         self.cell_cap, self.max_ratio, self.abs_floor, self.gain = cell_cap, max_ratio, abs_floor, gain

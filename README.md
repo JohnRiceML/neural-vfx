@@ -33,29 +33,54 @@ Design: [SPEC.md](SPEC.md). Conventions and module contracts: [CLAUDE.md](CLAUDE
 .venv/Scripts/python -m bench.run
 ```
 
-## 3D sandbox (feasibility phase — no 3D network is trained yet)
+## 3D sandbox — current best (2026-11-10)
 ```
-.venv/Scripts/python -m vfx.app3d.main
+.venv/Scripts/python -m vfx.app3d.main --best          # particles + calibrated sim-carried noise + faster pressure solve, next to untouched raw 64³
+.venv/Scripts/python -m vfx.app3d.main --best-light    # same without particles (cheaper)
 ```
-Orbit with RMB drag, zoom with the wheel, LMB drag pushes smoke, F fire, G smoke puff, N / B change the left / right
-mode, V side-by-side, 1–4 presets, T march scale, C auto-orbit. Modes: raw 64³, classical trilinear ×4 (256³),
-direct 128³ sim (reference), and the two neural routes, which run UNTRAINED weights for timing only.
-Full controls: vfx/app3d/README.md.
+Orbit with RMB drag, zoom with the wheel, LMB drag pushes smoke, F fire, G smoke puff, 1–4 presets, V side-by-side,
+N / B change the left / right mode, Q detail quality, P faster pressure solve, K resolution-consistent swirl strength,
+C auto-orbit. Every earlier mode is still there (raw, trilinear, neural_vol, neural_screen, ref128, detail, hires, ...).
+Full controls: vfx/app3d/README.md. State before this phase: git tag `v0.3-screen-space-baseline`.
 
-### 3D feasibility, measured (RTX 5080, idle GPU, 2560×1440, half-resolution march; full table in bench3d/results/REPORT.md)
-| Pipeline | sim | detail | render | frame | vs direct 256³ sim |
-|---|---|---|---|---|---|
-| raw 64³ | 0.82 | – | 0.84 | 1.66 ms | 27× |
-| 64³ + trilinear 256³ | 0.83 | 0.18 | 1.52 | 2.52 ms | 18× |
-| route A: neural volume 64³→256³ (untrained, box full of smoke) | 0.83 | 4.27 | 1.50 | 6.61 ms | 6.7× |
-| route B: neural screen-space detail (untrained) | 0.84 | 2.08 | 0.85 | 3.76 ms | 12× |
-| direct 128³ sim | 4.13 | – | 0.82 | 4.95 ms | 9× |
-| direct 256³ sim | 43.0 | – | 1.34 | 44.4 ms | 1× |
+### How fine detail is produced
+Detail is carried by the 64³ sim, not invented on the image:
+- `vfx/detail3d` — noise coordinates advected by the 64³ velocity, sampled inside the ray-marcher (no 256³ volume is written).
+- `vfx/particles3d` — 1M particles advected by the 64³ velocity, deposited into a 128³ volume each sim step.
+- `vfx/sim3d` opt-ins — `fused_config()` pressure solve, `scalar_res=128` smoke field, `confinement_ref_res=128`.
+The screen-space network (`vfx/runtime3d.ScreenDetail`) sharpens but does not produce wisps: an unconstrained teacher
+network (5× the compute) and a sharper 320³ target both failed to change that (vfx/train3d/EXPERIMENTS.md).
+Background: reports/Real time neural smoke techniques.md.
 
-Budget: sim 2.0, detail 2.5, render 1.5, frame 6.0 ms. Full-resolution marching misses the render budget (2.7–4.0 ms).
-Route A's cost scales with how much of the box holds smoke (0.8 ms at 5% of bricks, 1.1 at 10%, ~2.3 at 25%); the bench
-scenes fill the closed box, so it is measured at its worst case there. Sandbox presets dissipate smoke and hold at 31–39% active bricks.
+### Quality vs the steered 256³ reference (four held-out presets, lower is better, reference = 0)
+| Approach | detail by scale | patch statistics | motion match |
+|---|---|---|---|
+| raw 64³ | 0.359 | 0.220 | 0.440 |
+| screen-space network (regression) | 0.088 | 0.125 | 0.305 |
+| screen-space network (adversarial; rejected on pictures) | 0.051 | 0.068 | 0.194 |
+| sim-carried noise, calibrated | 0.119 | 0.080 | 0.167 |
+| particles 1M @128³ | 0.118 | 0.075 | 0.129 |
+| **particles + calibrated noise (`--best`)** | **0.051** | **0.041** | **0.050** |
+Crops: reports/images/best_vs_reference_crops.png. All approaches and metrics: bench3d/results/MODES.md.
+
+### Cost on an idle RTX 5080 at 2560×1440, half-resolution march (budget: sim 2.0 / detail 2.5 / render 1.5 / frame 6.0 ms)
+| Stage | ms |
+|---|---|
+| 64³ sim step, default / faster pressure solve | 0.88–1.01 / 0.48–0.62 |
+| + 128³ smoke field | +0.38 |
+| sim-carried noise, per sim step | 0.08–0.11 |
+| particles 1M @128³, per sim step | 1.41 |
+| render: plain / with calibrated noise (average of new-volume and reuse frames) | 0.74 / 1.08 |
+| `--best` in the sandbox (800×690 views), per 60 Hz frame | ~2.0 (sim 0.32, detail 0.79, render 0.85) |
+| direct 256³ sim step, for comparison | 43 |
+Windowed `--best`: 60.6 fps, 1% low 55.7 (frame-capped).
+
+### Known gaps
+- Fire: particle modes put a speckled grain into flames; the 256³ reference flame is smooth and taller.
+- The 64³ sim over-stirs plumes; `confinement_ref_res=128` fixes most of it (error vs a free-running 128³ sim 4.61 → 1.75)
+  but changes the flow the datasets and network were built on, so it is opt-in (vfx/correct3d/README.md).
+- Native runtime (D3D12 + DirectML, no Python) lives on branch `native-runtime`, not merged.
 ```
-.venv/Scripts/python -m pytest tests3d -q      # 57 tests
-.venv/Scripts/python -m bench3d.run            # feasibility report
+.venv/Scripts/python -m pytest tests3d -q        # 167 pass; 2 known failures: the first screen-space network vs the corrected detail gates
+.venv/Scripts/python -m bench3d.compare_modes    # all-approaches table
 ```
