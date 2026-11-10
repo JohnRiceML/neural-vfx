@@ -196,3 +196,36 @@ def load_sequences(version, split, length) -> torch Dataset
 # vfx/runtime3d — ScreenDetail.infer(frame, aux) keeps its signature; aux is the dict above.
 # vfx/eval3d/metrics.py — image-space metrics (owned by the test engineer; training code calls these).
 ```
+
+## Sim-carried detail phase (follows reports/Real time neural smoke techniques.md) — added 2026-11-09
+Goal: get fine wisps from classical transport driven by the 64^3 sim, inside the same 6 ms budget, and
+measure every option against the existing ones. NOTHING existing is removed: every earlier mode,
+checkpoint, dataset and solver path stays selectable so results can be compared side by side
+(git tag `v0.3-screen-space-baseline` marks the state before this phase). New behaviour is opt-in.
+
+| Path | Owner |
+|---|---|
+| `vfx/detail3d/` (new), `vfx/render3d/`, `vfx/app3d/` | detail/render engineer |
+| `vfx/sim3d/` | 3D solver engineer |
+| `tests3d/`, `bench3d/`, `vfx/eval3d/` | 3D test/eval engineer |
+| `vfx/model3d/`, `vfx/runtime3d/`, `vfx/train3d/`, `vfx/datagen3d/` | ML and data engineers (busy; read-only for others) |
+
+```python
+# vfx/detail3d/__init__.py — shortlist #1: detail lives in the volume, not on the image
+class AdvectedDetail:
+    def __init__(self, res: int = 64, device="cuda", **params): ...
+    def reset(self) -> None
+    def step(self, state: FieldState3D, dt: float) -> None     # advect detail coordinates by the 64^3 velocity
+    def fields(self) -> dict        # GPU tensors the ray-marcher samples (e.g. advected noise coords, blend
+                                    # weights, per-cell amplitude from the coarse sim's turbulence)
+    timings: dict[str, float]
+# vfx/render3d: VolumeRenderer.draw(..., detail: AdvectedDetail | None = None) samples the detail while marching
+#   (no 256^3 volume is written). detail=None must render bit-identically to before.
+
+# vfx/sim3d — shortlist #4, all opt-in via SolverConfig3D / constructor; defaults unchanged and bit-identical
+Solver3D(res, config, device, scalar_res: int | None = None)
+#   scalar_res (e.g. 128): density/temperature/fuel are ALSO advected on a finer grid by the res^3 velocity
+solver.hires_volume() -> Volume | None      # the finer density + temperature, for the renderer
+SolverConfig3D.pressure_mode: "pcg" (default, existing) | "fused"   # fused-kernel fixed V-cycle solve
+```
+Sandbox modes are additive: keep `raw`, `trilinear`, `neural_vol`, `neural_screen`, `ref128`; add new ones.
